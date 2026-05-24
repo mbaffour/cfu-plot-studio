@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="620" viewBox="0 0 1100 620" role="img" aria-labelledby="title desc">
+  <title id="title">CFU Plot Studio component map</title>
+  <desc id="desc">A visual map showing how data import, column mapping, statistics, plot controls, quality checks, and exports connect inside CFU Plot Studio.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7fbff"/>
+      <stop offset="1" stop-color="#eef7f2"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#2c3f4d" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#4b6676"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #152b35; }
+      .subtitle { font: 18px Arial, sans-serif; fill: #4b6676; }
+      .card { fill: #ffffff; stroke: #c9dce5; stroke-width: 2; rx: 18; filter: url(#shadow); }
+      .hub { fill: #17394a; stroke: #102936; stroke-width: 3; rx: 24; filter: url(#shadow); }
+      .hubText { font: 700 22px Arial, sans-serif; fill: #ffffff; }
+      .hubSmall { font: 15px Arial, sans-serif; fill: #d9edf4; }
+      .head { font: 700 18px Arial, sans-serif; fill: #17394a; }
+      .body { font: 14px Arial, sans-serif; fill: #405966; }
+      .tag { fill: #e8f3f7; stroke: #bfd5df; rx: 10; }
+      .tagText { font: 12px Arial, sans-serif; fill: #2f5364; }
+      .line { stroke: #4b6676; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .accent1 { fill: #1b7f79; }
+      .accent2 { fill: #d2793c; }
+      .accent3 { fill: #6f5ca8; }
+      .accent4 { fill: #3f74ad; }
+      .accent5 { fill: #8b6b2d; }
+      .accent6 { fill: #5c8f4f; }
+    </style>
+  </defs>
+  <rect width="1100" height="620" fill="url(#bg)"/>
+  <text x="70" y="64" class="title">CFU Plot Studio: from replicate counts to publication figures</text>
+  <text x="70" y="96" class="subtitle">A Shiny utility for plotting, statistics, quality checks, reproducible settings, and export-ready figures.</text>
+
+  <rect x="415" y="230" width="270" height="150" class="hub"/>
+  <text x="550" y="282" text-anchor="middle" class="hubText">Shiny App Core</text>
+  <text x="550" y="313" text-anchor="middle" class="hubSmall">reactive data cleaning</text>
+  <text x="550" y="338" text-anchor="middle" class="hubSmall">ggplot figure builder</text>
+  <text x="550" y="363" text-anchor="middle" class="hubSmall">statistics and export handlers</text>
+
+  <rect x="70" y="150" width="260" height="130" class="card"/>
+  <circle cx="104" cy="184" r="14" class="accent1"/>
+  <text x="130" y="190" class="head">Data input</text>
+  <text x="95" y="222" class="body">Upload CSV or use neutral</text>
+  <text x="95" y="244" class="body">dummy template data.</text>
+  <rect x="94" y="255" width="84" height="24" class="tag"/>
+  <text x="136" y="272" text-anchor="middle" class="tagText">readr</text>
+
+  <rect x="70" y="370" width="260" height="130" class="card"/>
+  <circle cx="104" cy="404" r="14" class="accent2"/>
+  <text x="130" y="410" class="head">Column mapping</text>
+  <text x="95" y="442" class="body">Sample, treatment, time,</text>
+  <text x="95" y="464" class="body">replicate, and CFU columns.</text>
+  <rect x="94" y="475" width="84" height="24" class="tag"/>
+  <text x="136" y="492" text-anchor="middle" class="tagText">dplyr</text>
+
+  <rect x="770" y="120" width="260" height="130" class="card"/>
+  <circle cx="804" cy="154" r="14" class="accent3"/>
+  <text x="830" y="160" class="head">Statistics</text>
+  <text x="795" y="192" class="body">log10(CFU) tests, adjusted</text>
+  <text x="795" y="214" class="body">p-values, stars, and tables.</text>
+  <rect x="795" y="225" width="92" height="24" class="tag"/>
+  <text x="841" y="242" text-anchor="middle" class="tagText">emmeans</text>
+
+  <rect x="770" y="285" width="260" height="130" class="card"/>
+  <circle cx="804" cy="319" r="14" class="accent4"/>
+  <text x="830" y="325" class="head">Publication plot</text>
+  <text x="795" y="357" class="body">Bars, points, SD/SEM/CI,</text>
+  <text x="795" y="379" class="body">ticks, units, and legends.</text>
+  <rect x="795" y="390" width="92" height="24" class="tag"/>
+  <text x="841" y="407" text-anchor="middle" class="tagText">ggplot2</text>
+
+  <rect x="770" y="450" width="260" height="130" class="card"/>
+  <circle cx="804" cy="484" r="14" class="accent5"/>
+  <text x="830" y="490" class="head">Exports</text>
+  <text x="795" y="522" class="body">PNG, PDF, SVG, PPTX, GIF,</text>
+  <text x="795" y="544" class="body">tables, presets, manifests.</text>
+  <rect x="795" y="555" width="92" height="24" class="tag"/>
+  <text x="841" y="572" text-anchor="middle" class="tagText">officer</text>
+
+  <rect x="415" y="455" width="270" height="100" class="card"/>
+  <circle cx="449" cy="489" r="14" class="accent6"/>
+  <text x="475" y="495" class="head">Figure QA</text>
+  <text x="440" y="527" class="body">Checks replicate counts, DPI, font size,</text>
+  <text x="440" y="549" class="body">axis clipping, and legend placement.</text>
+
+  <path d="M330 215 C365 230 385 250 415 280" class="line"/>
+  <path d="M330 435 C365 415 385 380 415 340" class="line"/>
+  <path d="M685 280 C725 245 742 210 770 185" class="line"/>
+  <path d="M685 305 C720 305 742 325 770 345" class="line"/>
+  <path d="M685 350 C725 395 742 465 770 515" class="line"/>
+  <path d="M550 380 L550 455" class="line"/>
+</svg>

@@ -6,21 +6,26 @@ Colony forming unit assays are beautifully direct at the bench: count colonies, 
 
 **CFU Plot Studio** is an R Shiny app built to make that workflow cleaner, more reproducible, and easier to share.
 
-## The Short Version
+Repository: <https://github.com/mbaffour/cfu-plot-studio>  
+Report a bug: <https://github.com/mbaffour/cfu-plot-studio/issues/new?template=bug_report.md>  
+Request a feature: <https://github.com/mbaffour/cfu-plot-studio/issues/new?template=feature_request.md>
+
+## What CFU Plot Studio Does
 
 CFU Plot Studio takes replicate-level CFU data and turns it into publication-focused bar plots, downloadable statistics, QC tables, and reproducible figure handoff files.
 
 It is built for labs that want:
 
 - A point-and-click interface for CFU plotting.
-- Replicate-level statistics on `log10(CFU)`.
+- Replicate-level data input rather than precomputed averages only.
+- Statistics on `log10(CFU)`.
 - SD, SEM, 95% CI, IQR, or min-max variation display.
 - Visible replicate points.
 - Reproducible figure dimensions and export settings.
 - Editable SVG, PDF, PNG, PowerPoint, GIF, and reveal-slide exports.
-- A saved preset, manifest, and R script that can recreate the figure later.
+- A saved preset, analysis manifest, and R script that can recreate the figure later.
 
-## The Workflow
+## Workflow Overview
 
 ![CFU Plot Studio workflow](docs/assets/cfu-workflow.svg)
 
@@ -31,112 +36,257 @@ It is built for labs that want:
 5. Choose the statistics and variation display.
 6. Export the figure, summary tables, statistics, preset, manifest, and reproducible R script.
 
-## Why This Exists
+## Input Data Format
 
-For publication figures, a CFU plot usually needs more than a quick bar chart. It needs:
+The app expects one row per replicate measurement. Column names do not have to match exactly because the app has column-mapping controls.
 
-- Replicate-level input, not only precomputed averages.
-- Clear variation display, such as SD, SEM, 95% CI, IQR, or min-max range.
-- Visible replicate points for transparency.
-- Statistics on an appropriate scale, usually `log10(CFU)`.
-- Flexible comparisons such as strain versus strain, vector versus vector, timepoint changes, or treatment versus control.
-- Exact figure sizing so plots can be reproduced across projects.
-- Export formats that work for manuscripts, talks, posters, and final editing.
+Required information:
 
-Doing this manually is possible, but it is also easy to lose track of what was tested, which axis limits were used, or whether the exported figure still matches the final statistics.
+| Field | Example |
+| --- | --- |
+| Sample, strain, vector, or group | `Control strain`, `Test strain` |
+| Treatment, dose, condition, or concentration | `Baseline`, `Treatment A`, `Treatment B` |
+| Timepoint | `Early`, `Late`, `0`, `120` |
+| Replicate | `1`, `2`, `3` |
+| CFU count | `4300000` |
 
-## What The App Does
+The repository includes a neutral synthetic file, `dummy_cfu_example.csv`, that can be used as a template.
 
-CFU Plot Studio starts from a normal CSV file. The data can have custom column names because the app lets you map the important fields:
+## How To Use The App
 
-- Sample, vector, strain, or individual
-- Treatment, dose, condition, or concentration
-- Timepoint
-- Replicate
+### 1. Run The App
+
+Install the core R packages:
+
+```r
+install.packages(c(
+  "shiny",
+  "ggplot2",
+  "dplyr",
+  "readr",
+  "emmeans",
+  "broom",
+  "DT",
+  "colourpicker",
+  "jsonlite"
+))
+```
+
+Optional packages for PowerPoint and animation exports:
+
+```r
+install.packages(c(
+  "officer",
+  "rvg",
+  "gganimate",
+  "gifski"
+))
+```
+
+Run from the project folder:
+
+```r
+shiny::runApp(".")
+```
+
+or:
+
+```powershell
+Rscript run_app.R
+```
+
+### 2. Upload Or Use The Template Data
+
+Use the file upload control for your CSV. If you are just testing the tool, load the built-in dummy example data. The dummy data are intentionally neutral and synthetic.
+
+### 3. Map Columns
+
+Choose which columns represent:
+
+- sample/vector/group
+- treatment/dose/condition
+- timepoint
+- replicate
 - CFU count
 
-Once the file is mapped, the app creates cleaned data, summary tables, QC checks, statistics, and publication-style plots.
+This means the app can work with different lab spreadsheet styles without requiring a fixed column naming convention.
 
-## Publication-Focused Plotting
+### 4. Choose A Plot Mode
 
-The plotting controls are built around manuscript needs. Users can set exact figure dimensions in inches, DPI, y-axis boundaries, major and minor tick spacing, plot theme, font sizes, legend position, and export format.
+The app currently supports:
 
-The app supports:
+- **Combined samples, faceted by time:** good for comparing groups across treatments at each timepoint.
+- **One sample, both timepoints:** good for looking at a single group across time.
+- **One sample, one timepoint:** good for focused treatment-response plots.
 
-- `log10(CFU)` plots
-- Raw CFU values on a log axis
-- SD, SEM, 95% CI, IQR, or min-max intervals
-- Capped error bars, uncapped whiskers, mean point plus whiskers, crossbar intervals, or replicate-points-only display
-- Custom sample and timepoint colors
-- Optional boxed plot panels
-- Major and minor y-axis ticks and guide lines
-- Inside or outside legend placement
-- Editable units for treatment and time labels
-- Single-column, double-column, and square figure size presets
+### 5. Choose Variation Display
 
-The treatment axis is generic. The same field can represent drug dose, infection condition, medium condition, temperature, growth condition, induction condition, or another lab-specific variable.
+Variation can be summarized as:
 
-## Statistics That Stay With The Figure
+- **SD:** common for showing spread around the mean.
+- **SEM:** useful for uncertainty around the mean, but often less transparent for small replicate counts.
+- **95% CI:** confidence interval around the mean.
+- **IQR:** interquartile range, useful for showing replicate spread without relying on normality.
+- **Range (min-max):** shows the full visible replicate range.
+
+Variation can be drawn as:
+
+- capped error bars
+- uncapped whiskers
+- mean point plus whiskers
+- crossbar interval
+- replicate points only
+
+For CFU assays with small replicate numbers, a good default is to keep replicate points visible and use SD or min-max range depending on the figure's purpose.
+
+### 6. Configure Statistics
 
 The app performs statistics on replicate-level `log10(CFU)` values. It can compare:
 
-- Samples or vectors within each treatment and timepoint
-- Timepoints within each sample and treatment
-- Each treatment versus a selected control
-- All treatment pairs within each sample and timepoint
+- samples or vectors within each treatment and timepoint
+- timepoints within each sample and treatment
+- each treatment versus a selected control
+- all treatment pairs within each sample and timepoint
 
-Welch t-tests are the default, with Student t-tests and `emmeans` available when needed. Multiple-comparison adjustment can be applied globally or within each panel or group, and results can be shown as stars or adjusted p/q values.
+Available methods:
 
-The statistics table is downloadable, so the figure and its underlying tests can be archived together.
+- Welch t-test on `log10(CFU)` values
+- Student t-test on `log10(CFU)` values
+- linear model plus `emmeans`
 
-## Reproducible Figure Handoff
+Multiple-comparison correction options:
 
-The final figure should not be a dead image. CFU Plot Studio can export:
+- BH
+- Holm
+- Bonferroni
+- none
 
-- A plot preset JSON file
-- An analysis manifest JSON file
-- A reproducible R script that recreates the visible plot
-- Cleaned data, summary data, QC tables, statistics, and ANOVA output
+Statistic labels can be shown as stars or exact adjusted p/q values.
 
-This makes it easier to move from interactive exploration to a project folder that can be shared, versioned, uploaded to GitHub, or archived with a release.
+### 7. Make The Figure Publication-Ready
 
-## Exporting For Real Use
+Plot controls include:
 
-The app exports:
+- exact export width, height, and DPI
+- single-column, double-column, and square size presets
+- y-axis boundaries
+- major and minor y-axis tick spacing
+- major and minor y-axis guide lines
+- plot box and axis line widths
+- bar width, dodge width, point size, point alpha, and jitter
+- axis, grid, outline, sample, timepoint, and statistic-label colors
+- title, subtitle, x-label, legend title, and font sizes
+- inside or outside legend placement
+- editable treatment and time unit suffixes
 
-- PNG for high-resolution raster figures
-- PDF and SVG for vector editing
-- PowerPoint for slide workflows
-- Editable PowerPoint vector art when `rvg` is installed
-- Animated GIFs and reveal-slide PowerPoints for presentations
-- Cleaned data, summaries, QC tables, and statistics
+### 8. Use Figure QA
 
-This makes the app useful beyond a single manuscript panel. It can support lab meetings, talks, supplementary figures, release records, and reproducible figure handoff.
+The Figure QA tab checks for common publication problems:
+
+- low replicate counts
+- hidden replicate points
+- low export DPI
+- very small figure dimensions
+- small fonts
+- crowded x-axis labels
+- statistics labels that may clip
+- inside legends that may cover data
+
+It is not a replacement for visual inspection, but it catches common problems before export.
+
+### 9. Export The Figure And Handoff Files
+
+The app can export:
+
+- PNG
+- PDF
+- SVG
+- PowerPoint
+- editable PowerPoint vector art when `rvg` is installed
+- animated GIF
+- reveal-slide PowerPoint
+- cleaned data
+- summary tables
+- QC tables
+- statistics tables
+- ANOVA tables
+- plot preset JSON
+- analysis manifest JSON
+- reproducible R script
+
+The preset, manifest, and R script are especially useful for reproducibility. They help preserve not only the image, but also the settings and data used to make it.
+
+## Technical Components
+
+CFU Plot Studio is built as a single-file R Shiny app with a small launcher script.
+
+Main components:
+
+- **Shiny:** interactive app framework.
+- **ggplot2:** plotting engine.
+- **dplyr:** data cleaning, grouping, summaries, QC, and reactive transformations.
+- **readr:** CSV import/export.
+- **emmeans:** model-based marginal means and contrasts.
+- **broom:** tidy model/statistics output.
+- **DT:** interactive tables.
+- **colourpicker:** color controls in the UI.
+- **jsonlite:** plot presets, analysis manifests, and reproducibility exports.
+- **officer:** PowerPoint export.
+- **rvg:** editable vector graphics in PowerPoint.
+- **gganimate and gifski:** animated GIF export.
+
+Repository components:
+
+- `app.R`: main Shiny application.
+- `run_app.R`: launcher script.
+- `dummy_cfu_example.csv`: neutral synthetic template data.
+- `README.md`: installation and usage guide.
+- `BLOGPOST.md`: project post and user guide.
+- `CITATION.cff`: citation metadata.
+- `.zenodo.json`: Zenodo metadata.
+- `LICENSE`: MIT License.
+- `docs/`: GitHub Pages landing page and graphics.
+- `.github/ISSUE_TEMPLATE/`: bug and feature request forms.
 
 ## Bug Reports And Contact
 
-The best way to report a bug is through the GitHub repository:
+The best way to report a bug is through GitHub Issues:
 
-- **Bug reports:** open a GitHub Issue with a short description, your operating system, R version, and a small example CSV if possible.
-- **Feature requests:** open a GitHub Issue and label it as an enhancement.
-- **Questions or lab-use feedback:** use GitHub Discussions if enabled, or contact the maintainer.
-- **Repository:** <https://github.com/mbaffour/cfu-plot-studio>
-- **Maintainer:** Michael Baffour Awuah, via GitHub Issues or the GitHub profile connected to the repository.
+- Bug report: <https://github.com/mbaffour/cfu-plot-studio/issues/new?template=bug_report.md>
+- Feature request: <https://github.com/mbaffour/cfu-plot-studio/issues/new?template=feature_request.md>
+- All issues: <https://github.com/mbaffour/cfu-plot-studio/issues>
 
-Please do not include private or unpublished experimental data in a public issue. If a bug requires data to reproduce, make a small synthetic example that has the same structure.
+When reporting a bug, include:
+
+- operating system
+- R version
+- browser
+- what you clicked or changed
+- error message or screenshot
+- a small synthetic CSV if data are needed to reproduce the issue
+
+Please do not include private or unpublished experimental data in a public issue. If a bug requires data to reproduce, make a small synthetic example with the same structure.
+
+Maintainer: Michael Baffour Awuah, through the GitHub repository.
 
 ## Citation And DOI
 
-The project can be made citable by archiving a GitHub release with Zenodo. Zenodo will mint a DOI for the archived release, and future releases can receive version-specific DOIs. A `CITATION.cff` file and `.zenodo.json` metadata file are included so the repository is ready for that workflow.
+The project is prepared for Zenodo archival. The repository includes:
+
+- `CITATION.cff`
+- `.zenodo.json`
+- `LICENSE`
+
+When a GitHub release is archived by Zenodo, Zenodo mints a DOI for that software release. Future releases can receive version-specific DOIs.
 
 ## What Comes Next
 
 Useful future additions could include:
 
-- Saved named presets inside the app.
-- Import/export of complete project sessions.
-- More plot types, such as dot plots, box plots, and raincloud-style plots.
-- Built-in example datasets for common CFU experiment designs.
-- A hosted Shiny deployment.
+- saved named presets inside the app
+- complete project-session export/import
+- dot plots, box plots, and raincloud-style plots
+- hosted Shiny deployment
+- more built-in synthetic examples for common CFU experimental designs
 
 CFU Plot Studio is meant to be a practical lab utility: polished enough for publication figures, flexible enough for different experiment designs, and transparent enough to keep the data, statistics, and final graph connected.

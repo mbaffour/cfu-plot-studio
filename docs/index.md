@@ -27,6 +27,12 @@ Read the full project post in [BLOGPOST.md](../BLOGPOST.md), or start with the [
 
 ## Bug Reports And Contact
 
-Please report bugs through GitHub Issues. Include your operating system, R version, what you clicked, and a small synthetic CSV if data are needed to reproduce the issue.
+Please report bugs through GitHub Issues:
+
+- [Open a bug report](https://github.com/mbaffour/cfu-plot-studio/issues/new?template=bug_report.md)
+- [Request a feature](https://github.com/mbaffour/cfu-plot-studio/issues/new?template=feature_request.md)
+- [View all issues](https://github.com/mbaffour/cfu-plot-studio/issues)
+
+Include your operating system, R version, what you clicked, and a small synthetic CSV if data are needed to reproduce the issue.
 
 Do not post private or unpublished experimental data in public issues.

@@ -1,0 +1,37 @@
+Group,Treatment,Timepoint,Replicate,CFU
+Control strain,Baseline,Early,1,4300000
+Control strain,Baseline,Early,2,5100000
+Control strain,Baseline,Early,3,4700000
+Control strain,Baseline,Late,1,6200000
+Control strain,Baseline,Late,2,6900000
+Control strain,Baseline,Late,3,6500000
+Control strain,Treatment A,Early,1,3900000
+Control strain,Treatment A,Early,2,4500000
+Control strain,Treatment A,Early,3,4200000
+Control strain,Treatment A,Late,1,5300000
+Control strain,Treatment A,Late,2,5900000
+Control strain,Treatment A,Late,3,5600000
+Control strain,Treatment B,Early,1,3600000
+Control strain,Treatment B,Early,2,4100000
+Control strain,Treatment B,Early,3,3800000
+Control strain,Treatment B,Late,1,4100000
+Control strain,Treatment B,Late,2,4700000
+Control strain,Treatment B,Late,3,4400000
+Test strain,Baseline,Early,1,4800000
+Test strain,Baseline,Early,2,5400000
+Test strain,Baseline,Early,3,5000000
+Test strain,Baseline,Late,1,7000000
+Test strain,Baseline,Late,2,7600000
+Test strain,Baseline,Late,3,7200000
+Test strain,Treatment A,Early,1,4500000
+Test strain,Treatment A,Early,2,4900000
+Test strain,Treatment A,Early,3,4700000
+Test strain,Treatment A,Late,1,3600000
+Test strain,Treatment A,Late,2,4000000
+Test strain,Treatment A,Late,3,3800000
+Test strain,Treatment B,Early,1,4200000
+Test strain,Treatment B,Early,2,4600000
+Test strain,Treatment B,Early,3,4400000
+Test strain,Treatment B,Late,1,2100000
+Test strain,Treatment B,Late,2,2500000
+Test strain,Treatment B,Late,3,2300000

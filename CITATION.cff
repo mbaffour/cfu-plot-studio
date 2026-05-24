@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use CFU Plot Studio, please cite it using the metadata from this file."
+title: "CFU Plot Studio"
+version: "0.1.0"
+date-released: "2026-05-24"
+type: software
+abstract: "An R Shiny app for publication-ready CFU plotting, replicate-level statistics, figure QC, and reproducible figure exports."
+authors:
+  - family-names: "Awuah"
+    given-names: "Michael Baffour"
+    affiliation: "Independent researcher"
+repository-code: "https://github.com/mbaffour/cfu-plot-studio"
+url: "https://github.com/mbaffour/cfu-plot-studio"
+license: "MIT"
+keywords:
+  - "CFU"
+  - "microbiology"
+  - "R Shiny"
+  - "ggplot2"
+  - "publication figures"
+  - "reproducibility"

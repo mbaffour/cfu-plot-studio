@@ -1,0 +1,21 @@
+{
+  "title": "CFU Plot Studio",
+  "description": "An R Shiny app for publication-ready CFU plotting, replicate-level statistics, figure QC, and reproducible figure exports.",
+  "creators": [
+    {
+      "name": "Awuah, Michael Baffour",
+      "affiliation": "Independent researcher"
+    }
+  ],
+  "license": "MIT",
+  "keywords": [
+    "CFU",
+    "microbiology",
+    "R Shiny",
+    "ggplot2",
+    "publication figures",
+    "reproducibility"
+  ],
+  "upload_type": "software",
+  "access_right": "open"
+}

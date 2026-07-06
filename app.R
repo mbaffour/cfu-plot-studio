@@ -69,7 +69,7 @@ scale_breaks_or_default <- function(x) {
 plot_setting_ids <- c(
   "plot_mode", "comparison", "stats_method", "p_adjust", "p_adjust_scope", "label_kind", "show_ns",
   "y_mode", "error_type", "variation_display", "show_points", "y_min", "y_max",
-  "plot_title", "plot_subtitle", "show_subtitle", "hide_subtitle_no_stats",
+  "plot_title", "plot_subtitle", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption",
   "x_label", "treatment_unit", "append_treatment_unit", "time_unit", "append_time_unit",
   "legend_title", "bar_orientation", "plot_theme", "plot_box", "show_y_ticks",
   "show_minor_y_ticks", "show_y_grid", "show_minor_y_grid", "y_major_step", "y_minor_step",
@@ -91,7 +91,7 @@ select_setting_ids <- c(
 radio_setting_ids <- c("label_kind")
 
 checkbox_setting_ids <- c(
-  "show_ns", "show_points", "show_subtitle", "hide_subtitle_no_stats", "append_treatment_unit",
+  "show_ns", "show_points", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption", "append_treatment_unit",
   "append_time_unit", "plot_box", "show_y_ticks", "show_minor_y_ticks", "show_y_grid",
   "show_minor_y_grid", "ppt_editable"
 )
@@ -131,6 +131,48 @@ significance_label <- function(p) {
     p < 0.05 ~ "*",
     TRUE ~ "ns"
   )
+}
+
+# Okabe-Ito colorblind-safe qualitative palette (Wong 2011, Nat Methods 8:441).
+# Order chosen so the first two entries read clearly for the common 2-group CFU case.
+okabe_ito <- c(
+  "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+  "#E69F00", "#56B4E9", "#F0E442", "#000000"
+)
+
+# Human-readable label for the variation/error-bar summary, for figure captions.
+error_type_caption <- function(error_type, variation_display = "errorbar") {
+  if (identical(variation_display, "none")) return(NULL)
+  descr <- switch(
+    error_type %||% "SD",
+    "SD" = "error bars show mean ± SD",
+    "SEM" = "error bars show mean ± SEM",
+    "95% CI" = "error bars show mean with 95% CI",
+    "IQR" = "intervals show median IQR (Q1-Q3)",
+    "Range (min-max)" = "intervals show min-max range",
+    paste0("error bars: ", error_type)
+  )
+  descr
+}
+
+# Names the statistical test + multiple-comparison correction for figure captions.
+stats_caption <- function(stats_method, p_adjust) {
+  test_txt <- switch(
+    stats_method %||% "welch",
+    "welch" = "Welch t-test on log10(CFU)",
+    "student" = "Student t-test on log10(CFU)",
+    "emmeans" = "linear model + emmeans on log10(CFU)",
+    "statistical test"
+  )
+  corr_txt <- switch(
+    p_adjust %||% "BH",
+    "BH" = "Benjamini-Hochberg FDR",
+    "holm" = "Holm",
+    "bonferroni" = "Bonferroni",
+    "none" = "no",
+    p_adjust
+  )
+  paste0(test_txt, "; ", corr_txt, " correction")
 }
 
 named_palette <- function(levels_vec, seed_colors) {
@@ -632,6 +674,24 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   errorbar_lwd <- input$errorbar_width %||% 0.55
   stat_col <- input$stat_color %||% "grey15"
   variation_display <- input$variation_display %||% "errorbar"
+
+  # Auto methods caption: names error-bar type, and (when stats are shown) the
+  # test + multiple-comparison correction. User can disable via the sidebar.
+  caption_text <- NULL
+  if (isTRUE(input$show_method_caption %||% TRUE)) {
+    caption_parts <- c(error_type_caption(error_type, variation_display))
+    stats_on <- !identical(input$comparison %||% "auto", "none")
+    if (stats_on) {
+      caption_parts <- c(caption_parts, stats_caption(input$stats_method, input$p_adjust))
+    }
+    caption_parts <- caption_parts[nzchar(caption_parts %||% "")]
+    if (length(caption_parts) > 0) {
+      caption_text <- paste(caption_parts, collapse = "; ")
+      substr(caption_text, 1, 1) <- toupper(substr(caption_text, 1, 1))
+      caption_text <- paste0(caption_text, ".")
+    }
+  }
+
   finite_y <- range(c(sumdat$ymin, sumdat$ymax), finite = TRUE)
   if (!all(is.finite(finite_y))) finite_y <- c(0, 1)
   break_min <- if (!is.na(y_min)) y_min else finite_y[1]
@@ -802,7 +862,12 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- p + geom_text(data = ann, aes(x = x, y = y, label = label), inherit.aes = FALSE, size = input$stat_size, color = stat_col)
   }
 
-  p <- p + base_theme
+  if (!is.null(caption_text)) {
+    p <- p + labs(caption = caption_text)
+  }
+
+  p <- p + base_theme +
+    theme(plot.caption = element_text(size = (input$subtitle_size %||% 10) * 0.92, color = "grey35", hjust = 0))
 
   if (y_mode == "raw_log_axis") {
     p <- p + scale_y_log10(breaks = major_breaks, minor_breaks = minor_breaks, guide = y_guide)
@@ -1466,6 +1531,7 @@ ui <- fluidPage(
       textInput("plot_subtitle", "Plot subtitle", value = "Stars show BH-adjusted comparisons: ns, * q<0.05, ** q<0.01, *** q<0.001"),
       checkboxInput("show_subtitle", "Show subtitle", value = TRUE),
       checkboxInput("hide_subtitle_no_stats", "Hide subtitle when statistics are set to None", value = TRUE),
+      checkboxInput("show_method_caption", "Show methods caption (error-bar type, test, correction)", value = TRUE),
       textInput("x_label", "X-axis label", value = "Treatment"),
       textInput("treatment_unit", "Treatment unit suffix", value = ""),
       checkboxInput("append_treatment_unit", "Append unit to numeric treatment labels", value = FALSE),
@@ -1495,8 +1561,10 @@ ui <- fluidPage(
       colourInput("bar_outline_color", "Bar/point outline color", value = "#262626"),
       sliderInput("bar_outline_width", "Bar outline width", min = 0, max = 1.5, value = 0.25),
       sliderInput("errorbar_width", "Error bar line width", min = 0.2, max = 2, value = 0.55),
-      colourInput("sample_color_1", "Sample color 1", value = "#4C78A8"),
-      colourInput("sample_color_2", "Sample color 2", value = "#E45756"),
+      actionButton("apply_okabe_ito", "Apply Okabe-Ito colorblind palette"),
+      helpText("Okabe-Ito is a colorblind-safe qualitative palette (Wong 2011). Applies to sample, time, and single-bar colors."),
+      colourInput("sample_color_1", "Sample color 1", value = "#0072B2"),
+      colourInput("sample_color_2", "Sample color 2", value = "#D55E00"),
       colourInput("time_color_1", "0 min color", value = "#7AA6C2"),
       colourInput("time_color_2", "120 min color", value = "#2F5D8C"),
       colourInput("single_color", "Single-bar color", value = "#7AA6C2"),
@@ -1692,6 +1760,15 @@ server <- function(input, output, session) {
     updateCheckboxInput(session, "show_y_grid", value = TRUE)
     updateSliderInput(session, "font_size", value = 12)
     updateSliderInput(session, "title_size", value = 15)
+  })
+
+  observeEvent(input$apply_okabe_ito, {
+    updateColourInput(session, "sample_color_1", value = okabe_ito[1])
+    updateColourInput(session, "sample_color_2", value = okabe_ito[2])
+    updateColourInput(session, "time_color_1", value = okabe_ito[1])
+    updateColourInput(session, "time_color_2", value = okabe_ito[2])
+    updateColourInput(session, "single_color", value = okabe_ito[1])
+    showNotification("Applied Okabe-Ito colorblind-safe palette.", type = "message")
   })
 
   observeEvent(input$size_single_col, {
@@ -2192,6 +2269,25 @@ server <- function(input, output, session) {
       "subtitle_text <- if (isTRUE(settings$show_subtitle)) settings$plot_subtitle else NULL",
       "y_lab <- if (identical(y_mode, 'log10')) expression(log[10]~'CFU') else 'CFU'",
       "",
+      "# Methods caption: names error-bar type and (when stats shown) test + correction.",
+      "caption_text <- NULL",
+      "if (isTRUE(settings$show_method_caption %||% TRUE)) {",
+      "  err_txt <- switch(settings$error_type %||% 'SD',",
+      "    'SD' = 'Error bars show mean ± SD', 'SEM' = 'Error bars show mean ± SEM',",
+      "    '95% CI' = 'Error bars show mean with 95% CI', 'IQR' = 'Intervals show median IQR (Q1-Q3)',",
+      "    'Range (min-max)' = 'Intervals show min-max range', paste0('Error bars: ', settings$error_type))",
+      "  if (identical(settings$variation_display %||% 'errorbar', 'none')) err_txt <- NULL",
+      "  parts <- err_txt",
+      "  if (!identical(settings$comparison %||% 'auto', 'none')) {",
+      "    test_txt <- switch(settings$stats_method %||% 'welch', 'welch' = 'Welch t-test on log10(CFU)',",
+      "      'student' = 'Student t-test on log10(CFU)', 'emmeans' = 'linear model + emmeans on log10(CFU)', 'statistical test')",
+      "    corr_txt <- switch(settings$p_adjust %||% 'BH', 'BH' = 'Benjamini-Hochberg FDR', 'holm' = 'Holm',",
+      "      'bonferroni' = 'Bonferroni', 'none' = 'no', settings$p_adjust)",
+      "    parts <- c(parts, paste0(test_txt, '; ', corr_txt, ' correction'))",
+      "  }",
+      "  if (length(parts) > 0) caption_text <- paste0(paste(parts, collapse = '; '), '.')",
+      "}",
+      "",
       "if (identical(plot_mode, 'combined')) {",
       "  pal <- named_palette(levels(sumdat$sample), c(settings$sample_color_1, settings$sample_color_2))",
       "  p <- ggplot(sumdat, aes(concentration_label, mean_y, fill = sample)) +",
@@ -2213,7 +2309,7 @@ server <- function(input, output, session) {
       "  if (isTRUE(settings$show_points)) p <- p + geom_point(data = dat, aes(concentration_label, if (identical(y_mode, 'log10')) log10_cfu else cfu), position = position_jitter(width = settings$jitter_width %||% 0.08, height = 0), shape = 21, size = settings$point_size %||% 1.8, fill = settings$single_color %||% '#7AA6C2', color = outline_col, stroke = 0.25, alpha = settings$point_alpha %||% 0.9)",
       "}",
       "",
-      "p <- p + scale_x_discrete(drop = FALSE) + labs(x = settings$x_label %||% 'Treatment', y = y_lab, fill = settings$legend_title %||% '', title = settings$plot_title %||% '', subtitle = subtitle_text) + base_theme",
+      "p <- p + scale_x_discrete(drop = FALSE) + labs(x = settings$x_label %||% 'Treatment', y = y_lab, fill = settings$legend_title %||% '', title = settings$plot_title %||% '', subtitle = subtitle_text, caption = caption_text) + base_theme + theme(plot.caption = element_text(size = (settings$subtitle_size %||% 10) * 0.92, color = 'grey35', hjust = 0))",
       "if (nrow(ann) > 0 && all(c('x', 'y', 'label') %in% names(ann))) p <- p + geom_text(data = ann, aes(x = x, y = y, label = label), inherit.aes = FALSE, size = settings$stat_size %||% 3, color = settings$stat_color %||% 'grey15')",
       "if (identical(y_mode, 'raw_log_axis')) p <- p + scale_y_log10() else p <- p + scale_y_continuous(expand = expansion(mult = c(0, 0.08)))",
       "if (identical(settings$bar_orientation, 'horizontal')) p <- p + coord_flip(clip = 'off')",

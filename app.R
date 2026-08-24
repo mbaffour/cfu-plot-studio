@@ -121,6 +121,7 @@ scale_breaks_or_default <- function(x) {
 plot_setting_ids <- c(
   "plot_mode", "comparison", "stats_method", "p_adjust", "p_adjust_scope", "label_kind", "show_ns",
   "y_mode", "chart_geom", "bar_color_mode", "error_type", "variation_display", "show_points", "y_min", "y_max",
+  "surv_baseline", "surv_readout", "surv_scale",
   "plot_title", "plot_subtitle", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption",
   "x_label", "y_label", "treatment_unit", "append_treatment_unit", "time_unit", "append_time_unit",
   "show_n_labels", "legend_title", "bar_orientation", "plot_theme", "plot_box", "show_y_ticks",
@@ -139,7 +140,11 @@ plot_setting_ids <- c(
 select_setting_ids <- c(
   "plot_mode", "comparison", "stats_method", "p_adjust", "p_adjust_scope", "y_mode",
   "error_type", "variation_display", "bar_orientation", "plot_theme", "legend_position",
-  "size_units", "chart_geom", "bar_color_mode"
+  "size_units", "chart_geom", "bar_color_mode",
+  # slider_setting_ids is a setdiff residual, so a select id missing from this
+  # list gets updateSliderInput called against it: no error, no effect, and the
+  # preset silently fails to restore.
+  "surv_baseline", "surv_readout", "surv_scale"
 )
 
 radio_setting_ids <- c("label_kind")
@@ -601,6 +606,128 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
     )
 }
 
+# Paired effect size for the survival readout. d_z uses the SD of the
+# within-replicate differences, which is a different denominator from the
+# two-sample Hedges' g -- conflating them overstates or understates the effect
+# by a large factor, so the two are reported under different column names.
+paired_dz <- function(d) {
+  if (length(d) < 2) return(NA_real_)
+  s <- sd(d)
+  if (!is.finite(s) || s == 0) return(NA_real_)
+  mean(d) / s
+}
+
+run_survival_stats <- function(surv, comparison, p_adjust, adjustment_scope,
+                               control_concentration, ttest_type) {
+  if (!is_survival_frame(surv)) {
+    return(tibble(message = "Survival statistics require a paired survival frame."))
+  }
+  if (identical(comparison, "none")) return(tibble())
+  if (identical(comparison, "time")) {
+    return(tibble(message = paste(
+      "The timepoint comparison is not available on a survival readout:",
+      "both timepoints have already been consumed to form the ratio.",
+      "Use 'Survival vs no change' instead."
+    )))
+  }
+
+  if (!identical(comparison, "survival_vs_zero")) {
+    # The survival frame carries the per-replicate log ratio in log10_cfu, so
+    # the existing pairwise machinery tests exactly the right quantity -- these
+    # comparisons are unpaired BETWEEN cells even though the values inside each
+    # cell are paired.
+    out <- run_groupwise_t_tests(surv, comparison, p_adjust, adjustment_scope,
+                                 control_concentration, ttest_type)
+    if (nrow(out) > 0 && "test" %in% names(out)) {
+      out <- out %>% mutate(
+        test = sub("on log10\\(CFU\\)", "on log10 survival ratio", test),
+        effect_size_kind = "two-sample (Hedges g)"
+      )
+    }
+    return(out)
+  }
+
+  if (nrow(surv) == 0) return(tibble())
+  cells <- surv %>% distinct(sample, concentration_label)
+  out <- bind_rows(lapply(seq_len(nrow(cells)), function(i) {
+    d <- surv %>%
+      filter(sample == cells$sample[i], concentration_label == cells$concentration_label[i]) %>%
+      pull(log10_cfu)
+    n <- length(d)
+    base <- tibble(
+      comparison_family = "Survival versus no change, within sample/vector and treatment",
+      contrast = "survival vs no change",
+      sample = as.character(cells$sample[i]),
+      concentration_label = cells$concentration_label[i],
+      time_min = NA_character_,
+      panel = as.character(cells$sample[i]),
+      numerator = "readout", denominator = "baseline",
+      n_pairs = n, pair_rank = 1
+    )
+    if (n < 2) {
+      return(base %>% mutate(
+        estimate = if (n == 1) d[1] else NA_real_,
+        conf.low = NA_real_, conf.high = NA_real_, hedges_g = NA_real_,
+        d_z = NA_real_, statistic = NA_real_, parameter = NA_real_, p.value = NA_real_,
+        stderr = NA_real_,
+        message = if (n == 0) "No complete pairs at this cell." else
+          "n = 1 pair: point estimate only, no inference."
+      ))
+    }
+    s <- sd(d)
+    if (!is.finite(s) || s == 0) {
+      # Every replicate moved by exactly the same amount. t.test() returns a NaN
+      # statistic when that constant equals mu and hard-errors when it does not,
+      # so neither a bare call nor a tryCatch alone is sufficient.
+      return(base %>% mutate(
+        estimate = mean(d), conf.low = NA_real_, conf.high = NA_real_,
+        hedges_g = NA_real_, d_z = NA_real_, statistic = NA_real_,
+        parameter = NA_real_, p.value = NA_real_, stderr = 0,
+        message = "Every replicate changed by an identical amount, so the spread is zero and no t-test is defined."
+      ))
+    }
+    tt <- tryCatch(t.test(d, mu = 0), error = function(e) e)
+    if (inherits(tt, "error")) {
+      return(base %>% mutate(
+        estimate = mean(d), conf.low = NA_real_, conf.high = NA_real_,
+        hedges_g = NA_real_, d_z = NA_real_, statistic = NA_real_,
+        parameter = NA_real_, p.value = NA_real_, stderr = NA_real_,
+        message = conditionMessage(tt)
+      ))
+    }
+    base %>% mutate(
+      estimate = mean(d),
+      conf.low = unname(tt$conf.int[1]), conf.high = unname(tt$conf.int[2]),
+      hedges_g = NA_real_, d_z = paired_dz(d),
+      statistic = unname(tt$statistic), parameter = unname(tt$parameter),
+      p.value = unname(tt$p.value), stderr = unname(tt$stderr %||% (s / sqrt(n))),
+      message = NA_character_
+    )
+  }))
+
+  # A NaN p survives p.adjust and then makes every comparison against it NA
+  # rather than "ns", so it would silently draw nothing. Scrub before adjusting.
+  out <- out %>% mutate(p.value = ifelse(is.finite(p.value), p.value, NA_real_))
+
+  adjust_stats(out, p_adjust, adjustment_scope) %>%
+    mutate(
+      test = "One-sample t-test on log10 survival ratio (paired within replicate)",
+      estimate_log10_difference = estimate,
+      fold_change = 10^estimate,
+      fold_change_low = 10^conf.low,
+      fold_change_high = 10^conf.high,
+      percent_survival = 100 * 10^estimate,
+      effect_size_kind = "paired (d_z)"
+    ) %>%
+    select(
+      comparison_family, test, contrast, sample, concentration_label, n_pairs,
+      estimate_log10_difference, conf.low, conf.high,
+      fold_change, fold_change_low, fold_change_high, percent_survival,
+      d_z, effect_size_kind, statistic, parameter, p.value, q.value,
+      significance, p_adjust_method, adjustment_scope, message, everything()
+    )
+}
+
 run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
   if (nrow(dat) < 3 || n_distinct(dat$log10_cfu) < 2) return(tibble())
   if (comparison == "sample" && n_distinct(dat$sample) < 2) return(tibble(message = "Sample comparison requires at least two samples."))
@@ -671,12 +798,219 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
     )
 }
 
-plot_summary <- function(dat, plot_mode, y_mode, error_type) {
+# ---------------------------------------------------------------------------
+# Paired survival readout
+# ---------------------------------------------------------------------------
+# For an induction time-course the readout is survival: CFU at the readout
+# timepoint relative to CFU at baseline, WITHIN THE SAME CULTURE.
+#
+# Why pair at all. For a cell where every replicate has both timepoints, the
+# paired point estimate is algebraically IDENTICAL to the marginal one --
+# mean(a_i - b_i) == mean(a_i) - mean(b_i) is an identity. Pairing buys two
+# things instead:
+#   1. The standard error becomes the SD of within-replicate differences rather
+#      than the pooled spread across replicates. On cultures whose starting
+#      titres differ by orders of magnitude that is the difference between
+#      p = 0.002 and p = 0.5 on the same estimate.
+#   2. When a replicate is missing one timepoint, the marginal estimator
+#      subtracts a baseline mean containing a replicate the readout mean cannot
+#      contain, charging that replicate's titre to the treatment effect. On the
+#      gp75 dummy file that flips the sign of the biology at one dose.
+SURVIVAL_READOUT_MARKER <- "survival_log10_ratio"
+
+# A survival frame reuses the plotting contract column names, so nothing
+# downstream can tell it apart by shape alone. This marker is how the survival
+# code paths refuse to run against raw counts, and vice versa.
+is_survival_frame <- function(x) {
+  is.data.frame(x) && "readout" %in% names(x) &&
+    (nrow(x) == 0 || all(as.character(x$readout) == SURVIVAL_READOUT_MARKER, na.rm = TRUE))
+}
+
+# Timepoint levels in true chronological order. format_label() already sorts
+# numerically when every time parses as a number, but falls back to order of
+# appearance for labels like "pre"/"post" -- so never assume levels()[1] is the
+# baseline without consulting time_value.
+survival_time_levels <- function(dat) {
+  lv <- levels(droplevels(dat$time_min))
+  if (length(lv) == 0 || !"time_value" %in% names(dat)) return(lv)
+  v <- vapply(lv, function(l) {
+    vals <- dat$time_value[as.character(dat$time_min) == l]
+    if (length(vals) == 0) NA_real_ else vals[1]
+  }, numeric(1))
+  if (all(is.finite(v))) lv[order(v)] else lv
+}
+
+survival_time_label <- function(baseline_time, readout_time) {
+  paste(readout_time, "vs", baseline_time)
+}
+
+# Axis text for each display scale. All three scales plot the SAME underlying
+# quantity (the log10 ratio) and differ only in how the ticks are written, so
+# switching scale never rescales or distorts the data.
+survival_axis_label <- function(surv_scale, baseline_time, readout_time) {
+  ctx <- paste0(" (", readout_time, " vs ", baseline_time, ")")
+  switch(
+    surv_scale %||% "log10",
+    "fold"    = paste0("Fold change in CFU/mL", ctx),
+    "percent" = paste0("Survival, % of baseline CFU/mL", ctx),
+    bquote(log[10] ~ "survival ratio" ~ .(ctx))
+  )
+}
+
+survival_scale_labeller <- function(surv_scale) {
+  switch(
+    surv_scale %||% "log10",
+    # format() pads a vector to a common width, so each tick is formatted alone.
+    "fold" = function(x) vapply(x, function(v) {
+      if (!is.finite(v)) return("")
+      paste0(format(10^v, drop0trailing = TRUE, scientific = FALSE, trim = TRUE), "x")
+    }, character(1)),
+    "percent" = function(x) vapply(x, function(v) {
+      if (!is.finite(v)) return("")
+      paste0(format(100 * 10^v, drop0trailing = TRUE, scientific = FALSE, trim = TRUE), "%")
+    }, character(1)),
+    waiver()
+  )
+}
+
+# Collapse technical duplicates on the LOG scale before joining. A pairing key
+# with two rows is either a genuine technical duplicate or a mislabelled
+# replicate; qc_summary already flags it, and averaging the logs (a geometric
+# mean of the counts) is the only aggregation consistent with everything else
+# here. The count is returned so it can be declared rather than assumed.
+survival_side <- function(dat, which_time, value_name, n_name) {
+  key <- c("sample", "concentration_label", "replicate")
+  dat %>%
+    filter(as.character(time_min) == which_time) %>%
+    # A blank replicate label cannot be matched to a replicate. Left in, dplyr's
+    # default na_matches = "na" pairs one unlabelled baseline well with one
+    # unlabelled readout well from anywhere in the cell, inventing a data point
+    # that no QC channel reports.
+    filter(!is.na(replicate), nzchar(trimws(as.character(replicate)))) %>%
+    group_by(across(all_of(key))) %>%
+    summarize(
+      !!value_name := mean(log10_cfu, na.rm = TRUE),
+      !!n_name := dplyr::n(),
+      .groups = "drop"
+    )
+}
+
+pair_survival <- function(dat, baseline_time, readout_time) {
+  key <- c("sample", "concentration_label", "replicate")
+  empty <- tibble(
+    sample = factor(), concentration_label = factor(), replicate = factor(),
+    time_min = factor(), baseline_log10 = numeric(), readout_log10 = numeric(),
+    log10_cfu = numeric(), cfu = numeric(),
+    n_tech_baseline = integer(), n_tech_readout = integer(), readout = character()
+  )
+  if (is.null(dat) || nrow(dat) == 0) return(empty)
+  lv <- levels(droplevels(dat$time_min))
+  if (!(baseline_time %in% lv) || !(readout_time %in% lv) ||
+      identical(baseline_time, readout_time)) {
+    return(empty)
+  }
+
+  base <- survival_side(dat, baseline_time, "baseline_log10", "n_tech_baseline")
+  read <- survival_side(dat, readout_time, "readout_log10", "n_tech_readout")
+
+  out <- inner_join(base, read, by = key, na_matches = "never") %>%
+    mutate(
+      log10_cfu = readout_log10 - baseline_log10,
+      # cfu holds the fold change so it stays strictly positive: the raw-log
+      # axis path and anything that assumes cfu > 0 keeps working.
+      cfu = 10^log10_cfu,
+      time_min = factor(survival_time_label(baseline_time, readout_time)),
+      readout = SURVIVAL_READOUT_MARKER
+    )
+  if (nrow(out) == 0) return(empty)
+
+  # Preserve the treatment order the rest of the app plots in.
+  out %>%
+    mutate(concentration_label = factor(concentration_label,
+                                        levels = levels(droplevels(dat$concentration_label))),
+           sample = factor(sample, levels = levels(droplevels(dat$sample)))) %>%
+    arrange(sample, concentration_label, replicate) %>%
+    select(sample, concentration_label, replicate, time_min,
+           baseline_log10, readout_log10, log10_cfu, cfu,
+           n_tech_baseline, n_tech_readout, readout)
+}
+
+# Everything the figure and the QC tab need to say about what pairing cost.
+survival_pairing_qc <- function(dat, baseline_time, readout_time) {
+  key <- c("sample", "concentration_label", "replicate")
+  blank <- list(units = 0L, complete = 0L, baseline_only = 0L, readout_only = 0L,
+                tech_collapsed = 0L, unlabelled = 0L, empty_cells = character(0), ok = FALSE,
+                reason = "Survival needs two different timepoints that both exist in the data.")
+  if (is.null(dat) || nrow(dat) == 0) return(blank)
+  lv <- levels(droplevels(dat$time_min))
+  if (!(baseline_time %in% lv) || !(readout_time %in% lv)) return(blank)
+  if (identical(baseline_time, readout_time)) {
+    blank$reason <- "Baseline and readout timepoints must be different."
+    return(blank)
+  }
+
+  base <- survival_side(dat, baseline_time, "baseline_log10", "n_tech_baseline")
+  read <- survival_side(dat, readout_time, "readout_log10", "n_tech_readout")
+  complete <- inner_join(base, read, by = key, na_matches = "never")
+
+  # Wells with no replicate label are excluded from pairing entirely. They are
+  # not orphans -- an orphan lost its partner, these could never have had one --
+  # so they get their own count rather than disappearing.
+  unlabelled <- dat %>%
+    filter(as.character(time_min) %in% c(baseline_time, readout_time)) %>%
+    filter(is.na(replicate) | !nzchar(trimws(as.character(replicate)))) %>%
+    nrow()
+
+  # Cells that exist in the data but end up with no complete pair at all. These
+  # vanish from the figure entirely, so they have to be named.
+  cells <- dat %>% distinct(sample, concentration_label)
+  have <- complete %>% distinct(sample, concentration_label) %>% mutate(.ok = TRUE)
+  gone <- cells %>% left_join(have, by = c("sample", "concentration_label")) %>%
+    filter(is.na(.ok))
+
+  list(
+    units = nrow(dplyr::full_join(base, read, by = key)),
+    complete = nrow(complete),
+    baseline_only = nrow(anti_join(base, read, by = key)),
+    readout_only = nrow(anti_join(read, base, by = key)),
+    tech_collapsed = sum(c(base$n_tech_baseline, read$n_tech_readout) - 1L),
+    unlabelled = unlabelled,
+    empty_cells = if (nrow(gone) == 0) character(0) else
+      paste(gone$sample, "@", gone$concentration_label),
+    ok = nrow(complete) > 0,
+    reason = if (nrow(complete) > 0) NA_character_ else
+      "No replicate has both timepoints, so no survival ratio can be formed."
+  )
+}
+
+# Summary table for the survival readout. summary_cfu() would take the
+# ARITHMETIC mean of the cfu column, which on this frame is a ratio -- that
+# publishes a different number than the figure plots.
+summary_survival <- function(surv) {
+  if (nrow(surv) == 0) return(tibble())
+  surv %>%
+    group_by(sample, concentration_label) %>%
+    summarize(
+      n_pairs = dplyr::n(),
+      mean_log10_ratio = mean(log10_cfu),
+      sd_log10_ratio = sd(log10_cfu),
+      sem_log10_ratio = sd_log10_ratio / sqrt(n_pairs),
+      geometric_fold_change = 10^mean_log10_ratio,
+      percent_survival = 100 * 10^mean_log10_ratio,
+      median_log10_ratio = median(log10_cfu),
+      .groups = "drop"
+    )
+}
+
+plot_summary <- function(dat, plot_mode, y_mode, error_type, clamp_zero = TRUE) {
+  # Same reason as make_cfu_plot: the survival value is a log ratio already.
+  if (identical(plot_mode, "survival")) y_mode <- "log10"
   group_cols <- switch(
     plot_mode,
     combined = c("concentration_label", "sample", "time_min"),
     sample_both = c("concentration_label", "time_min"),
     sample_time = c("concentration_label"),
+    survival = c("concentration_label", "sample"),
     c("concentration_label", "sample", "time_min")
   )
 
@@ -707,7 +1041,15 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type) {
       ymax = if (error_type == "IQR") q3_y
              else if (error_type == "Range (min-max)") max_y
              else mean_y + err_y,
-      ymin = pmax(ymin, if (y_mode == "raw_log_axis") .Machine$double.eps else 0)
+      # A log10 CFU count cannot go below 0, so clamping the lower whisker there
+      # is right for absolute counts. A log10 SURVIVAL RATIO is signed -- 0 is
+      # "no change", not a floor -- and clamping it would draw a group that lost
+      # a log as though its error bar reached no-change. Hence clamp_zero.
+      # The raw-log-axis floor is unconditional: that axis is log-transformed
+      # and cannot take zero whatever the quantity means.
+      ymin = if (y_mode == "raw_log_axis") pmax(ymin, .Machine$double.eps)
+             else if (isTRUE(clamp_zero)) pmax(ymin, 0)
+             else ymin
     )
 }
 
@@ -736,7 +1078,21 @@ apply_annotation_offsets <- function(ann, offsets) {
   ann
 }
 
-annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, show_ns, y_mode) {
+# The plot_mode -> default comparison map lives here so make_cfu_plot's caption
+# and the server's active_comparison() cannot disagree about which test ran.
+resolve_auto_comparison <- function(plot_mode) {
+  switch(
+    plot_mode %||% "combined",
+    combined = "sample",
+    sample_both = "time",
+    sample_time = "concentration_vs_control",
+    survival = "survival_vs_zero",
+    "sample"
+  )
+}
+
+annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, show_ns, y_mode,
+                            dodge_width = 0.78) {
   if (nrow(stats) == 0) return(tibble())
   if (!all(c("label_stars", "label_q", "p.value") %in% names(stats))) return(tibble())
 
@@ -755,23 +1111,83 @@ annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, sh
     mutate(label = .data[[label_col]])
 
   if (!isTRUE(show_ns)) {
-    stats <- stats %>% filter(label != "ns")
+    stats <- stats %>% filter(!is.na(label), label != "ns")
   }
+  # A cell where no test could run (one pair, or zero spread) has no label at
+  # all. Dropping it here rather than letting ggplot discard an NA keeps the
+  # "Removed rows" warning off the console; the n row under the axis and the
+  # Figure QA pairing check are what tell the reader those cells exist.
+  stats <- stats %>% filter(!is.na(label))
 
   if (nrow(stats) == 0) return(tibble())
 
-  pad <- if (y_mode == "raw_log_axis") 0.25 * max(sumdat$ymax, na.rm = TRUE) else 0.45
+  # On a raw log axis the pad is proportional -- but 0.25 * max(ymax) goes
+  # NEGATIVE when every group sits below the reference, which on a survival
+  # figure means every dose killed. That would push the labels underneath the
+  # data. Floor it on the span instead.
+  pad <- if (y_mode == "raw_log_axis") {
+    # The original proportional pad, unchanged whenever it is usable. It is only
+    # replaced when max(ymax) is non-finite (every group single-replicate) or
+    # non-positive (every group below the reference on a survival figure), where
+    # 0.25 * top would be zero or negative and push labels under the data.
+    top <- suppressWarnings(max(sumdat$ymax, na.rm = TRUE))
+    if (is.finite(top) && top > 0) {
+      0.25 * top
+    } else {
+      v <- c(sumdat$ymin, sumdat$ymax, sumdat$mean_y)
+      v <- v[is.finite(v)]
+      span <- if (length(v) > 1) diff(range(v)) else 0
+      max(0.08 * span, .Machine$double.eps)
+    }
+  } else {
+    0.45
+  }
 
-  if (comparison == "sample") {
+  # A group with a single replicate has no interval, so ymax is NA and
+  # max(na.rm = TRUE) returns -Inf. Fall back to the mean so the label still
+  # lands on the data instead of at negative infinity.
+  safe_top <- function(ymax, mean_y) {
+    # Prefer the interval tops, exactly as the original max(ymax, na.rm = TRUE)
+    # did. Only when EVERY ymax in the group is non-finite (which made the old
+    # code return -Inf) does the mean stand in. Widening this to always consider
+    # mean_y lifts valid labels off their own bars whenever a sibling group has
+    # a single replicate.
+    v <- ymax[is.finite(ymax)]
+    if (length(v) > 0) return(max(v))
+    v <- mean_y[is.finite(mean_y)]
+    if (length(v) > 0) max(v) else NA_real_
+  }
+
+  if (comparison == "survival_vs_zero") {
+    # One test per bar, so the labels have to be dodged the same way the bars
+    # are or every sample's star lands on the same x.
+    lv <- levels(droplevels(sumdat$sample))
+    k <- max(length(lv), 1)
     yref <- sumdat %>%
-      group_by(concentration_label, time_min) %>%
-      summarize(y = max(ymax, na.rm = TRUE) + pad, .groups = "drop")
-    out <- stats %>% left_join(yref, by = c("concentration_label", "time_min")) %>%
+      group_by(concentration_label, sample) %>%
+      summarize(y = safe_top(ymax, mean_y) + pad, .groups = "drop")
+    out <- stats %>%
+      mutate(sample = factor(as.character(sample), levels = lv)) %>%
+      left_join(yref, by = c("concentration_label", "sample")) %>%
+      mutate(
+        x = concentration_label,
+        dodge_offset = if (k > 1) (match(as.character(sample), lv) - (k + 1) / 2) * (dodge_width / k) else 0
+      )
+  } else if (comparison == "sample") {
+    # A survival summary is collapsed over time, so it has no time_min column to
+    # group by. Key on whatever both frames actually carry.
+    grp <- intersect(c("concentration_label", "time_min"),
+                     intersect(names(sumdat), names(stats)))
+    if (length(grp) == 0) return(tibble())
+    yref <- sumdat %>%
+      group_by(across(all_of(grp))) %>%
+      summarize(y = safe_top(ymax, mean_y) + pad, .groups = "drop")
+    out <- stats %>% left_join(yref, by = grp) %>%
       mutate(x = concentration_label)
   } else if (comparison == "time") {
     yref <- sumdat %>%
       group_by(concentration_label) %>%
-      summarize(y = max(ymax, na.rm = TRUE) + pad, .groups = "drop")
+      summarize(y = safe_top(ymax, mean_y) + pad, .groups = "drop")
     out <- stats %>% left_join(yref, by = "concentration_label") %>%
       mutate(x = concentration_label)
   } else if (comparison == "concentration_vs_control") {
@@ -779,7 +1195,7 @@ annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, sh
       mutate(concentration_label = sub(" - .*", "", contrast))
     yref <- sumdat %>%
       group_by(concentration_label) %>%
-      summarize(y = max(ymax, na.rm = TRUE) + pad, .groups = "drop")
+      summarize(y = safe_top(ymax, mean_y) + pad, .groups = "drop")
     out <- stats %>% left_join(yref, by = "concentration_label") %>%
       mutate(x = concentration_label)
   } else {
@@ -790,7 +1206,9 @@ annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, sh
   # continuously along it, which a factor level cannot be, and it is what the
   # canvas drag writes its offsets into.
   x_levels <- levels(sumdat$concentration_label)
-  out %>% mutate(x_pos = match(as.character(x), x_levels))
+  out %>% mutate(
+    x_pos = match(as.character(x), x_levels) + (if ("dodge_offset" %in% names(out)) dodge_offset else 0)
+  )
 }
 
 plot_group_cols <- function(plot_mode) {
@@ -799,6 +1217,7 @@ plot_group_cols <- function(plot_mode) {
     combined = c("time_min", "concentration_label", "sample"),
     sample_both = c("concentration_label", "time_min"),
     sample_time = c("concentration_label"),
+    survival = c("concentration_label", "sample"),
     c("time_min", "concentration_label", "sample")
   )
 }
@@ -835,6 +1254,7 @@ bar_key_columns <- function(plot_mode) {
     combined    = c("sample", "concentration_label"),
     sample_both = c("time_min", "concentration_label"),
     sample_time = "concentration_label",
+    survival    = c("sample", "concentration_label"),
     c("sample", "concentration_label")
   )
 }
@@ -852,10 +1272,24 @@ bar_keys <- function(dat, plot_mode) {
 bar_color_input_id <- function(key) paste0("barcol_", make.names(key))
 
 make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input, bar_palette = NULL) {
+  is_survival <- identical(plot_mode, "survival")
+  # The plotted quantity is already a log10 ratio. Sending it through the
+  # raw-CFU log axis would log it a second time: the reference line collapses to
+  # -Inf, and every replicate that lost ground becomes log10 of a negative
+  # number and is silently dropped. Surface scale choice lives in surv_scale.
+  if (is_survival) y_mode <- "log10"
+
   # CFU/mL, CFU/plate and CFU/OD are different quantities; let the axis say which.
   y_quantity <- trimws(input$y_label %||% "")
   if (!nzchar(y_quantity)) y_quantity <- "CFU/mL"
-  y_lab <- if (y_mode == "log10") bquote(log[10] ~ .(y_quantity)) else y_quantity
+  y_lab <- if (is_survival) {
+    survival_axis_label(input$surv_scale, input$surv_baseline %||% "baseline",
+                        input$surv_readout %||% "readout")
+  } else if (y_mode == "log10") {
+    bquote(log[10] ~ .(y_quantity))
+  } else {
+    y_quantity
+  }
   y_min <- axis_limit(input$y_min)
   y_max <- axis_limit(input$y_max)
   if (y_mode == "raw_log_axis" && !is.na(y_min) && y_min <= 0) {
@@ -921,31 +1355,47 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   max_x_chars <- suppressWarnings(max(nchar(as.character(unique(sumdat$concentration_label))), 1, na.rm = TRUE))
   tick_extent_pt <- base_pt * (cos(x_angle_rad) + max_x_chars * 0.55 * sin(x_angle_rad))
   n_row_offset_pt <- 5 + tick_extent_pt + 4
+  # On a survival figure n counts PAIRS, not wells: a well whose partner was
+  # lost contributes nothing, so calling these "replicates" would overstate it.
+  n_unit <- if (is_survival) "complete pairs" else "replicates"
   n_caption <- if (length(group_ns) == 0) {
     ""
   } else if (n_is_constant) {
-    paste0("n = ", group_ns[1], " replicates per group")
+    paste0("n = ", group_ns[1], " ", n_unit, " per group")
   } else if (draw_n_labels) {
-    paste0("n = ", min(group_ns), "-", max(group_ns), " replicates per group (n row under the axis)")
+    paste0("n = ", min(group_ns), "-", max(group_ns), " ", n_unit, " per group (n row under the axis)")
   } else {
-    paste0("n = ", min(group_ns), "-", max(group_ns), " replicates per group")
+    paste0("n = ", min(group_ns), "-", max(group_ns), " ", n_unit, " per group")
   }
 
   # Auto methods caption: names error-bar type, replicate n, and (when stats are
   # shown) the test + multiple-comparison correction. Disable via the sidebar.
   caption_text <- NULL
   if (isTRUE(input$show_method_caption %||% TRUE)) {
-    caption_parts <- c(error_type_caption(error_type, variation_display), n_caption)
-    stats_on <- !identical(input$comparison %||% "auto", "none")
-    if (stats_on) {
-      caption_parts <- c(caption_parts, stats_caption(input$stats_method, input$p_adjust))
+    survival_caption <- if (is_survival) {
+      paste0("survival is ", input$surv_readout %||% "readout", " relative to ",
+             input$surv_baseline %||% "baseline",
+             ", paired within each replicate; the reference line is no change")
+    } else NULL
+    caption_parts <- c(error_type_caption(error_type, variation_display),
+                       survival_caption, n_caption)
+    resolved_cmp <- input$comparison %||% "auto"
+    if (identical(resolved_cmp, "auto")) resolved_cmp <- resolve_auto_comparison(plot_mode)
+    # A survival test outside survival mode, or a timepoint test inside it, is
+    # refused by current_stats() -- so no test ran and the caption must not
+    # claim one. The caption and the Statistics tab have to tell one story.
+    stats_ran <- !identical(input$comparison %||% "auto", "none") &&
+      !(identical(resolved_cmp, "survival_vs_zero") && !is_survival) &&
+      !(identical(resolved_cmp, "time") && is_survival)
+    if (stats_ran) {
+      caption_parts <- c(caption_parts, if (identical(resolved_cmp, "survival_vs_zero") && is_survival) {
+        paste0("one-sample t-test of the log10 survival ratio against no change; ",
+               sub("^.*; ", "", stats_caption(input$stats_method, input$p_adjust)))
+      } else {
+        stats_caption(input$stats_method, input$p_adjust)
+      })
       # When more pairs were tested than the plot can annotate, the figure must
       # say which pair its stars refer to.
-      resolved_cmp <- input$comparison %||% "auto"
-      if (identical(resolved_cmp, "auto")) {
-        resolved_cmp <- switch(plot_mode, combined = "sample", sample_both = "time",
-                               sample_time = "concentration_vs_control", "sample")
-      }
       if (identical(resolved_cmp, "sample") && nlevels(droplevels(dat$sample)) > 2) {
         lv <- levels(droplevels(dat$sample))
         caption_parts <- c(caption_parts, paste0(
@@ -1113,6 +1563,15 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     # Anchor to a real y value, not -Inf: on a log10 axis -Inf transforms to NaN
     # and every label is silently dropped.
     n_y <- if (!is.na(y_min)) y_min else finite_y[1]
+    # The offset below is measured from the PANEL bottom, which is not y_min
+    # when the scale expands downwards -- a survival axis does, because it runs
+    # in both directions from the reference. Without this the n row lands on
+    # top of the tick labels.
+    if (is_survival && identical(y_mode, "log10")) {
+      lo <- if (!is.na(y_min)) y_min else finite_y[1]
+      hi <- if (!is.na(y_max)) y_max else finite_y[2]
+      if (is.finite(lo) && is.finite(hi) && hi > lo) n_y <- lo - 0.08 * (hi - lo)
+    }
     if (identical(y_mode, "raw_log_axis") && (!is.finite(n_y) || n_y <= 0)) {
       n_y <- suppressWarnings(min(sumdat$ymin[sumdat$ymin > 0], na.rm = TRUE))
     }
@@ -1135,7 +1594,41 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     )
   }
 
-  if (plot_mode == "combined") {
+  if (plot_mode == "survival") {
+    sample_colors <- named_palette(levels(droplevels(sumdat$sample)),
+                                   c(input$sample_color_1, input$sample_color_2))
+    dodge_pos <- position_dodge(width = input$dodge_width)
+    p <- if (per_bar_color) {
+      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = sample))
+    } else {
+      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = sample))
+    }
+    # The no-change reference is what the whole figure is read against, so it is
+    # drawn first (underneath the data) and is not optional.
+    p <- p + geom_hline(yintercept = 0, linewidth = input$axis_line_width %||% 0.6,
+                        color = axis_col, linetype = "22")
+    p <- add_mean_layer(p, dodge_pos)
+    p <- add_interval_layer(p, dodge_pos, width = 0.22)
+    if (isTRUE(input$show_points)) {
+      point_aes <- if (per_bar_color) {
+        aes(x = concentration_label, y = log10_cfu, fill = bar_key, group = sample)
+      } else {
+        aes(x = concentration_label, y = log10_cfu, fill = sample)
+      }
+      p <- p + geom_point(
+        data = dat, point_aes,
+        position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width, seed = jitter_seed),
+        shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
+      )
+    }
+    p <- add_n_labels(p, dodge_pos, "sample")
+    p <- p +
+      scale_x_discrete(drop = FALSE) +
+      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
+       else scale_fill_manual(values = sample_colors)) +
+      labs(x = input$x_label, y = y_lab, fill = input$legend_title,
+           title = input$plot_title, subtitle = subtitle_text)
+  } else if (plot_mode == "combined") {
     sample_colors <- named_palette(levels(dat$sample), c(input$sample_color_1, input$sample_color_2))
     dodge_pos <- position_dodge(width = input$dodge_width)
     # group stays on the sample even when fill moves to bar_key: position_dodge
@@ -1273,7 +1766,15 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   if (y_mode == "raw_log_axis") {
     p <- p + scale_y_log10(breaks = major_breaks, minor_breaks = minor_breaks, guide = y_guide)
   } else {
-    p <- p + scale_y_continuous(breaks = major_breaks, minor_breaks = minor_breaks, guide = y_guide, expand = expansion(mult = c(0, 0.08)))
+    p <- p + scale_y_continuous(
+      breaks = major_breaks, minor_breaks = minor_breaks, guide = y_guide,
+      # A survival axis runs in both directions from the reference, so it needs
+      # headroom below as well as above; an absolute-count axis sits on zero.
+      expand = if (is_survival) expansion(mult = c(0.08, 0.08)) else expansion(mult = c(0, 0.08)),
+      # Fold change and percent are the SAME numbers relabelled, never rescaled,
+      # so switching display scale cannot distort a single data point.
+      labels = if (is_survival) survival_scale_labeller(input$surv_scale) else waiver()
+    )
   }
 
   coord_ylim <- if (has_y_limits) coord_limits else NULL
@@ -1907,12 +2408,14 @@ ui <- fluidPage(
         choices = c(
           "Combined samples, faceted by time" = "combined",
           "One sample, both timepoints" = "sample_both",
-          "One sample, one timepoint" = "sample_time"
+          "One sample, one timepoint" = "sample_time",
+          "Paired survival (readout vs baseline)" = "survival"
         )
       ),
       uiOutput("filter_ui"),
       selectInput("comparison", "Statistics shown on plot", choices = c(
         "Auto for selected plot" = "auto",
+        "Survival vs no change (paired)" = "survival_vs_zero",
         "Sample/vector comparison" = "sample",
         "0 min vs 120 min" = "time",
         "Each treatment vs control" = "concentration_vs_control",
@@ -2181,6 +2684,19 @@ server <- function(input, output, session) {
   })
 
   output$axis_limit_ui <- renderUI({
+    if (identical(input$plot_mode, "survival")) {
+      return(tagList(
+        selectInput("surv_scale", "Survival axis shown as", choices = c(
+          "log10 survival ratio" = "log10",
+          "Fold change" = "fold",
+          "Percent of baseline" = "percent"
+        ), selected = "log10"),
+        helpText("All three are the same numbers with different tick labels, so switching never rescales the data. Fold change and percent are read on a log spacing, which is why they are not offered on a linear axis."),
+        numericInput("y_min", "Y minimum (log10 ratio)", value = NA),
+        numericInput("y_max", "Y maximum (log10 ratio)", value = NA),
+        helpText("Enter log10 ratios: -1 is a 10-fold drop, 0 is no change, 1 is a 10-fold rise.")
+      ))
+    }
     if (input$y_mode == "raw_log_axis") {
       tagList(
         numericInput("y_min", "Y minimum (raw CFU)", value = NA),
@@ -2197,6 +2713,24 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$auto_y_axis, {
+    if (identical(input$plot_mode, "survival")) {
+      # A survival axis is read against the no-change line, so it is framed
+      # symmetrically about it: an equal drop and rise must look equal.
+      span <- tryCatch({
+        sm <- current_summary()
+        if (is.null(sm) || nrow(sm) == 0) NULL else range(c(sm$ymin, sm$ymax), finite = TRUE)
+      }, error = function(e) NULL)
+      if (is.null(span) || !all(is.finite(span))) {
+        updateNumericInput(session, "y_min", value = NA)
+        updateNumericInput(session, "y_max", value = NA)
+        return()
+      }
+      reach <- max(abs(span), 0.25)
+      reach <- ceiling((reach * 1.12) * 4) / 4
+      updateNumericInput(session, "y_min", value = -reach)
+      updateNumericInput(session, "y_max", value = reach)
+      return()
+    }
     # Bars must keep their baseline -- a bar chart cropped away from zero
     # misstates every ratio the reader takes off it. Points carry no such
     # promise, so they can be framed around the data.
@@ -2479,7 +3013,7 @@ server <- function(input, output, session) {
   # One picker per drawn bar. The keys come from the filtered data, so they
   # follow the plot mode and any sample/timepoint filtering.
   visible_bar_keys <- reactive({
-    dat <- filtered_data()
+    dat <- plot_data()
     if (nrow(dat) == 0) return(character(0))
     unique(bar_keys(current_summary(), input$plot_mode))
   })
@@ -2488,9 +3022,12 @@ server <- function(input, output, session) {
   # per-bar colouring starts from the current figure rather than a blank grey.
   default_bar_color <- function(key, idx) {
     grp <- sub(" · .*$", "", key)
-    lv_sample <- levels(droplevels(filtered_data()$sample))
-    lv_time <- levels(droplevels(filtered_data()$time_min))
-    if (identical(input$plot_mode, "combined") && grp %in% lv_sample) {
+    lv_sample <- levels(droplevels(plot_data()$sample))
+    lv_time <- levels(droplevels(plot_data()$time_min))
+    # Survival dodges by sample exactly as "combined" does, so its per-bar
+    # pickers must seed from the sample colours too -- otherwise every bar
+    # starts the same colour and the user has to set all of them by hand.
+    if (input$plot_mode %in% c("combined", "survival") && grp %in% lv_sample) {
       c(input$sample_color_1 %||% okabe_ito[1], input$sample_color_2 %||% okabe_ito[2])[
         match(grp, lv_sample)
       ] %||% okabe_ito[((idx - 1) %% length(okabe_ito)) + 1]
@@ -2512,7 +3049,7 @@ server <- function(input, output, session) {
     warn <- if (!identical(input$plot_mode, "sample_time")) {
       div(class = "lab-tip warn", paste(
         "Bars are dodged by",
-        if (identical(input$plot_mode, "combined")) "sample" else "timepoint",
+        if (input$plot_mode %in% c("combined", "survival")) "sample" else "timepoint",
         "in this plot mode. Colouring bar by bar means colour no longer identifies the group,",
         "so the legend is hidden -- keep the groups distinguishable some other way,",
         "or use one colour per group."
@@ -2628,6 +3165,34 @@ server <- function(input, output, session) {
     } else {
       NULL
     }
+    # Pairing loses whole replicates in a way the CFU<=0 banner cannot describe:
+    # a well can survive the filter and still contribute nothing because its
+    # partner did not. Cells that end up empty vanish from the figure entirely.
+    sq <- survival_qc()
+    pair_tip <- if (!is.null(sq)) {
+      if (!isTRUE(sq$ok)) {
+        div(class = "lab-tip warn", paste("No survival ratios could be formed.", sq$reason %||% ""))
+      } else {
+        bits <- paste0(
+          sq$complete, " of ", sq$units, " replicate-cells form a complete pair; ",
+          sq$baseline_only + sq$readout_only, " lost their partner and contribute nothing."
+        )
+        if (length(sq$empty_cells) > 0) {
+          bits <- paste0(bits, " No pairs at all for: ", paste(sq$empty_cells, collapse = "; "),
+                         " -- these are absent from the figure.")
+        }
+        if (isTRUE(sq$unlabelled > 0)) {
+          bits <- paste0(bits, " ", sq$unlabelled,
+                         " well(s) have no replicate label and cannot be paired at all.")
+        }
+        if (sq$tech_collapsed > 0) {
+          bits <- paste0(bits, " ", sq$tech_collapsed,
+                         " duplicate replicate label(s) were averaged on the log scale before pairing.")
+        }
+        div(class = if (length(sq$empty_cells) > 0 || sq$baseline_only + sq$readout_only > 0) "lab-tip warn" else "lab-tip ok", bits)
+      }
+    } else NULL
+
     div(
       class = "lab-overview",
       div(
@@ -2664,6 +3229,7 @@ server <- function(input, output, session) {
       ),
       tip,
       drop_tip,
+      pair_tip,
       tags$span(
         style = "display:none;",
         data_source_label()
@@ -2673,6 +3239,20 @@ server <- function(input, output, session) {
 
   output$filter_ui <- renderUI({
     dat <- cfu_data()
+    if (input$plot_mode == "survival") {
+      tl <- survival_time_levels(dat)
+      if (length(tl) < 2) {
+        return(div(class = "lab-tip warn",
+                   "Survival needs at least two timepoints in the data."))
+      }
+      return(tagList(
+        selectizeInput("samples", "Samples to include", choices = levels(dat$sample),
+                       selected = levels(dat$sample), multiple = TRUE),
+        selectInput("surv_baseline", "Baseline timepoint", choices = tl, selected = tl[1]),
+        selectInput("surv_readout", "Readout timepoint", choices = tl, selected = tl[length(tl)]),
+        helpText("Survival is the readout divided by the baseline within each replicate. Both timepoints are consumed to form the ratio, so there is no timepoint filter in this mode.")
+      ))
+    }
     if (input$plot_mode == "combined") {
       tagList(
         selectizeInput("samples", "Samples to include", choices = levels(dat$sample), selected = levels(dat$sample), multiple = TRUE),
@@ -2698,6 +3278,13 @@ server <- function(input, output, session) {
 
   filtered_data <- reactive({
     dat <- cfu_data()
+    if (input$plot_mode == "survival") {
+      req(input$samples)
+      # Both chosen timepoints must survive: they are the pairing inputs, not a
+      # display filter.
+      keep <- c(input$surv_baseline, input$surv_readout)
+      return(dat %>% filter(sample %in% input$samples, as.character(time_min) %in% keep) %>% droplevels())
+    }
     if (input$plot_mode == "combined") {
       req(input$samples, input$times)
       dat %>% filter(sample %in% input$samples, time_min %in% input$times) %>% droplevels()
@@ -2710,24 +3297,61 @@ server <- function(input, output, session) {
     }
   })
 
+  # THE frame every downstream consumer must use. In survival mode this is the
+  # paired frame; otherwise it is filtered_data() unchanged. Routing everything
+  # through one reactive is deliberate: the survival frame reuses the same
+  # column names, so a consumer handed the wrong one produces a plausible
+  # figure rather than an error.
+  survival_pairs <- reactive({
+    if (!identical(input$plot_mode, "survival")) return(NULL)
+    req(input$surv_baseline, input$surv_readout)
+    pair_survival(filtered_data(), input$surv_baseline, input$surv_readout)
+  })
+
+  survival_qc <- reactive({
+    if (!identical(input$plot_mode, "survival")) return(NULL)
+    req(input$surv_baseline, input$surv_readout)
+    survival_pairing_qc(filtered_data(), input$surv_baseline, input$surv_readout)
+  })
+
+  plot_data <- reactive({
+    if (identical(input$plot_mode, "survival")) {
+      sv <- survival_pairs()
+      validate(need(!is.null(sv) && nrow(sv) > 0, paste(
+        "No complete pairs.",
+        (survival_qc() %||% list(reason = ""))$reason %||% ""
+      )))
+      return(sv)
+    }
+    filtered_data()
+  })
+
   active_comparison <- reactive({
     if (input$comparison != "auto") return(input$comparison)
-    switch(
-      input$plot_mode,
-      combined = "sample",
-      sample_both = "time",
-      sample_time = "concentration_vs_control",
-      "sample"
-    )
+    resolve_auto_comparison(input$plot_mode)
   })
 
   current_summary <- reactive({
-    plot_summary(filtered_data(), input$plot_mode, input$y_mode, input$error_type)
+    # clamp_zero = FALSE in survival mode: 0 is the no-change reference there,
+    # not a floor, and clamping would hide killing.
+    plot_summary(plot_data(), input$plot_mode, input$y_mode, input$error_type,
+                 clamp_zero = !identical(input$plot_mode, "survival"))
   })
 
   current_stats <- reactive({
     cmp <- active_comparison()
     if (cmp == "none") return(tibble())
+    if (identical(input$plot_mode, "survival")) {
+      return(run_survival_stats(
+        surv = plot_data(), comparison = cmp, p_adjust = input$p_adjust,
+        adjustment_scope = input$p_adjust_scope,
+        control_concentration = input$control_concentration,
+        ttest_type = input$stats_method
+      ))
+    }
+    if (identical(cmp, "survival_vs_zero")) {
+      return(tibble(message = "The survival comparison needs the Paired survival plot mode."))
+    }
     if (identical(input$stats_method, "emmeans")) {
       run_contrast(filtered_data(), cmp, input$p_adjust, input$control_concentration)
     } else {
@@ -2743,17 +3367,18 @@ server <- function(input, output, session) {
   })
 
   current_anova <- reactive({
-    run_anova(filtered_data())
+    run_anova(plot_data())
   })
 
   current_annotation <- reactive({
     ann <- annotation_data(current_stats(), current_summary(), active_comparison(),
-                           input$plot_mode, input$label_kind, input$show_ns, input$y_mode)
+                           input$plot_mode, input$label_kind, input$show_ns, input$y_mode,
+                           dodge_width = input$dodge_width %||% 0.78)
     apply_annotation_offsets(ann, canvas$ann_offsets)
   })
 
   figure_qa <- reactive({
-    dat <- filtered_data()
+    dat <- plot_data()
     sumdat <- current_summary()
     stats <- current_stats()
     rep_counts <- dat %>%
@@ -2835,12 +3460,27 @@ server <- function(input, output, session) {
         "When star labels are shown, set a y-axis maximum if labels get clipped."
       ),
       add_check(
+        "Pairing completeness",
+        is.null(survival_qc()) ||
+          (isTRUE(survival_qc()$ok) && length(survival_qc()$empty_cells) == 0 &&
+             survival_qc()$baseline_only + survival_qc()$readout_only == 0),
+        if (is.null(survival_qc())) "Not a paired readout." else
+          paste0("All ", survival_qc()$complete, " replicate-cells pair completely."),
+        if (is.null(survival_qc())) "Not a paired readout." else
+          paste0(survival_qc()$baseline_only + survival_qc()$readout_only,
+                 " replicate(s) lost their partner and are excluded",
+                 if (length(survival_qc()$empty_cells) > 0)
+                   paste0("; no pairs at all for ", paste(survival_qc()$empty_cells, collapse = "; "),
+                          ", which are therefore missing from the figure") else "",
+                 ". The plotted n counts pairs, not wells.")
+      ),
+      add_check(
         "Colour encodes group",
         !identical(input$bar_color_mode %||% "group", "manual") ||
           identical(input$plot_mode, "sample_time"),
         "Colour maps to the sample/timepoint group.",
         paste0("Bars are coloured individually while the plot dodges by ",
-               if (identical(input$plot_mode, "combined")) "sample" else "timepoint",
+               if (input$plot_mode %in% c("combined", "survival")) "sample" else "timepoint",
                ", so colour no longer identifies the group and the legend is hidden. ",
                "Make sure the groups are distinguishable another way before submitting.")
       ),
@@ -2863,7 +3503,7 @@ server <- function(input, output, session) {
   current_plot <- reactive({
     validate(need(nrow(filtered_data()) > 0, "No rows remain after filtering."))
     make_cfu_plot(
-      dat = filtered_data(),
+      dat = plot_data(),
       sumdat = current_summary(),
       ann = current_annotation(),
       plot_mode = input$plot_mode,
@@ -2886,7 +3526,9 @@ server <- function(input, output, session) {
   })
 
   output$summary_table <- renderDT({
-    datatable(summary_cfu(filtered_data()), options = list(pageLength = 12, scrollX = TRUE))
+    d <- plot_data()
+    datatable(if (is_survival_frame(d)) summary_survival(d) else summary_cfu(d),
+              options = list(pageLength = 12, scrollX = TRUE))
   })
 
   output$raw_qc_table <- renderDT({
@@ -2957,7 +3599,7 @@ server <- function(input, output, session) {
     doc <- officer::read_pptx()
     for (step in seq_len(total_steps)) {
       step_plot <- make_reveal_plot(
-        dat = filtered_data(),
+        dat = plot_data(),
         sumdat = current_summary(),
         plot_mode = input$plot_mode,
         y_mode = input$y_mode,
@@ -2992,10 +3634,12 @@ server <- function(input, output, session) {
       active_comparison = active_comparison(),
       settings = c(collect_plot_settings(input), list(bar_palette = as.list(bar_palette() %||% NULL))),
       visible_data = list(
-        rows = nrow(filtered_data()),
-        samples = as.character(levels(droplevels(filtered_data()$sample))),
-        treatments = as.character(levels(droplevels(filtered_data()$concentration_label))),
-        timepoints = as.character(levels(droplevels(filtered_data()$time_min)))
+        rows = nrow(plot_data()),
+        readout = if (is_survival_frame(plot_data())) "paired survival ratio" else "absolute CFU",
+        survival_pairing = survival_qc(),
+        samples = as.character(levels(droplevels(plot_data()$sample))),
+        treatments = as.character(levels(droplevels(plot_data()$concentration_label))),
+        timepoints = as.character(levels(droplevels(plot_data()$time_min)))
       ),
       figure_qa = figure_qa(),
       packages = list(
@@ -3015,7 +3659,7 @@ server <- function(input, output, session) {
     # The per-bar palette lives in dynamic inputs, so collect_plot_settings
     # cannot see it. Bake it in or the exported script loses the colours.
     settings$bar_palette <- as.list(bar_palette() %||% NULL)
-    dat_csv <- csv_literal(filtered_data())
+    dat_csv <- csv_literal(plot_data())
     sum_csv <- csv_literal(current_summary())
     ann_csv <- csv_literal(current_annotation())
     settings_code <- dput_literal(settings)
@@ -3051,6 +3695,9 @@ server <- function(input, output, session) {
       exported_function_source("scale_breaks_or_default"),
       exported_function_source("axis_step_breaks"),
       exported_function_source("named_palette"),
+      exported_function_source("survival_axis_label"),
+      exported_function_source("survival_scale_labeller"),
+      exported_function_source("resolve_auto_comparison"),
       exported_function_source("annotation_key"),
       exported_function_source("apply_annotation_offsets"),
       exported_function_source("bar_key_columns"),
@@ -3096,7 +3743,7 @@ server <- function(input, output, session) {
     filename = function() "cfu_bar_reveal.gif",
     content = function(file) {
       anim <- make_animated_cfu_plot(
-        dat = filtered_data(),
+        dat = plot_data(),
         sumdat = current_summary(),
         plot_mode = input$plot_mode,
         y_mode = input$y_mode,
@@ -3160,9 +3807,15 @@ server <- function(input, output, session) {
     content = function(file) write_csv(cfu_data(), file)
   )
 
+  # Must mirror output$summary_table exactly: the button sits under the table.
+  summary_for_export <- reactive({
+    d <- plot_data()
+    if (is_survival_frame(d)) summary_survival(d) else summary_cfu(d)
+  })
+
   output$download_summary <- downloadHandler(
     filename = function() "summary_statistics.csv",
-    content = function(file) write_csv(summary_cfu(filtered_data()), file)
+    content = function(file) write_csv(summary_for_export(), file)
   )
 
   output$download_qc <- downloadHandler(

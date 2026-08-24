@@ -155,6 +155,53 @@ resizing, preset save/load, and the reproducible-script export.
 Title, subtitle, methods caption and both axis titles have alignment sliders under
 **Text placement** (0 left, 0.5 centred, 1 right).
 
+## Paired Survival
+
+An induction time-course is not really a question about absolute counts, it is a question
+about survival: how much of each culture is left at the readout timepoint relative to
+where that same culture started. **Plot mode > Paired survival** computes, for every
+(sample, treatment, replicate) that has BOTH timepoints:
+
+```
+log10 survival ratio = log10(CFU at readout) - log10(CFU at baseline)
+```
+
+then summarises those per-replicate ratios. Pick the baseline and readout timepoints in
+the sidebar; a dashed reference line marks no change.
+
+**Why pair.** When every replicate has both timepoints the paired point estimate is
+algebraically identical to the unpaired one — `mean(a - b)` is `mean(a) - mean(b)`. What
+pairing buys is the uncertainty: the standard error becomes the spread of *within-culture*
+differences rather than the pooled spread across cultures. On replicates whose starting
+titres differ by orders of magnitude that is the difference between p = 0.002 and p = 0.5
+on the same estimate.
+
+And when a replicate is missing one timepoint, the two stop agreeing entirely. The
+unpaired calculation subtracts a baseline mean containing a replicate the readout mean
+cannot contain, charging that replicate's whole titre to the treatment. On the bundled
+gp75 dummy file that flips the sign of the biology at one dose: paired says 48% survival,
+unpaired says 119% growth.
+
+**Axis.** The three display scales — log10 ratio, fold change, percent of baseline — are
+the same numbers with different tick labels. Switching never rescales or distorts
+anything. Percent is offered but is intrinsically asymmetric (a 10x drop is 10%, a 10x
+rise is 1000%), so log10 is the default. The raw-CFU log axis is not available in this
+mode: the plotted quantity is already a log ratio.
+
+**Statistics.** The default test asks whether survival differs from no change, as a
+one-sample t-test of the per-replicate log ratios against zero — which is the paired test.
+The reported effect size is `d_z` (mean of differences over their SD), reported under its
+own column name because it is a different quantity from the two-sample Hedges' g and the
+two must not be compared. Between-construct and dose-versus-control comparisons run on the
+same ratios. The timepoint comparison is refused, because both timepoints have already
+been consumed to form the ratio.
+
+**What pairing costs, stated.** Wells whose partner did not survive the `CFU > 0` filter
+contribute nothing, and a cell can end up with no pairs at all and vanish from the figure.
+The banner above the plot and the Figure QA "Pairing completeness" check report the
+complete pairs, the orphans, any unlabelled wells, and name any cell that disappeared. The
+plotted n counts **pairs, not wells**.
+
 ## Publication Figure Controls
 
 The app includes controls for:
@@ -211,6 +258,7 @@ names the type it used.
 ## Testing
 
 ```bash
+Rscript tests/test_survival.R
 Rscript tests/test_statistics.R
 Rscript tests/test_column_matching.R
 ```

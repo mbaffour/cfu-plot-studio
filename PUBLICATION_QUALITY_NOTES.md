@@ -1,5 +1,101 @@
 # Publication-Quality Audit Notes
 
+## Round 4 — 2026-08-24: the paired survival readout
+
+The readout an induction time-course is actually about. Designed against a four-way
+specification (statistics, integration surface, edge cases, figure integrity), then
+attacked by five independent adversarial reviewers before it shipped. Locked by
+`tests/test_survival.R`.
+
+### The estimand
+
+theta = mean over biological replicates of log10( CFU_readout / CFU_baseline ), paired
+within the culture. 10^theta is the geometric-mean fold change; 100 x 10^theta is percent
+survival.
+
+**What pairing actually buys.** It is NOT the point estimate: for complete pairs
+`mean(a - b) == mean(a) - mean(b)` is an identity, verified over 500 random datasets (max
+divergence 1.8e-15). It buys two other things:
+
+1. **The standard error.** The denominator becomes the SD of within-culture differences
+   rather than the pooled spread across cultures. On baselines of 7, 9 and 11 logs each
+   losing a consistent 1.2 logs, the paired test gives p = 0.002 and the unpaired test
+   p = 0.508 — on an identical estimate.
+2. **Which wells are used.** With an incomplete pair the marginal estimator subtracts a
+   baseline mean containing a replicate the readout mean cannot contain, charging that
+   replicate's titre to the treatment. On the gp75 file this flips the sign of the biology
+   at 12.5: paired -0.32 log (48% survival) versus marginal +0.076 log (119% growth).
+
+### What pairing costs, measured on the real file
+
+Of 36 replicate-cells, only **24 form a complete pair**: 5 lose the readout, 6 lose the
+baseline, and **pSJExD gp75 @ 0 has no pairs at all** and disappears from the figure —
+the zero-dose control, the most important comparison in the experiment. Two more cells
+fall to n = 1, where no test is defined. The banner and the Figure QA "Pairing
+completeness" check report all of it and name the vanished cell; the plotted n counts
+pairs, not wells.
+
+### The clamp that would have hidden every kill
+
+`plot_summary()` ended with `ymin = pmax(ymin, 0)`. Correct for absolute counts, where a
+log10 CFU cannot go below zero. On a survival axis 0 is *no change*, not a floor, so a
+group that lost a full log would have drawn its lower error bar at no-change. Confirmed
+before writing any survival code: a group with mean -1 and SD 0.5 returned ymin = 0
+instead of -1.5. `clamp_zero` now gates it; 7 of the 11 cells on the gp75 file keep a
+negative lower bound that would otherwise have been erased.
+
+### Guards that each cost a real diagnosis
+
+- `t.test` on constant data behaves **two different ways**: constant *at* the null returns
+  a NaN statistic with no error, constant *away from* it hard-errors. A cell where every
+  replicate lost exactly the same amount — a perfect result — takes the second path. Both
+  are pre-checked on `sd == 0`, wrapped in `tryCatch`, and the NaN is scrubbed before
+  `p.adjust`, because any one of the three alone is insufficient.
+- A NaN p survives `p.adjust`, and `NaN < 0.05` is `NA`, so it draws nothing and warns
+  nothing.
+- `d_z` (mean of differences / SD of differences) is a different quantity from the
+  two-sample Hedges' g; on the same data they differ by more than 4x. They carry different
+  column names and an `effect_size_kind` label so they cannot be compared by accident.
+- The Wilcoxon-style limits still apply: at n = 3 the percent-survival CI spans 0% to
+  2e12%, which is why log10 is the default scale and percent is opt-in.
+
+### Findings from the adversarial review, all reproduced and fixed
+
+1. **Blank replicate labels fabricated a pair.** dplyr joins NA to NA by default, so two
+   unlabelled wells became a data point. It moved a headline number from 0.1% to 0.316%
+   survival and turned an untestable cell into a starred p = 0.015, with every QC channel
+   silent. Unlabelled wells are now excluded and counted separately from orphans.
+2. **Between-sample stats crashed the whole figure in survival mode.** `annotation_data()`
+   grouped by `time_min`, which the survival summary does not have — taking the plot, and
+   every export with it. It now keys on the columns both frames actually carry.
+3. **Survival on the raw-CFU log axis was incoherent.** The ratio is already a log, so it
+   was logged twice: the reference line collapsed to -Inf, every killed replicate became
+   log10 of a negative number and was silently deleted, and the remaining bars all read as
+   growth. Survival now forces the log10 axis; scale choice lives in `surv_scale`.
+4. **A regression I introduced.** Widening the annotation height to consider `mean_y`
+   alongside `ymax` lifted valid stars whenever a *sibling* group had a single replicate —
+   in plain combined mode, moving a star 1.96 log units onto a third sample's bar. The
+   fallback now fires only when every `ymax` in the group is non-finite, which is the
+   -Inf case it was written for.
+5. **Non-survival figures captioned a survival test that never ran.** The caption keyed on
+   the comparison string alone while the Statistics tab correctly refused the combination.
+   The caption now agrees with the tab.
+6. **"Download summary CSV" exported absolute CFU in survival mode**, while the table
+   above the button showed survival. Both now read the same expression.
+
+The reviewers also confirmed, by differential testing against the previous file, that
+`clamp_zero = TRUE` reproduces the old clamping exactly across 765 combinations, that
+`resolve_auto_comparison()` matches the switch it replaced, that the two-sided expansion
+and reference line are correctly gated to survival mode, and that the exported script
+remains self-contained.
+
+### Still open here
+
+The between-cell comparisons (construct vs construct, dose vs control) are unpaired even
+in survival mode, because the CSV cannot express whether replicate 1 of one construct and
+replicate 1 of another came from one split culture. That is a claim about how the
+experiment was run, so the tool does not assume it.
+
 ## Round 3 — 2026-08-24: statistical audit, per-bar colour, canvas placement
 
 Every statistic was re-derived from first principles and compared against the app's
@@ -200,8 +296,8 @@ reason now appear in a banner above the figure, not only in the QC tab.
 ## Still open (methodology choices, not defects)
 
 1. **Normality diagnostics.** No residual QQ or Shapiro test is offered. The Wilcoxon option exists as an alternative, but nothing tells the user when to reach for it — and at n = 3 neither test is well powered, so the honest answer is usually "report the effect size and interval, not the p".
-2. **Paired / normalised readouts.** The app plots absolute counts. For an induction time-course the usual readout is survival — CFU at t120 relative to t0 **within the same replicate** — which normalises out plating variation. This needs a replicate-pairing model the data layer does not currently have, and it is the single biggest remaining gap for the gp75 experiment.
-3. **The tests are unpaired.** t0 vs t120 comes from the same culture, so a paired test would be more powerful; the app treats the two timepoints as independent samples. Correct but conservative. Fixing it properly is the same work as item 2.
+2. **Paired / normalised readouts — DONE in round 4.** See above.
+3. **The tests are unpaired — DONE in round 4** for the survival readout. The absolute-CFU modes still treat the two timepoints as independent samples, which is correct for what they plot.
 4. **Only the first pair is annotated** when three or more samples or timepoints are compared. All pairs are tested, corrected together and exported; the figure just cannot legibly carry them. Stacked or bracketed annotations would be the fuller answer.
 5. **Upstream format gap.** CFU Calculator exports `sample` as one packed string (`"EV t0 12.5"`) with no separate time or dose column, so it cannot be loaded here without manual reshaping.
 

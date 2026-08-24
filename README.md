@@ -36,55 +36,71 @@ Required information:
 
 The included `dummy_cfu_example.csv` is synthetic example data and can be downloaded from the app as a template.
 
-## Installation
-
-Install R, then install the core packages:
-
-```r
-install.packages(c(
-  "shiny",
-  "ggplot2",
-  "dplyr",
-  "readr",
-  "emmeans",
-  "broom",
-  "DT",
-  "colourpicker",
-  "jsonlite"
-))
-```
-
-Optional export packages:
-
-```r
-install.packages(c(
-  "officer",
-  "rvg",
-  "gganimate",
-  "gifski"
-))
-```
-
 ## Running The App
 
-From the project folder:
+### Windows: double-click
+
+Double-click **`Run CFU Plot Studio.bat`**. It finds R, installs anything missing into a
+private `.Rlibrary` folder beside the app, picks a free port and opens your browser.
+Close the console window to stop the app. Nothing is installed system-wide and nothing
+leaves your machine.
+
+The first run installs packages and can take several minutes. Later runs start in
+seconds.
+
+If R is installed somewhere the launcher does not look, point it at your `Rscript.exe`:
+
+```powershell
+setx CFU_RSCRIPT "C:\Program Files\R\R-4.5.0\bin\Rscript.exe"
+```
+
+Don't have R? Install it from <https://cran.r-project.org/bin/windows/base/> first.
+
+### Any platform: from a shell
+
+```bash
+Rscript run_app.R
+```
+
+`run_app.R` does the same dependency check and port selection, and works from any
+working directory. Overrides:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CFU_APP_HOST` | `127.0.0.1` | Bind address |
+| `CFU_APP_PORT` | first free from 4267 | Fixed port; errors if that port is busy |
+| `CFU_APP_LIB` | `<app>/.Rlibrary` | Where missing packages are installed |
+| `CFU_NO_INSTALL` | unset | Set to `1` to fail rather than install anything |
+
+### From an R session
 
 ```r
 shiny::runApp(".")
 ```
 
-Or run:
+This path assumes the packages below are already installed.
 
-```powershell
-Rscript run_app.R
+## Installation
+
+The launchers handle this for you. To install by hand:
+
+```r
+install.packages(c(
+  "shiny", "ggplot2", "dplyr", "readr", "tibble", "tidyr", "scales",
+  "emmeans", "broom", "DT", "colourpicker", "jsonlite"
+))
 ```
 
-The helper script also supports a fixed host and port:
+Optional export packages. Each one only affects the export format named, and the app
+reports which are absent at startup:
 
-```powershell
-$env:CFU_APP_HOST = "127.0.0.1"
-$env:CFU_APP_PORT = "4267"
-Rscript run_app.R
+```r
+install.packages(c(
+  "officer",    # PowerPoint export
+  "rvg",        # editable vector art inside PowerPoint
+  "gganimate",  # animated GIF export
+  "gifski"      # GIF encoding
+))
 ```
 
 ## Figure Size
@@ -180,7 +196,9 @@ For manuscript figures, a good starting workflow is:
 ## Files
 
 - `app.R`: main Shiny application.
-- `run_app.R`: app launcher.
+- `Run CFU Plot Studio.bat`: double-click launcher for Windows.
+- `run_app.R`: cross-platform launcher (dependency check, free-port selection, browser).
+- `tests/test_column_matching.R`: regression test for CSV header auto-detection.
 - `dummy_cfu_example.csv`: synthetic example/template data.
 - `outputs/`: local validation outputs and screenshots.
 

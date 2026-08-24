@@ -16,3 +16,6 @@ outputs/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Launcher private library (created on first run)
+.Rlibrary/

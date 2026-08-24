@@ -2442,6 +2442,13 @@ ui <- fluidPage(
     .canvas-bar label { margin-bottom: 0; }
     .canvas-hint { color: #536b6f; font-size: 12px; flex: 1 1 260px; }
     .canvas-reset { margin-left: auto; }
+    .bundle-row {
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      padding: 10px 12px; border: 1px solid #d5dedf; border-radius: 6px;
+      background: #f6f9f9;
+    }
+    .bundle-row .form-group { margin-bottom: 0; }
+    .bundle-hint { color: #536b6f; font-size: 12px; flex: 1 1 280px; }
     .size-readout {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
@@ -2793,6 +2800,14 @@ ui <- fluidPage(
             column(3, downloadButton("download_gif", "Animated GIF")),
             column(3, downloadButton("download_pptx", "PowerPoint")),
             column(4, downloadButton("download_reveal_pptx", "Reveal slides PPT"))
+          ),
+          br(),
+          div(
+            class = "bundle-row",
+            downloadButton("download_all", "Download everything (.zip)", class = "btn-primary"),
+            checkboxInput("bundle_gif", "Include the animated GIF (slow)", value = FALSE),
+            span(class = "bundle-hint",
+                 "Every figure format, every table, and the files needed to rebuild this exact figure, in one archive with a README listing what is inside.")
           ),
           br(),
           actionButton("copy_plot", "Copy current plot"),
@@ -4107,6 +4122,139 @@ server <- function(input, output, session) {
   output$download_stats <- downloadHandler(
     filename = function() "cfu_statistics.csv",
     content = function(file) write_csv(current_stats(), file)
+  )
+
+  # One archive holding every export the app can produce for the current figure,
+  # plus a README saying what is in it and what could not be produced. Each item
+  # is attempted independently: a missing optional package costs that one file,
+  # not the whole bundle.
+  output$download_all <- downloadHandler(
+    filename = function() {
+      stem <- if (!is.null(input$file) && nzchar(input$file$name %||% "")) {
+        tools::file_path_sans_ext(basename(input$file$name))
+      } else "cfu_plot_studio"
+      paste0(gsub("[^A-Za-z0-9._-]+", "_", stem), "_bundle_", format(Sys.Date(), "%Y-%m-%d"), ".zip")
+    },
+    content = function(file) {
+      validate(need(requireNamespace("zip", quietly = TRUE),
+                    "Package zip is required to build the archive. Install it with install.packages('zip')."))
+      dir <- file.path(tempdir(), paste0("cfu_bundle_", as.integer(runif(1, 1, 1e9))))
+      dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+      on.exit(unlink(dir, recursive = TRUE), add = TRUE)
+
+      made <- character(0)
+      skipped <- character(0)
+      add <- function(name, label, fn) {
+        r <- tryCatch({ fn(file.path(dir, name)); TRUE },
+                      error = function(e) { skipped <<- c(skipped, sprintf("%-34s %s", name, conditionMessage(e))); FALSE })
+        if (isTRUE(r) && file.exists(file.path(dir, name))) {
+          made <<- c(made, sprintf("%-34s %s", name, label))
+        }
+      }
+
+      steps <- 12 + as.integer(isTRUE(input$bundle_gif))
+      withProgress(message = "Building the archive", value = 0, {
+        bump <- function(msg) incProgress(1 / steps, detail = msg)
+
+        bump("figures")
+        add("figure.png", "Raster figure at the export DPI.", function(f) save_plot_file(f, "png"))
+        add("figure.pdf", "Vector figure for a manuscript.", function(f) save_plot_file(f, cairo_pdf))
+        add("figure.svg", "Vector figure for editing in Illustrator or Inkscape.", function(f) save_plot_file(f, "svg"))
+
+        bump("PowerPoint")
+        add("figure.pptx", "PowerPoint slide, editable vector art when rvg is installed.",
+            function(f) save_pptx_file(f))
+
+        if (isTRUE(input$bundle_gif)) {
+          bump("animated GIF")
+          add("figure_reveal.gif", "Animated build of the figure. Panel pinning does not apply to GIF frames.",
+              function(f) {
+                anim <- make_animated_cfu_plot(
+                  dat = plot_data(), sumdat = current_summary(), plot_mode = input$plot_mode,
+                  y_mode = input$y_mode, error_type = input$error_type, input = input,
+                  bar_palette = bar_palette())
+                rendered <- gganimate::animate(
+                  anim$plot, nframes = max(anim$steps, round(input$animation_duration * input$animation_fps)),
+                  fps = input$animation_fps, width = export_width(), height = export_height(),
+                  units = "in", res = input$animation_dpi, renderer = gganimate::gifski_renderer())
+                gganimate::anim_save(f, animation = rendered)
+              })
+        }
+
+        bump("plotted data")
+        add("data_cleaned.csv", "Every row that survived import, before plot filtering.",
+            function(f) write_csv(cfu_data(), f))
+        add("data_plotted.csv",
+            if (is_survival_frame(plot_data())) "The paired survival ratios actually plotted, with both source counts."
+            else "The rows actually plotted, after filtering.",
+            function(f) write_csv(plot_data(), f))
+
+        bump("summary")
+        add("summary.csv", "Group summary exactly as shown on the Summary tab.",
+            function(f) write_csv(summary_for_export(), f))
+
+        bump("statistics")
+        add("statistics.csv", "Every comparison, with intervals, effect sizes and adjusted q values.",
+            function(f) write_csv(current_stats(), f))
+        add("anova.csv", "ANOVA table, with the sum-of-squares type it used.",
+            function(f) write_csv(current_anova(), f))
+
+        bump("QC")
+        add("qc_replicates.csv", "Source checks and per-group replicate structure.",
+            function(f) {
+              write_csv(bind_rows(
+                raw_qc_summary(raw_data(), column_mapping()) %>%
+                  mutate(section = "source", value = as.character(value), .before = 1),
+                qc_summary(cfu_data()) %>%
+                  mutate(section = "replicate_groups", check = flag, value = as.character(replicates), .before = 1) %>%
+                  select(section, check, value, everything())
+              ), f)
+            })
+        add("figure_qa.csv", "Publication-readiness checklist for this figure.",
+            function(f) write_csv(figure_qa(), f))
+
+        bump("reproducibility")
+        add("recreate_figure.R", "Standalone script that rebuilds this figure from embedded data.",
+            function(f) writeLines(reproducible_script(), f))
+        add("plot_preset.json", "Every plot setting, reloadable from the sidebar.",
+            function(f) writeLines(jsonlite::toJSON(plot_settings_payload(input), pretty = TRUE,
+                                                    auto_unbox = TRUE, null = "null"), f))
+        add("analysis_manifest.json", "What was loaded, what was filtered, and how the figure was made.",
+            function(f) writeLines(jsonlite::toJSON(manifest_payload(), pretty = TRUE,
+                                                    auto_unbox = TRUE, null = "null"), f))
+
+        bump("README")
+        writeLines(c(
+          "CFU Plot Studio export bundle",
+          paste0("Created: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
+          paste0("Source:  ", if (!is.null(input$file)) input$file$name else "bundled example data"),
+          paste0("Figure:  ", format_figure_size(export_width(), export_height(), export_dpi())),
+          paste0("Readout: ", if (is_survival_frame(plot_data()))
+            paste0("paired survival, ", input$surv_readout, " relative to ", input$surv_baseline,
+                   ", within each replicate")
+            else "absolute CFU"),
+          "",
+          "CONTENTS",
+          made,
+          if (length(skipped) > 0) c("", "NOT INCLUDED", skipped) else NULL,
+          "",
+          "To rebuild the figure without this app, open recreate_figure.R in R and run it.",
+          "It carries its own copy of the plotting code and the data it needs.",
+          "To carry on in the app instead, load plot_preset.json from the sidebar.",
+          "",
+          "https://github.com/mbaffour/cfu-plot-studio"
+        ), file.path(dir, "README.txt"))
+
+        bump("compressing")
+        zip::zip(zipfile = file, files = list.files(dir), root = dir)
+      })
+
+      if (length(skipped) > 0) {
+        showNotification(
+          paste0(length(skipped), " item(s) could not be produced and are listed in the README."),
+          type = "warning", duration = 8)
+      }
+    }
   )
 
   output$download_anova <- downloadHandler(

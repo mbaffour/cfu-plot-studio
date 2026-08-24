@@ -119,6 +119,29 @@ Presets: single column (3.35 x 2.65 in), double column (7.0 x 4.2 in), square
 (4.5 x 4.5 in), Nature single column (89 mm), Nature double column (183 mm). All set
 600 DPI.
 
+## Download Everything
+
+**Download everything (.zip)** bundles the current figure and everything needed to
+defend or rebuild it:
+
+| File | What it is |
+| --- | --- |
+| `figure.png` / `.pdf` / `.svg` / `.pptx` | The figure in every static format |
+| `figure_reveal.gif` | Optional, off by default because it is slow |
+| `data_cleaned.csv` | Every row that survived import |
+| `data_plotted.csv` | The rows actually plotted — in survival mode the paired ratios, each with both source counts |
+| `summary.csv` | Exactly what the Summary tab shows |
+| `statistics.csv` | Every comparison with intervals, effect sizes and adjusted q values |
+| `anova.csv` | The ANOVA table, naming its sum-of-squares type |
+| `qc_replicates.csv`, `figure_qa.csv` | Source checks, replicate structure, publication checklist |
+| `recreate_figure.R` | Standalone script that rebuilds the figure from embedded data |
+| `plot_preset.json` | Every setting, reloadable from the sidebar |
+| `analysis_manifest.json` | What was loaded, what was filtered, how the figure was made |
+| `README.txt` | Contents, the figure geometry, the readout, and what could not be produced |
+
+Each item is attempted independently, so a missing optional package costs that one file
+rather than the whole archive, and the README says which are absent and why.
+
 ## Keeping The Data Area Fixed
 
 ggplot sizes the panel last: it gets whatever space is left after the legend, the titles,
@@ -312,6 +335,7 @@ names the type it used.
 ## Testing
 
 ```bash
+Rscript tests/test_bundle.R                # optionally: ... path/to/your.csv
 Rscript tests/test_panel_size.R
 Rscript tests/test_survival.R
 Rscript tests/test_statistics.R

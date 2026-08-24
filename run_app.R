@@ -39,7 +39,7 @@ if (dir.exists(lib_dir)) .libPaths(c(lib_dir, .libPaths()))
 
 REQUIRED <- c(
   "shiny", "ggplot2", "dplyr", "readr", "tibble", "tidyr", "scales",
-  "emmeans", "broom", "DT", "colourpicker", "jsonlite"
+  "emmeans", "broom", "DT", "colourpicker", "jsonlite", "zip"
 )
 # Export formats that degrade gracefully: the app hides or falls back on these.
 OPTIONAL <- c(

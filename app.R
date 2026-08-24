@@ -120,7 +120,7 @@ scale_breaks_or_default <- function(x) {
 
 plot_setting_ids <- c(
   "plot_mode", "comparison", "stats_method", "p_adjust", "p_adjust_scope", "label_kind", "show_ns",
-  "y_mode", "chart_geom", "error_type", "variation_display", "show_points", "y_min", "y_max",
+  "y_mode", "chart_geom", "bar_color_mode", "error_type", "variation_display", "show_points", "y_min", "y_max",
   "plot_title", "plot_subtitle", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption",
   "x_label", "y_label", "treatment_unit", "append_treatment_unit", "time_unit", "append_time_unit",
   "show_n_labels", "legend_title", "bar_orientation", "plot_theme", "plot_box", "show_y_ticks",
@@ -130,6 +130,7 @@ plot_setting_ids <- c(
   "sample_color_1", "sample_color_2", "time_color_1", "time_color_2", "single_color", "stat_color",
   "bar_width", "dodge_width", "point_size", "point_alpha", "jitter_width", "jitter_seed",
   "font_size", "title_size", "subtitle_size", "stat_size", "x_angle",
+  "title_hjust", "subtitle_hjust", "caption_hjust", "x_title_hjust", "y_title_hjust",
   "legend_position", "legend_x", "legend_y", "legend_just_x", "legend_just_y",
   "size_units", "download_width", "download_height", "download_dpi", "animation_fps", "animation_duration",
   "animation_dpi", "ppt_editable"
@@ -138,7 +139,7 @@ plot_setting_ids <- c(
 select_setting_ids <- c(
   "plot_mode", "comparison", "stats_method", "p_adjust", "p_adjust_scope", "y_mode",
   "error_type", "variation_display", "bar_orientation", "plot_theme", "legend_position",
-  "size_units", "chart_geom"
+  "size_units", "chart_geom", "bar_color_mode"
 )
 
 radio_setting_ids <- c("label_kind")
@@ -214,6 +215,7 @@ stats_caption <- function(stats_method, p_adjust) {
     stats_method %||% "welch",
     "welch" = "Welch t-test on log10(CFU)",
     "student" = "Student t-test on log10(CFU)",
+    "wilcoxon" = "Wilcoxon rank-sum test on log10(CFU)",
     "emmeans" = "linear model + emmeans on log10(CFU)",
     "statistical test"
   )
@@ -344,8 +346,24 @@ model_formula <- function(dat) {
 run_anova <- function(dat) {
   if (nrow(dat) < 3 || n_distinct(dat$log10_cfu) < 2) return(tibble())
   fit <- lm(model_formula(dat), data = dat)
-  tidy(anova(fit)) %>%
-    mutate(across(where(is.numeric), ~ signif(.x, 4)))
+  # CFU designs are routinely unbalanced by the time they reach the ANOVA: the
+  # cfu > 0 filter removes whole replicates from some cells. Type I sequential
+  # SS then makes each main effect's F depend on the order the terms happen to
+  # be listed in the formula. Type II tests each term after the others at its
+  # level, which is order-invariant, so use it whenever car is available and
+  # label the table with what was actually computed.
+  out <- NULL
+  ss_type <- "Type I (sequential)"
+  if (requireNamespace("car", quietly = TRUE)) {
+    out <- tryCatch(tidy(car::Anova(fit, type = 2)), error = function(e) NULL)
+    if (!is.null(out)) ss_type <- "Type II (car::Anova)"
+  }
+  if (is.null(out)) out <- tidy(anova(fit))
+  out %>%
+    mutate(
+      across(where(is.numeric), ~ signif(.x, 4)),
+      ss_type = ss_type
+    )
 }
 
 adjust_stats <- function(out, p_adjust, adjustment_scope) {
@@ -400,13 +418,24 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal, test
   }
 
   if (identical(test_family, "wilcoxon")) {
-    # With n=3 vs n=3 the smallest attainable two-sided p is 0.1, so a rank test
-    # on a typical CFU assay can never reach 0.05. Report it, do not hide it.
+    # exact is left at its default so R uses the EXACT distribution whenever the
+    # sample is small and untied -- the case a CFU assay is always in. Forcing
+    # the normal approximation at n=3 gives p=0.383 where the exact test gives
+    # p=0.4. Ties force the approximation; that is reported, not hidden.
     test <- tryCatch(
-      suppressWarnings(wilcox.test(a, b, conf.int = TRUE, exact = FALSE)),
+      suppressWarnings(wilcox.test(a, b, conf.int = TRUE)),
       error = function(e) e
     )
     if (inherits(test, "error")) return(empty_two_group_result(a, b, conditionMessage(test)))
+    notes <- character(0)
+    if (min(length(a), length(b)) < 4) {
+      # With n=3 vs n=3 the smallest attainable two-sided p is 0.1, so a rank
+      # test on a typical CFU assay can never reach 0.05. Say so, per row.
+      notes <- c(notes, "Rank test: with this n the smallest attainable p may exceed 0.05.")
+    }
+    if (anyDuplicated(c(a, b)) > 0) {
+      notes <- c(notes, "Ties present, so the normal approximation replaced the exact test.")
+    }
     return(tibble(
       p.value = unname(test$p.value),
       statistic = unname(test$statistic),
@@ -418,9 +447,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal, test
       conf.high = unname(test$conf.int[2] %||% NA_real_),
       hedges_g = hedges_g(a, b),
       stderr = NA_real_,
-      message = if (min(length(a), length(b)) < 4) {
-        "Rank test: with this n the smallest attainable p may exceed 0.05."
-      } else NA_character_
+      message = if (length(notes) > 0) paste(notes, collapse = " ") else NA_character_
     ))
   }
 
@@ -452,41 +479,54 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
 
   if (comparison == "sample") {
     if (n_distinct(dat$sample) < 2) return(tibble(message = "Sample comparison requires at least two samples."))
-    levels_to_compare <- levels(droplevels(dat$sample))[seq_len(2)]
+    # ALL sample pairs, not just the first two. With 3+ samples the old code
+    # silently ignored every comparison beyond levels 1-2, and because the
+    # missing rows never entered the table, the multiplicity correction was
+    # computed over the wrong m as well. pair_rank marks the first pair, which
+    # is the one annotated on the plot.
+    sample_pairs <- utils::combn(levels(droplevels(dat$sample)), 2, simplify = FALSE)
     strata <- dat %>% distinct(concentration_label, time_min)
     out <- bind_rows(lapply(seq_len(nrow(strata)), function(i) {
       sub <- dat %>% filter(concentration_label == strata$concentration_label[i], time_min == strata$time_min[i])
-      res <- run_two_group_test(sub, "sample", levels_to_compare[1], levels_to_compare[2], var_equal, test_family)
-      res %>%
-        mutate(
-          comparison_family = "Sample/vector within treatment and time",
-          contrast = paste(levels_to_compare[1], "-", levels_to_compare[2]),
-          sample = NA_character_,
-          concentration_label = strata$concentration_label[i],
-          time_min = strata$time_min[i],
-          panel = paste(strata$time_min[i]),
-          numerator = levels_to_compare[1],
-          denominator = levels_to_compare[2]
-        )
+      bind_rows(lapply(seq_along(sample_pairs), function(k) {
+        pair <- sample_pairs[[k]]
+        res <- run_two_group_test(sub, "sample", pair[1], pair[2], var_equal, test_family)
+        res %>%
+          mutate(
+            comparison_family = "Sample/vector within treatment and time",
+            contrast = paste(pair[1], "-", pair[2]),
+            sample = NA_character_,
+            concentration_label = strata$concentration_label[i],
+            time_min = strata$time_min[i],
+            panel = paste(strata$time_min[i]),
+            numerator = pair[1],
+            denominator = pair[2],
+            pair_rank = k
+          )
+      }))
     }))
   } else if (comparison == "time") {
     if (n_distinct(dat$time_min) < 2) return(tibble(message = "Timepoint comparison requires at least two timepoints."))
-    levels_to_compare <- levels(droplevels(dat$time_min))[seq_len(2)]
+    time_pairs <- utils::combn(levels(droplevels(dat$time_min)), 2, simplify = FALSE)
     strata <- dat %>% distinct(sample, concentration_label)
     out <- bind_rows(lapply(seq_len(nrow(strata)), function(i) {
       sub <- dat %>% filter(sample == strata$sample[i], concentration_label == strata$concentration_label[i])
-      res <- run_two_group_test(sub, "time_min", levels_to_compare[1], levels_to_compare[2], var_equal, test_family)
-      res %>%
-        mutate(
-          comparison_family = "Timepoints within sample/vector and treatment",
-          contrast = paste(levels_to_compare[1], "-", levels_to_compare[2]),
-          sample = as.character(strata$sample[i]),
-          concentration_label = strata$concentration_label[i],
-          time_min = NA_character_,
-          panel = paste(strata$sample[i]),
-          numerator = levels_to_compare[1],
-          denominator = levels_to_compare[2]
-        )
+      bind_rows(lapply(seq_along(time_pairs), function(k) {
+        pair <- time_pairs[[k]]
+        res <- run_two_group_test(sub, "time_min", pair[1], pair[2], var_equal, test_family)
+        res %>%
+          mutate(
+            comparison_family = "Timepoints within sample/vector and treatment",
+            contrast = paste(pair[1], "-", pair[2]),
+            sample = as.character(strata$sample[i]),
+            concentration_label = strata$concentration_label[i],
+            time_min = NA_character_,
+            panel = paste(strata$sample[i]),
+            numerator = pair[1],
+            denominator = pair[2],
+            pair_rank = k
+          )
+      }))
     }))
   } else if (comparison == "concentration_vs_control") {
     if (n_distinct(dat$concentration_label) < 2) return(tibble(message = "Treatment comparison requires at least two treatment groups."))
@@ -508,7 +548,8 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
             time_min = as.character(strata$time_min[i]),
             panel = paste(strata$sample[i], strata$time_min[i]),
             numerator = lvl,
-            denominator = control_concentration
+            denominator = control_concentration,
+            pair_rank = 1
           )
       }))
     }))
@@ -519,7 +560,8 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
       sub <- dat %>% filter(sample == strata$sample[i], time_min == strata$time_min[i])
       levs <- levels(droplevels(sub$concentration_label))
       pairs <- combn(levs, 2, simplify = FALSE)
-      bind_rows(lapply(pairs, function(pair) {
+      bind_rows(lapply(seq_along(pairs), function(k) {
+        pair <- pairs[[k]]
         res <- run_two_group_test(sub, "concentration_label", pair[1], pair[2], var_equal, test_family)
         res %>%
           mutate(
@@ -530,7 +572,8 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
             time_min = as.character(strata$time_min[i]),
             panel = paste(strata$sample[i], strata$time_min[i]),
             numerator = pair[1],
-            denominator = pair[2]
+            denominator = pair[2],
+            pair_rank = k
           )
       }))
     }))
@@ -668,9 +711,44 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type) {
     )
 }
 
+# Stable identity for one statistic label, so a nudge the user applies by
+# dragging survives a re-render, a filter change and a preset round-trip.
+annotation_key <- function(ann) {
+  paste(
+    as.character(ann$contrast %||% ""),
+    as.character(ann$x %||% ""),
+    as.character(ann$time_min %||% ""),
+    as.character(ann$sample %||% ""),
+    sep = "|"
+  )
+}
+
+# Apply the user's canvas nudges. Offsets are stored in axis units (x in
+# discrete-position units, y in whatever the y axis is showing), which is what
+# a plot click reports, so a nudge stays put when the figure is resized.
+apply_annotation_offsets <- function(ann, offsets) {
+  if (nrow(ann) == 0 || length(offsets) == 0) return(ann)
+  keys <- annotation_key(ann)
+  dx <- vapply(keys, function(k) offsets[[k]]$dx %||% 0, numeric(1))
+  dy <- vapply(keys, function(k) offsets[[k]]$dy %||% 0, numeric(1))
+  ann$x_pos <- as.numeric(ann$x_pos) + dx
+  ann$y <- ann$y + dy
+  ann
+}
+
 annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, show_ns, y_mode) {
   if (nrow(stats) == 0) return(tibble())
   if (!all(c("label_stars", "label_q", "p.value") %in% names(stats))) return(tibble())
+
+  # With 3+ samples or timepoints, several pairwise rows share one x position.
+  # Stacked star labels are unreadable and ambiguous about which pair they
+  # belong to, so the plot annotates only the first pair; the full pairwise
+  # table lives in the Statistics tab and the caption says so. The q-values are
+  # unchanged by this filter -- the correction ran over the complete table.
+  if ("pair_rank" %in% names(stats)) {
+    stats <- stats %>% filter(pair_rank == 1)
+  }
+  if (nrow(stats) == 0) return(tibble())
 
   label_col <- if (label_kind == "stars") "label_stars" else "label_q"
   stats <- stats %>%
@@ -688,13 +766,13 @@ annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, sh
     yref <- sumdat %>%
       group_by(concentration_label, time_min) %>%
       summarize(y = max(ymax, na.rm = TRUE) + pad, .groups = "drop")
-    stats %>% left_join(yref, by = c("concentration_label", "time_min")) %>%
+    out <- stats %>% left_join(yref, by = c("concentration_label", "time_min")) %>%
       mutate(x = concentration_label)
   } else if (comparison == "time") {
     yref <- sumdat %>%
       group_by(concentration_label) %>%
       summarize(y = max(ymax, na.rm = TRUE) + pad, .groups = "drop")
-    stats %>% left_join(yref, by = "concentration_label") %>%
+    out <- stats %>% left_join(yref, by = "concentration_label") %>%
       mutate(x = concentration_label)
   } else if (comparison == "concentration_vs_control") {
     stats <- stats %>%
@@ -702,11 +780,17 @@ annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, sh
     yref <- sumdat %>%
       group_by(concentration_label) %>%
       summarize(y = max(ymax, na.rm = TRUE) + pad, .groups = "drop")
-    stats %>% left_join(yref, by = "concentration_label") %>%
+    out <- stats %>% left_join(yref, by = "concentration_label") %>%
       mutate(x = concentration_label)
   } else {
-    tibble()
+    return(tibble())
   }
+
+  # A numeric copy of the discrete x position. geom_text can be nudged
+  # continuously along it, which a factor level cannot be, and it is what the
+  # canvas drag writes its offsets into.
+  x_levels <- levels(sumdat$concentration_label)
+  out %>% mutate(x_pos = match(as.character(x), x_levels))
 }
 
 plot_group_cols <- function(plot_mode) {
@@ -741,7 +825,33 @@ expand_reveal <- function(x, total_steps) {
   }))
 }
 
-make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input) {
+# Identity of a single drawn bar/point, used for per-bar colouring. This is the
+# fill variable crossed with the x variable, which is exactly what separates two
+# bars inside a panel. Time is a facet in "combined", not a bar, so the same
+# sample x treatment bar keeps its colour across both facets.
+bar_key_columns <- function(plot_mode) {
+  switch(
+    plot_mode,
+    combined    = c("sample", "concentration_label"),
+    sample_both = c("time_min", "concentration_label"),
+    sample_time = "concentration_label",
+    c("sample", "concentration_label")
+  )
+}
+
+bar_keys <- function(dat, plot_mode) {
+  cols <- bar_key_columns(plot_mode)
+  cols <- cols[cols %in% names(dat)]
+  if (length(cols) == 0) return(character(0))
+  parts <- lapply(cols, function(cc) as.character(dat[[cc]]))
+  do.call(paste, c(parts, list(sep = " · ")))
+}
+
+# Input id for one bar's colour picker. make.names keeps the id valid for any
+# sample or treatment label the user's CSV happens to contain.
+bar_color_input_id <- function(key) paste0("barcol_", make.names(key))
+
+make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input, bar_palette = NULL) {
   # CFU/mL, CFU/plate and CFU/OD are different quantities; let the axis say which.
   y_quantity <- trimws(input$y_label %||% "")
   if (!nzchar(y_quantity)) y_quantity <- "CFU/mL"
@@ -770,6 +880,27 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   variation_display <- input$variation_display %||% "errorbar"
   chart_geom <- input$chart_geom %||% "bar"
   draw_bars <- identical(chart_geom, "bar")
+
+  # Per-bar colours. The server resolves them from the dynamic pickers; the
+  # exported script carries them in settings. Either way they arrive as a named
+  # character vector keyed by bar_keys().
+  bar_palette <- bar_palette %||% input$bar_palette
+  per_bar_color <- identical(input$bar_color_mode %||% "group", "manual") &&
+    length(bar_palette) > 0
+  if (per_bar_color) {
+    sumdat$bar_key <- bar_keys(sumdat, plot_mode)
+    dat$bar_key <- bar_keys(dat, plot_mode)
+    present <- unique(sumdat$bar_key)
+    # Any bar the palette does not name falls back to a neutral grey rather than
+    # to NA, which ggplot would drop from the plot entirely.
+    resolved <- setNames(rep("#BBBBBB", length(present)), present)
+    known <- intersect(present, names(bar_palette))
+    resolved[known] <- unlist(bar_palette[known])
+    bar_palette <- resolved
+    key_levels <- present
+    sumdat$bar_key <- factor(sumdat$bar_key, levels = key_levels)
+    dat$bar_key <- factor(dat$bar_key, levels = key_levels)
+  }
 
   # When every group has the same n, one phrase in the caption says it better
   # than a label under every bar. Per-bar labels are only worth their clutter
@@ -808,6 +939,23 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     stats_on <- !identical(input$comparison %||% "auto", "none")
     if (stats_on) {
       caption_parts <- c(caption_parts, stats_caption(input$stats_method, input$p_adjust))
+      # When more pairs were tested than the plot can annotate, the figure must
+      # say which pair its stars refer to.
+      resolved_cmp <- input$comparison %||% "auto"
+      if (identical(resolved_cmp, "auto")) {
+        resolved_cmp <- switch(plot_mode, combined = "sample", sample_both = "time",
+                               sample_time = "concentration_vs_control", "sample")
+      }
+      if (identical(resolved_cmp, "sample") && nlevels(droplevels(dat$sample)) > 2) {
+        lv <- levels(droplevels(dat$sample))
+        caption_parts <- c(caption_parts, paste0(
+          "plot annotates ", lv[1], " vs ", lv[2], " only; all sample pairs are in the Statistics tab"))
+      }
+      if (identical(resolved_cmp, "time") && nlevels(droplevels(dat$time_min)) > 2) {
+        lv <- levels(droplevels(dat$time_min))
+        caption_parts <- c(caption_parts, paste0(
+          "plot annotates ", lv[1], " vs ", lv[2], " only; all timepoint pairs are in the Statistics tab"))
+      }
     }
     caption_parts <- caption_parts[nzchar(caption_parts %||% "")]
     if (length(caption_parts) > 0) {
@@ -990,13 +1138,25 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   if (plot_mode == "combined") {
     sample_colors <- named_palette(levels(dat$sample), c(input$sample_color_1, input$sample_color_2))
     dodge_pos <- position_dodge(width = input$dodge_width)
-    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = sample))
+    # group stays on the sample even when fill moves to bar_key: position_dodge
+    # allocates one slot per group, so dodging by a key that also varies with x
+    # would ask for one slot per bar in the whole panel.
+    p <- if (per_bar_color) {
+      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = sample))
+    } else {
+      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = sample))
+    }
     p <- add_mean_layer(p, dodge_pos)
     p <- add_interval_layer(p, dodge_pos, width = 0.22)
     if (isTRUE(input$show_points)) {
+      point_aes <- if (per_bar_color) {
+        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = bar_key, group = sample)
+      } else {
+        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = sample)
+      }
       p <- p + geom_point(
         data = dat,
-        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = sample),
+        point_aes,
         position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width, seed = jitter_seed),
         shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
       )
@@ -1005,18 +1165,28 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- p +
       facet_wrap(~ time_min, nrow = 1) +
       scale_x_discrete(drop = FALSE) +
-      scale_fill_manual(values = sample_colors) +
+      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
+       else scale_fill_manual(values = sample_colors)) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   } else if (plot_mode == "sample_both") {
     time_colors <- named_palette(levels(dat$time_min), c(input$time_color_1, input$time_color_2))
     dodge_pos <- position_dodge(width = input$dodge_width)
-    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = time_min))
+    p <- if (per_bar_color) {
+      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = time_min))
+    } else {
+      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = time_min))
+    }
     p <- add_mean_layer(p, dodge_pos)
     p <- add_interval_layer(p, dodge_pos, width = 0.22)
     if (isTRUE(input$show_points)) {
+      point_aes <- if (per_bar_color) {
+        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = bar_key, group = time_min)
+      } else {
+        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = time_min)
+      }
       p <- p + geom_point(
         data = dat,
-        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = time_min),
+        point_aes,
         position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width, seed = jitter_seed),
         shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
       )
@@ -1024,28 +1194,52 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- add_n_labels(p, dodge_pos, "time_min")
     p <- p +
       scale_x_discrete(drop = FALSE) +
-      scale_fill_manual(values = time_colors) +
+      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
+       else scale_fill_manual(values = time_colors)) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   } else {
-    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y))
-    p <- add_mean_layer(p, position_identity(), fixed_fill = input$single_color)
+    p <- if (per_bar_color) {
+      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key))
+    } else {
+      ggplot(sumdat, aes(x = concentration_label, y = mean_y))
+    }
+    p <- add_mean_layer(p, position_identity(),
+                        fixed_fill = if (per_bar_color) NULL else input$single_color)
     p <- add_interval_layer(p, position_identity(), width = 0.2)
     if (isTRUE(input$show_points)) {
-      p <- p + geom_point(
-        data = dat,
-        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu),
-        position = position_jitter(width = input$jitter_width, height = 0, seed = jitter_seed),
-        shape = 21, size = input$point_size, fill = input$single_color, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
-      )
+      if (per_bar_color) {
+        p <- p + geom_point(
+          data = dat,
+          aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = bar_key),
+          position = position_jitter(width = input$jitter_width, height = 0, seed = jitter_seed),
+          shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
+        )
+      } else {
+        p <- p + geom_point(
+          data = dat,
+          aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu),
+          position = position_jitter(width = input$jitter_width, height = 0, seed = jitter_seed),
+          shape = 21, size = input$point_size, fill = input$single_color, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
+        )
+      }
     }
     p <- add_n_labels(p, position_identity())
     p <- p +
       scale_x_discrete(drop = FALSE) +
+      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none") else NULL) +
       labs(x = input$x_label, y = y_lab, title = input$plot_title, subtitle = subtitle_text)
   }
 
   if (nrow(ann) > 0) {
-    p <- p + geom_text(data = ann, aes(x = x, y = y, label = label), inherit.aes = FALSE, size = input$stat_size, color = stat_col)
+    # Use the numeric x when it is available so canvas nudges can move a label
+    # off its bar centre; fall back to the factor for older saved annotations.
+    ann_aes <- if ("x_pos" %in% names(ann) && all(is.finite(ann$x_pos))) {
+      aes(x = x_pos, y = y, label = label)
+    } else {
+      aes(x = x, y = y, label = label)
+    }
+    p <- p + geom_text(data = ann, ann_aes, inherit.aes = FALSE,
+                       size = input$stat_size, color = stat_col)
   }
 
   if (!is.null(caption_text)) {
@@ -1053,7 +1247,16 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   }
 
   p <- p + base_theme +
-    theme(plot.caption = element_text(size = (input$subtitle_size %||% 10) * 0.92, color = "grey35", hjust = 0))
+    theme(
+      plot.title = element_text(face = "bold", size = input$title_size, hjust = input$title_hjust %||% 0),
+      plot.subtitle = element_text(size = input$subtitle_size, color = "grey30", hjust = input$subtitle_hjust %||% 0),
+      plot.caption = element_text(
+        size = (input$subtitle_size %||% 10) * 0.92, color = "grey35",
+        hjust = input$caption_hjust %||% 0
+      ),
+      axis.title.x = element_text(hjust = input$x_title_hjust %||% 0.5),
+      axis.title.y = element_text(hjust = input$y_title_hjust %||% 0.5)
+    )
 
   # The n row sits outside the panel between the tick labels and the axis title,
   # so the title has to move down and the plot needs bottom margin for both.
@@ -1061,7 +1264,8 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     # The axis title is already positioned below the tick labels, so it only
     # needs the extra height the n row adds -- not the tick extent again.
     p <- p + theme(
-      axis.title.x = element_text(margin = margin(t = n_label_pt + 7, unit = "pt")),
+      axis.title.x = element_text(margin = margin(t = n_label_pt + 7, unit = "pt"),
+                                  hjust = input$x_title_hjust %||% 0.5),
       plot.margin = margin(5.5, 5.5, 8, 5.5, "pt")
     )
   }
@@ -1082,7 +1286,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   p
 }
 
-make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, step = NULL) {
+make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, step = NULL, bar_palette = NULL) {
   reveal <- reveal_data(dat, sumdat, plot_mode)
   if (!is.null(step)) {
     step <- max(1, min(step, nrow(reveal$groups)))
@@ -1097,11 +1301,12 @@ make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, 
     plot_mode = plot_mode,
     y_mode = y_mode,
     error_type = error_type,
-    input = input
+    input = input,
+    bar_palette = bar_palette
   )
 }
 
-make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input) {
+make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, bar_palette = NULL) {
   validate(need(requireNamespace("gganimate", quietly = TRUE), "Package gganimate is required for GIF export."))
   validate(need(requireNamespace("gifski", quietly = TRUE), "Package gifski is required for GIF export."))
 
@@ -1119,7 +1324,8 @@ make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, i
     plot_mode = plot_mode,
     y_mode = y_mode,
     error_type = error_type,
-    input = input
+    input = input,
+    bar_palette = bar_palette
   ) +
     gganimate::transition_manual(frame) +
     labs(caption = "Reveal step {current_frame}")
@@ -1550,6 +1756,21 @@ ui <- fluidPage(
       box-shadow: 0 1px 6px rgba(20, 40, 45, 0.16);
       margin: 0 auto;
     }
+    .canvas-bar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      padding: 8px 12px;
+      margin-bottom: 8px;
+      border: 1px solid #d5dedf;
+      border-radius: 6px;
+      background: #f6f9f9;
+    }
+    .canvas-bar .shiny-input-radiogroup { margin-bottom: 0; }
+    .canvas-bar label { margin-bottom: 0; }
+    .canvas-hint { color: #536b6f; font-size: 12px; flex: 1 1 260px; }
+    .canvas-reset { margin-left: auto; }
     .size-readout {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
@@ -1801,6 +2022,11 @@ ui <- fluidPage(
       colourInput("time_color_1", "0 min color", value = "#7AA6C2"),
       colourInput("time_color_2", "120 min color", value = "#2F5D8C"),
       colourInput("single_color", "Single-bar color", value = "#7AA6C2"),
+      selectInput("bar_color_mode", "Bar colouring", choices = c(
+        "By group (sample or timepoint)" = "group",
+        "Individually, bar by bar" = "manual"
+      ), selected = "group"),
+      uiOutput("bar_color_ui"),
       colourInput("stat_color", "Statistic label color", value = "#262626"),
       sliderInput("bar_width", "Bar width", min = 0.35, max = 0.95, value = 0.68),
       sliderInput("dodge_width", "Dodge width", min = 0.45, max = 1.1, value = 0.78),
@@ -1814,6 +2040,14 @@ ui <- fluidPage(
       sliderInput("subtitle_size", "Subtitle font size", min = 7, max = 16, value = 10),
       sliderInput("stat_size", "Statistic label size", min = 2, max = 7, value = 3),
       sliderInput("x_angle", "X-label angle", min = 0, max = 70, value = 35),
+      tags$hr(),
+      h4("Text placement"),
+      helpText("0 is left, 0.5 centred, 1 right."),
+      sliderInput("title_hjust", "Title", min = 0, max = 1, value = 0, step = 0.05),
+      sliderInput("subtitle_hjust", "Subtitle", min = 0, max = 1, value = 0, step = 0.05),
+      sliderInput("caption_hjust", "Methods caption", min = 0, max = 1, value = 0, step = 0.05),
+      sliderInput("x_title_hjust", "X-axis title", min = 0, max = 1, value = 0.5, step = 0.05),
+      sliderInput("y_title_hjust", "Y-axis title", min = 0, max = 1, value = 0.5, step = 0.05),
       selectInput("legend_position", "Legend position", choices = c("top", "right", "bottom", "left", "inside", "none"), selected = "top"),
       sliderInput("legend_x", "Inside legend x", min = 0, max = 1, value = 0.98),
       sliderInput("legend_y", "Inside legend y", min = 0, max = 1, value = 0.98),
@@ -1856,7 +2090,20 @@ ui <- fluidPage(
               span(class = "guide-text", "Size presets keep figure geometry consistent across CFU projects, talks, and manuscript panels.")
             )
           ),
-          div(class = "preview-frame", plotOutput("cfu_plot", height = "auto")),
+          div(
+            class = "canvas-bar",
+            radioButtons("canvas_mode", "Canvas", inline = TRUE, selected = "off", choices = c(
+              "Off" = "off",
+              "Place legend" = "legend",
+              "Move stat labels" = "stats"
+            )),
+            span(class = "canvas-hint", textOutput("canvas_hint", inline = TRUE)),
+            actionButton("canvas_reset", "Reset placement", class = "canvas-reset")
+          ),
+          div(
+            class = "preview-frame",
+            plotOutput("cfu_plot", height = "auto", click = "plot_click")
+          ),
           div(class = "size-readout", textOutput("figure_size_caption", inline = TRUE)),
           fluidRow(
             column(4, downloadButton("download_png", "PNG")),
@@ -2108,6 +2355,12 @@ server <- function(input, output, session) {
         updateSliderInput(session, id, value = suppressWarnings(as.numeric(value)))
       }
     }
+    if (!is.null(settings$bar_palette) && length(settings$bar_palette) > 0) {
+      pal <- unlist(settings$bar_palette)
+      for (key in names(pal)) {
+        updateColourInput(session, bar_color_input_id(key), value = unname(pal[[key]]))
+      }
+    }
     showNotification("Plot preset loaded.", type = "message")
   })
 
@@ -2120,6 +2373,189 @@ server <- function(input, output, session) {
       selectInput("col_rep", "Replicate column", choices = cols, selected = guess_column(cols, c("replicate", "rep", "biorep", "trial"))),
       selectInput("col_cfu", "CFU column", choices = cols, selected = guess_column(cols, c("cfu", "cfuperml", "cfuml", "count", "colonies", "titer", "titre")))
     )
+  })
+
+  # --- Canvas placement ------------------------------------------------------
+  # Nudges are keyed by annotation identity, not row number, so they survive a
+  # filter change, a re-render and a preset round-trip.
+  canvas <- reactiveValues(ann_offsets = list(), selected = NULL)
+
+  output$canvas_hint <- renderText({
+    switch(
+      input$canvas_mode %||% "off",
+      legend = if (identical(input$bar_color_mode %||% "group", "manual")) {
+        # Per-bar colouring hides the fill legend, so there is nothing to place
+        # and a click would look like it did nothing.
+        "This figure has no legend to place: per-bar colouring hides it. Switch Bar colouring back to 'By group' first."
+      } else if (identical(input$legend_position %||% "top", "none")) {
+        "The legend is set to 'none'. Choose another legend position first."
+      } else {
+        "Click anywhere on the figure to put the legend there."
+      },
+      stats = if (nrow(current_annotation()) == 0) {
+        "No statistic labels on this figure yet. Choose a comparison, or switch on 'Show ns labels'."
+      } else if (is.null(canvas$selected)) {
+        "Click a statistic label to pick it up."
+      } else {
+        paste0("Carrying \"", canvas$selected$label, "\" - click where it should go.")
+      },
+      "Canvas editing is off. Pick a mode to place the legend or move statistic labels by clicking."
+    )
+  })
+
+  observeEvent(input$canvas_mode, {
+    canvas$selected <- NULL
+  })
+
+  observeEvent(input$plot_click, {
+    mode <- input$canvas_mode %||% "off"
+    if (identical(mode, "off")) return()
+    click <- input$plot_click
+    if (is.null(click)) return()
+
+    if (identical(mode, "legend")) {
+      dom <- click$domain
+      if (is.null(dom)) return()
+      # Click arrives in data units; legend.position.inside wants panel-relative
+      # 0-1. Clamp so a click outside the panel cannot push the legend off-figure.
+      rel_x <- (click$x - dom$left) / (dom$right - dom$left)
+      rel_y <- (click$y - dom$bottom) / (dom$top - dom$bottom)
+      rel_x <- max(0, min(1, rel_x))
+      rel_y <- max(0, min(1, rel_y))
+      updateSelectInput(session, "legend_position", selected = "inside")
+      updateSliderInput(session, "legend_x", value = round(rel_x, 2))
+      updateSliderInput(session, "legend_y", value = round(rel_y, 2))
+      # Anchor on the centre so the legend lands under the cursor rather than
+      # hanging by a corner from it.
+      updateSliderInput(session, "legend_just_x", value = 0.5)
+      updateSliderInput(session, "legend_just_y", value = 0.5)
+      return()
+    }
+
+    ann <- current_annotation()
+    if (nrow(ann) == 0) {
+      showNotification("There are no statistic labels on this figure to move.", type = "warning")
+      return()
+    }
+    if (is.null(canvas$selected)) {
+      # Pick up the nearest label. Distances are normalised by the axis ranges so
+      # x and y contribute comparably despite completely different units.
+      dom <- click$domain
+      xr <- if (is.null(dom)) 1 else (dom$right - dom$left)
+      yr <- if (is.null(dom)) 1 else (dom$top - dom$bottom)
+      d <- sqrt(((ann$x_pos - click$x) / xr)^2 + ((ann$y - click$y) / yr)^2)
+      i <- which.min(d)
+      if (length(i) == 0 || !is.finite(d[i]) || d[i] > 0.25) {
+        showNotification("No statistic label near that click.", type = "warning")
+        return()
+      }
+      canvas$selected <- list(key = annotation_key(ann[i, ]), label = ann$label[i])
+    } else {
+      keys <- annotation_key(ann)
+      i <- match(canvas$selected$key, keys)
+      if (is.na(i)) {
+        canvas$selected <- NULL
+        return()
+      }
+      prev <- canvas$ann_offsets[[canvas$selected$key]] %||% list(dx = 0, dy = 0)
+      # The stored offset is relative to the label's automatic position, so
+      # subtract the offset already applied before recording the new one.
+      canvas$ann_offsets[[canvas$selected$key]] <- list(
+        dx = (prev$dx %||% 0) + (click$x - ann$x_pos[i]),
+        dy = (prev$dy %||% 0) + (click$y - ann$y[i])
+      )
+      canvas$selected <- NULL
+    }
+  })
+
+  observeEvent(input$canvas_reset, {
+    canvas$ann_offsets <- list()
+    canvas$selected <- NULL
+    updateSelectInput(session, "legend_position", selected = "top")
+    showNotification("Legend and statistic labels returned to their automatic positions.", type = "message")
+  })
+
+  # --- Per-bar colours -------------------------------------------------------
+  # One picker per drawn bar. The keys come from the filtered data, so they
+  # follow the plot mode and any sample/timepoint filtering.
+  visible_bar_keys <- reactive({
+    dat <- filtered_data()
+    if (nrow(dat) == 0) return(character(0))
+    unique(bar_keys(current_summary(), input$plot_mode))
+  })
+
+  # Seeded from the group colours the user already picked, so switching to
+  # per-bar colouring starts from the current figure rather than a blank grey.
+  default_bar_color <- function(key, idx) {
+    grp <- sub(" · .*$", "", key)
+    lv_sample <- levels(droplevels(filtered_data()$sample))
+    lv_time <- levels(droplevels(filtered_data()$time_min))
+    if (identical(input$plot_mode, "combined") && grp %in% lv_sample) {
+      c(input$sample_color_1 %||% okabe_ito[1], input$sample_color_2 %||% okabe_ito[2])[
+        match(grp, lv_sample)
+      ] %||% okabe_ito[((idx - 1) %% length(okabe_ito)) + 1]
+    } else if (identical(input$plot_mode, "sample_both") && grp %in% lv_time) {
+      c(input$time_color_1 %||% okabe_ito[6], input$time_color_2 %||% okabe_ito[1])[
+        match(grp, lv_time)
+      ] %||% okabe_ito[((idx - 1) %% length(okabe_ito)) + 1]
+    } else {
+      input$single_color %||% okabe_ito[1]
+    }
+  }
+
+  output$bar_color_ui <- renderUI({
+    if (!identical(input$bar_color_mode %||% "group", "manual")) return(NULL)
+    keys <- visible_bar_keys()
+    if (length(keys) == 0) {
+      return(helpText("Load data and choose a plot mode to get one colour picker per bar."))
+    }
+    warn <- if (!identical(input$plot_mode, "sample_time")) {
+      div(class = "lab-tip warn", paste(
+        "Bars are dodged by",
+        if (identical(input$plot_mode, "combined")) "sample" else "timepoint",
+        "in this plot mode. Colouring bar by bar means colour no longer identifies the group,",
+        "so the legend is hidden -- keep the groups distinguishable some other way,",
+        "or use one colour per group."
+      ))
+    } else NULL
+    tagList(
+      warn,
+      fluidRow(
+        column(6, actionButton("bar_colors_okabe", "Okabe-Ito per bar")),
+        column(6, actionButton("bar_colors_reset", "Reset to group colours"))
+      ),
+      br(),
+      lapply(seq_along(keys), function(i) {
+        key <- keys[i]
+        colourInput(bar_color_input_id(key), key,
+                    value = isolate(input[[bar_color_input_id(key)]] %||% default_bar_color(key, i)))
+      })
+    )
+  })
+
+  observeEvent(input$bar_colors_okabe, {
+    keys <- visible_bar_keys()
+    for (i in seq_along(keys)) {
+      updateColourInput(session, bar_color_input_id(keys[i]),
+                        value = okabe_ito[((i - 1) %% length(okabe_ito)) + 1])
+    }
+  })
+
+  observeEvent(input$bar_colors_reset, {
+    keys <- visible_bar_keys()
+    for (i in seq_along(keys)) {
+      updateColourInput(session, bar_color_input_id(keys[i]), value = default_bar_color(keys[i], i))
+    }
+  })
+
+  bar_palette <- reactive({
+    if (!identical(input$bar_color_mode %||% "group", "manual")) return(NULL)
+    keys <- visible_bar_keys()
+    if (length(keys) == 0) return(NULL)
+    vals <- vapply(seq_along(keys), function(i) {
+      input[[bar_color_input_id(keys[i])]] %||% default_bar_color(keys[i], i)
+    }, character(1))
+    setNames(vals, keys)
   })
 
   dropped_rows <- reactive({
@@ -2311,7 +2747,9 @@ server <- function(input, output, session) {
   })
 
   current_annotation <- reactive({
-    annotation_data(current_stats(), current_summary(), active_comparison(), input$plot_mode, input$label_kind, input$show_ns, input$y_mode)
+    ann <- annotation_data(current_stats(), current_summary(), active_comparison(),
+                           input$plot_mode, input$label_kind, input$show_ns, input$y_mode)
+    apply_annotation_offsets(ann, canvas$ann_offsets)
   })
 
   figure_qa <- reactive({
@@ -2397,6 +2835,23 @@ server <- function(input, output, session) {
         "When star labels are shown, set a y-axis maximum if labels get clipped."
       ),
       add_check(
+        "Colour encodes group",
+        !identical(input$bar_color_mode %||% "group", "manual") ||
+          identical(input$plot_mode, "sample_time"),
+        "Colour maps to the sample/timepoint group.",
+        paste0("Bars are coloured individually while the plot dodges by ",
+               if (identical(input$plot_mode, "combined")) "sample" else "timepoint",
+               ", so colour no longer identifies the group and the legend is hidden. ",
+               "Make sure the groups are distinguishable another way before submitting.")
+      ),
+      add_check(
+        "Pairwise coverage on the figure",
+        !(identical(active_comparison(), "sample") && n_distinct(dat$sample) > 2) &&
+          !(identical(active_comparison(), "time") && n_distinct(dat$time_min) > 2),
+        "Every tested pair is annotated on the figure.",
+        "More pairs were tested than the figure annotates; only the first pair is starred. The caption says so and the full table is in the Statistics tab."
+      ),
+      add_check(
         "Legend placement",
         !identical(input$legend_position, "inside") || n_distinct(dat$sample) <= 2,
         "Legend placement should be manageable.",
@@ -2414,7 +2869,8 @@ server <- function(input, output, session) {
       plot_mode = input$plot_mode,
       y_mode = input$y_mode,
       error_type = input$error_type,
-      input = input
+      input = input,
+      bar_palette = bar_palette()
     )
   })
 
@@ -2507,7 +2963,8 @@ server <- function(input, output, session) {
         y_mode = input$y_mode,
         error_type = input$error_type,
         input = input,
-        step = step
+        step = step,
+        bar_palette = bar_palette()
       ) +
         labs(caption = paste0("Reveal step ", step, " of ", total_steps))
       doc <- add_plot_slide(doc, step_plot)
@@ -2533,7 +2990,7 @@ server <- function(input, output, session) {
       column_mapping = column_mapping(),
       plot_mode = input$plot_mode,
       active_comparison = active_comparison(),
-      settings = collect_plot_settings(input),
+      settings = c(collect_plot_settings(input), list(bar_palette = as.list(bar_palette() %||% NULL))),
       visible_data = list(
         rows = nrow(filtered_data()),
         samples = as.character(levels(droplevels(filtered_data()$sample))),
@@ -2555,6 +3012,9 @@ server <- function(input, output, session) {
   reproducible_script <- reactive({
     validate(need(requireNamespace("jsonlite", quietly = TRUE), "Package jsonlite is required for R script export."))
     settings <- collect_plot_settings(input)
+    # The per-bar palette lives in dynamic inputs, so collect_plot_settings
+    # cannot see it. Bake it in or the exported script loses the colours.
+    settings$bar_palette <- as.list(bar_palette() %||% NULL)
     dat_csv <- csv_literal(filtered_data())
     sum_csv <- csv_literal(current_summary())
     ann_csv <- csv_literal(current_annotation())
@@ -2591,6 +3051,10 @@ server <- function(input, output, session) {
       exported_function_source("scale_breaks_or_default"),
       exported_function_source("axis_step_breaks"),
       exported_function_source("named_palette"),
+      exported_function_source("annotation_key"),
+      exported_function_source("apply_annotation_offsets"),
+      exported_function_source("bar_key_columns"),
+      exported_function_source("bar_keys"),
       exported_function_source("error_type_caption"),
       exported_function_source("stats_caption"),
       exported_function_source("make_cfu_plot"),
@@ -2637,7 +3101,8 @@ server <- function(input, output, session) {
         plot_mode = input$plot_mode,
         y_mode = input$y_mode,
         error_type = input$error_type,
-        input = input
+        input = input,
+        bar_palette = bar_palette()
       )
       nframes <- max(anim$steps, round(input$animation_duration * input$animation_fps))
       rendered <- gganimate::animate(

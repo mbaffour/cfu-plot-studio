@@ -128,6 +128,33 @@ the group mean as a marker instead, which allows the axis to be framed on the da
 *Auto y-axis* respects the distinction: it keeps the zero baseline for bars and fits
 the range to the data for points.
 
+## Colouring Bars Individually
+
+**Bar colouring** switches between one colour per group (the default) and one colour per
+bar. In per-bar mode you get a colour picker for every drawn bar, plus a button that
+lays Okabe-Ito across them and one that returns to the group colours.
+
+A caveat the app enforces rather than hides: when bars are dodged by sample or
+timepoint, colouring them individually means colour no longer identifies the group. The
+fill legend is hidden in that case (it would just list every bar), and Figure QA raises
+it. Per-bar colour is unambiguous in the one-sample-one-timepoint mode, and elsewhere it
+is best used to highlight rather than to classify.
+
+## Moving Things On The Canvas
+
+The **Canvas** bar above the figure has three modes:
+
+- **Off** — clicks do nothing.
+- **Place legend** — click anywhere on the figure and the legend centre moves there.
+- **Move stat labels** — click a significance label to pick it up, click again to drop it.
+
+**Reset placement** returns the legend and every label to its automatic position.
+Nudges are stored per label in axis units, so they survive re-rendering, filtering,
+resizing, preset save/load, and the reproducible-script export.
+
+Title, subtitle, methods caption and both axis titles have alignment sliders under
+**Text placement** (0 left, 0.5 centred, 1 right).
+
 ## Publication Figure Controls
 
 The app includes controls for:
@@ -169,7 +196,28 @@ small-sample correction, which matters at n = 3).
 The rank test is offered because `log10(CFU)` normality is an assumption, not a fact —
 but note that with three versus three replicates the smallest attainable two-sided p is
 0.1, so no comparison can reach 0.05. Rows produced under that condition carry a note
-saying so.
+saying so. It uses the exact null distribution unless ties force the normal
+approximation, which is also reported per row.
+
+Every pair is tested. With three or more samples or timepoints the figure annotates only
+the first pair — stacked stars at one x position are unreadable — but all pairs are
+computed, corrected together, named in the caption, and exported in the Statistics tab.
+
+The ANOVA uses Type II sums of squares via `car::Anova` when `car` is installed, because
+the `CFU > 0` filter usually leaves the design unbalanced and Type I sequential SS would
+make each main effect depend on the order the terms appear in the formula. The table
+names the type it used.
+
+## Testing
+
+```bash
+Rscript tests/test_statistics.R
+Rscript tests/test_column_matching.R
+```
+
+`test_statistics.R` re-derives each expected value from first principles or a hand-worked
+example rather than from the app's own helpers, so a bug that is self-consistent across
+the app still fails the test. Both scripts exit non-zero on failure.
 
 Multiple-comparison correction options include:
 

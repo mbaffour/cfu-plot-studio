@@ -89,12 +89,43 @@ The reviewers also confirmed, by differential testing against the previous file,
 and reference line are correctly gated to survival mode, and that the exported script
 remains self-contained.
 
+### Between-construct pairing (added after the first survival release)
+
+The within-culture pairing is guaranteed by the design. Whether replicate 1 of two
+different constructs is also one experiment is not, so **Replicate labels match across
+samples and treatments** is an explicit opt-in, off by default. When set, the
+between-construct and dose-versus-control comparisons become paired t-tests on the
+matched differences, reporting `d_z` rather than Hedges' g and carrying `paired` and
+`n_matched` columns.
+
+The power difference is the whole point: on three days whose baselines span four logs
+with a consistent half-log construct effect, the paired test gives p = 0.002 and the
+unpaired test p = 0.37, from an identical estimate.
+
+Guards, each of which is a real state on real data:
+
+- A replicate with no counterpart on the other side is excluded and counted, with the
+  count stated in the row's message.
+- Fewer than two matched replicates yields no test, and the message distinguishes
+  "no replicate label appears in both groups" from "fewer than two matched".
+- Identical matched differences give zero spread and no test, rather than an error.
+- `mean(numeric(0))` is `NaN`, which survives every `is.na()` guard written for `NA`, so
+  a non-finite estimate is scrubbed to `NA` at the source.
+- The rank test has no paired form here; selecting both leaves the comparison unpaired
+  rather than silently substituting a signed-rank test, which is a different procedure.
+- `paired` is a result column as well as an argument, and inside `mutate()` the data mask
+  shadows the argument — the internal flag is named `use_paired` for that reason.
+
+**Measured on the gp75 dummy file, pairing costs more than it buys**: only dose 50 has all
+three replicates matched, dose 25 has two, dose 100 has one, and 12.5 has none, so the
+number of testable doses falls from three to two. That is reported per row rather than
+hidden, which is the point — it tells the user the pairing claim is not supported by what
+survived.
+
 ### Still open here
 
-The between-cell comparisons (construct vs construct, dose vs control) are unpaired even
-in survival mode, because the CSV cannot express whether replicate 1 of one construct and
-replicate 1 of another came from one split culture. That is a claim about how the
-experiment was run, so the tool does not assume it.
+Nothing in the survival readout. The absolute-CFU modes remain unpaired, which is correct
+for what they plot.
 
 ## Round 3 — 2026-08-24: statistical audit, per-bar colour, canvas placement
 

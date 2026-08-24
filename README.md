@@ -196,6 +196,26 @@ two must not be compared. Between-construct and dose-versus-control comparisons 
 same ratios. The timepoint comparison is refused, because both timepoints have already
 been consumed to form the ratio.
 
+**Pairing between constructs and between doses.** The within-culture pairing above is
+guaranteed by the design: the two timepoints came from one flask. Whether replicate 1 of
+one construct and replicate 1 of another are also the same experiment — one split culture,
+one day — is a claim the CSV cannot settle, so **Replicate labels match across samples and
+treatments** is off by default.
+
+Tick it and the between-construct and dose-versus-control comparisons become paired
+t-tests on the matched differences. When the claim is true this is markedly more
+sensitive: on three days whose baselines span four logs, a consistent half-log construct
+effect gives p = 0.002 paired and p = 0.37 unpaired, from the same point estimate. When
+the claim is false, ticking it invents a pairing and the p values are wrong.
+
+Pairing is not free. A replicate with no counterpart on the other side is excluded, and
+the Statistics tab reports `n_matched` per row plus a note naming how many were dropped.
+On the bundled gp75 dummy file pairing actually *reduces* the number of testable doses
+from three to two, because different replicate numbers survived on each side — which is
+exactly the sort of thing worth seeing before trusting the result. The rank test has no
+paired form here, so selecting both leaves the comparison unpaired rather than silently
+substituting a signed-rank test.
+
 **What pairing costs, stated.** Wells whose partner did not survive the `CFU > 0` filter
 contribute nothing, and a cell can end up with no pairs at all and vanish from the figure.
 The banner above the plot and the Figure QA "Pairing completeness" check report the
@@ -261,7 +281,12 @@ names the type it used.
 Rscript tests/test_survival.R
 Rscript tests/test_statistics.R
 Rscript tests/test_column_matching.R
+Rscript tests/test_end_to_end.R            # optionally: ... path/to/your.csv
 ```
+
+`test_end_to_end.R` drives the real Shiny server with a real uploaded CSV, so it covers
+the reactives rather than the helper functions. Point it at your own file to check the
+whole pipeline against your data.
 
 `test_statistics.R` re-derives each expected value from first principles or a hand-worked
 example rather than from the app's own helpers, so a bug that is self-consistent across

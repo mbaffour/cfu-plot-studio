@@ -268,6 +268,83 @@ ok("a single-replicate sibling does not lift a valid star off its own bars",
    eq(ra$y[1], max(rsm$ymax, na.rm = TRUE) + 0.45),
    paste("y =", round(ra$y[1], 4), "expected", round(max(rsm$ymax, na.rm = TRUE) + 0.45, 4)))
 
+cat("\n-- paired between-construct comparisons --\n")
+# Two constructs measured on the same three days. Day-to-day variation is huge
+# (baselines span 4 logs) but the CONSTRUCT effect is a consistent 0.5 log, so
+# the unpaired test cannot see it and the paired test can.
+# Baselines span 4 logs across days, and both constructs swing WITH the day
+# (+0.8, -0.4, +0.2). Construct B sits about half a log below A every time. The
+# within-day difference is near-constant while the between-day spread is large,
+# which is precisely the situation pairing exists for.
+matched <- tibble::tribble(~Sample, ~inducer_concentration, ~Time, ~Replicate, ~CFU,
+  "A",0,0,1,1e7,      "A",0,0,2,1e9,       "A",0,0,3,1e11,
+  "A",0,120,1,10^7.8, "A",0,120,2,10^8.6,  "A",0,120,3,10^11.2,
+  "B",0,0,1,1e7,      "B",0,0,2,1e9,       "B",0,0,3,1e11,
+  "B",0,120,1,10^7.32,"B",0,120,2,10^8.05, "B",0,120,3,10^10.68)
+mv <- pair_survival(prep(matched), "0 min", "120 min")
+a_r <- mv$log10_cfu[mv$sample == "A"]; b_r <- mv$log10_cfu[mv$sample == "B"]
+ok("construct A swings with the day", eq(a_r, c(0.8, -0.4, 0.2), tol = 1e-8))
+ok("construct B swings the same way, half a log lower",
+   eq(b_r, c(0.32, -0.95, -0.32), tol = 1e-8))
+ok("the within-day difference is nearly constant",
+   sd(a_r - b_r) < 0.05 && sd(a_r) > 0.5,
+   paste("sd(diff) =", signif(sd(a_r - b_r), 3), " sd(A) =", signif(sd(a_r), 3)))
+
+unp <- run_survival_stats(mv, "sample", "none", "global", "0", "welch", paired = FALSE)
+pai <- run_survival_stats(mv, "sample", "none", "global", "0", "welch", paired = TRUE)
+ok("both report the same point estimate",
+   eq(unp$estimate_log10_difference, pai$estimate_log10_difference))
+ok("the paired test matches t.test(paired = TRUE) on the ratios",
+   eq(pai$p.value, t.test(a_r, b_r, paired = TRUE)$p.value))
+ok("the unpaired test matches Welch on the same ratios",
+   eq(unp$p.value, t.test(a_r, b_r)$p.value))
+ok("pairing is what makes the effect detectable here",
+   pai$p.value < 0.05 && unp$p.value > 0.05,
+   paste("paired p =", signif(pai$p.value, 3), " unpaired p =", signif(unp$p.value, 3)))
+ok("the paired row says so", isTRUE(pai$paired) && grepl("Paired", pai$test))
+ok("it reports how many replicates matched", pai$n_matched == 3)
+ok("it reports the paired effect size, not Hedges g",
+   identical(pai$effect_size_kind, "paired (d_z)") && !is.na(pai$d_z) && is.na(pai$hedges_g))
+ok("the unpaired row still reports Hedges g",
+   identical(unp$effect_size_kind, "two-sample (Hedges g)") && !is.na(unp$hedges_g))
+
+# A replicate present in one construct only cannot be paired.
+lop <- matched[!(matched$Sample == "B" & matched$Replicate == 3), ]
+lv <- pair_survival(prep(lop), "0 min", "120 min")
+lp <- run_survival_stats(lv, "sample", "none", "global", "0", "welch", paired = TRUE)
+ok("unmatched replicates are excluded from the pairing", lp$n_matched == 2, paste("got", lp$n_matched))
+ok("and the exclusion is stated", grepl("no counterpart", lp$message))
+
+# Fewer than two matched replicates leaves nothing to test.
+one <- matched[matched$Replicate == 1, ]
+op <- run_survival_stats(pair_survival(prep(one), "0 min", "120 min"),
+                         "sample", "none", "global", "0", "welch", paired = TRUE)
+ok("one matched replicate gives no paired test", is.na(op$p.value))
+ok("and says why", grepl("Fewer than two matched", op$message))
+ok("it still reports the single observed difference", eq(op$estimate_log10_difference, 0.48))
+
+# Two groups that share NO replicate label at all.
+# Each group needs real spread, or the UNPAIRED test is undefined too and the
+# comparison below would not isolate the pairing.
+disj <- tibble::tribble(~Sample, ~inducer_concentration, ~Time, ~Replicate, ~CFU,
+  "A",0,0,1,1e8, "A",0,0,2,1e8, "A",0,120,1,1e7,    "A",0,120,2,10^7.2,
+  "B",0,0,8,1e8, "B",0,0,9,1e8, "B",0,120,8,1e6,    "B",0,120,9,10^6.3)
+dp <- run_survival_stats(pair_survival(prep(disj), "0 min", "120 min"),
+                         "sample", "none", "global", "0", "welch", paired = TRUE)
+ok("disjoint replicate labels pair nothing", dp$n_matched == 0)
+ok("the estimate is NA, never NaN",
+   is.na(dp$estimate_log10_difference) && !is.nan(dp$estimate_log10_difference))
+ok("and the reason names the real problem", grepl("appears in both groups", dp$message))
+ok("the same data still tests fine unpaired",
+   !is.na(run_survival_stats(pair_survival(prep(disj), "0 min", "120 min"),
+                             "sample", "none", "global", "0", "welch")$p.value))
+
+# The rank test has no paired form here, so asking for both must not silently
+# substitute a different procedure.
+wx <- run_survival_stats(mv, "sample", "none", "global", "0", "wilcoxon", paired = TRUE)
+ok("a rank test stays unpaired rather than silently changing procedure",
+   !isTRUE(wx$paired[1]) && grepl("Wilcoxon", wx$test[1]))
+
 cat("\n-- the real gp75 file --\n")
 raw <- readr::read_csv("../gp75 cfu all reps_vault dummy.csv", show_col_types = FALSE, trim_ws = TRUE)
 if (!inherits(raw, "try-error") && nrow(raw) > 0) {

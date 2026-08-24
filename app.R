@@ -121,7 +121,7 @@ scale_breaks_or_default <- function(x) {
 plot_setting_ids <- c(
   "plot_mode", "comparison", "stats_method", "p_adjust", "p_adjust_scope", "label_kind", "show_ns",
   "y_mode", "chart_geom", "bar_color_mode", "error_type", "variation_display", "show_points", "y_min", "y_max",
-  "surv_baseline", "surv_readout", "surv_scale",
+  "surv_baseline", "surv_readout", "surv_scale", "surv_match_replicates",
   "plot_title", "plot_subtitle", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption",
   "x_label", "y_label", "treatment_unit", "append_treatment_unit", "time_unit", "append_time_unit",
   "show_n_labels", "legend_title", "bar_orientation", "plot_theme", "plot_box", "show_y_ticks",
@@ -150,7 +150,8 @@ select_setting_ids <- c(
 radio_setting_ids <- c("label_kind")
 
 checkbox_setting_ids <- c(
-  "show_ns", "show_points", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption", "append_treatment_unit",
+  "show_ns", "show_points", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption",
+  "surv_match_replicates", "append_treatment_unit",
   "append_time_unit", "show_n_labels", "plot_box", "show_y_ticks", "show_minor_y_ticks", "show_y_grid",
   "show_minor_y_grid", "ppt_editable"
 )
@@ -413,18 +414,97 @@ hedges_g <- function(a, b) {
   d * (1 - 3 / (4 * df - 1))
 }
 
-empty_two_group_result <- function(a, b, note) {
+# Paired effect size for the survival readout. d_z uses the SD of the
+# within-replicate differences, which is a different denominator from the
+# two-sample Hedges' g -- conflating them overstates or understates the effect
+# by a large factor, so the two are reported under different column names.
+paired_dz <- function(d) {
+  if (length(d) < 2) return(NA_real_)
+  s <- sd(d)
+  if (!is.finite(s) || s == 0) return(NA_real_)
+  mean(d) / s
+}
+
+empty_two_group_result <- function(a, b, note, paired = FALSE, n_matched = NA_integer_) {
+  # mean(numeric(0)) is NaN, so an empty group produced a NaN estimate. NaN then
+  # survives every downstream is.na() guard written for NA and reaches the table.
+  est <- mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE)
+  if (!is.finite(est)) est <- NA_real_
   tibble(
     p.value = NA_real_, statistic = NA_real_, parameter = NA_real_,
-    estimate = mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE),
+    estimate = est,
     conf.low = NA_real_, conf.high = NA_real_,
-    hedges_g = NA_real_, stderr = NA_real_, message = note
+    hedges_g = NA_real_, d_z = NA_real_, stderr = NA_real_,
+    paired = paired, n_matched = n_matched, message = note
   )
 }
 
-run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal, test_family = "t") {
+# Match two groups replicate by replicate. Only meaningful when the replicate
+# labels mean the same thing on both sides -- same split culture, same
+# experimental day. That is a claim about how the experiment was run which the
+# CSV cannot settle, so the caller has to opt in.
+matched_pairs <- function(dat, group_col, level_a, level_b) {
+  side <- function(lv) {
+    dat %>%
+      filter(.data[[group_col]] == lv,
+             !is.na(replicate), nzchar(trimws(as.character(replicate)))) %>%
+      group_by(replicate) %>%
+      summarize(v = mean(log10_cfu), .groups = "drop")
+  }
+  aa <- side(level_a); bb <- side(level_b)
+  m <- inner_join(aa, bb, by = "replicate", suffix = c("_a", "_b"), na_matches = "never")
+  list(
+    d = m$v_a - m$v_b,
+    n_matched = nrow(m),
+    n_dropped = (nrow(aa) - nrow(m)) + (nrow(bb) - nrow(m))
+  )
+}
+
+run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal,
+                               test_family = "t", paired = FALSE) {
   a <- dat %>% filter(.data[[group_col]] == level_a) %>% pull(log10_cfu)
   b <- dat %>% filter(.data[[group_col]] == level_b) %>% pull(log10_cfu)
+
+  if (isTRUE(paired)) {
+    mp <- matched_pairs(dat, group_col, level_a, level_b)
+    d <- mp$d
+    drop_note <- if (mp$n_dropped > 0) {
+      paste0(mp$n_dropped, " replicate(s) had no counterpart in the other group and were excluded. ")
+    } else ""
+    if (length(d) < 2) {
+      note <- if (mp$n_matched == 0) {
+        paste0(drop_note, "No replicate label appears in both groups, so nothing can be paired.")
+      } else {
+        paste0(drop_note, "Fewer than two matched replicates, so no paired test is defined.")
+      }
+      return(empty_two_group_result(a, b, note, paired = TRUE, n_matched = mp$n_matched) %>%
+               mutate(estimate = if (length(d) == 1) d[1] else NA_real_))
+    }
+    sd_d <- sd(d)
+    if (!is.finite(sd_d) || sd_d == 0) {
+      return(empty_two_group_result(a, b, paste0(
+        drop_note, "Every matched replicate differed by an identical amount, so the spread is zero and no t-test is defined."),
+        paired = TRUE, n_matched = mp$n_matched) %>% mutate(estimate = mean(d)))
+    }
+    tt <- tryCatch(t.test(d, mu = 0), error = function(e) e)
+    if (inherits(tt, "error")) {
+      return(empty_two_group_result(a, b, paste0(drop_note, conditionMessage(tt)),
+                                    paired = TRUE, n_matched = mp$n_matched))
+    }
+    return(tibble(
+      p.value = unname(tt$p.value),
+      statistic = unname(tt$statistic),
+      parameter = unname(tt$parameter),
+      estimate = mean(d),
+      conf.low = unname(tt$conf.int[1]), conf.high = unname(tt$conf.int[2]),
+      # Paired data gets the paired effect size. Reporting Hedges' g here would
+      # divide by the wrong spread entirely.
+      hedges_g = NA_real_, d_z = paired_dz(d),
+      stderr = unname(tt$stderr %||% (sd_d / sqrt(length(d)))),
+      paired = TRUE, n_matched = mp$n_matched,
+      message = if (nzchar(drop_note)) trimws(drop_note) else NA_character_
+    ))
+  }
 
   if (length(a) < 2 || length(b) < 2) {
     return(empty_two_group_result(a, b, "Each group needs at least two replicates for a test."))
@@ -453,6 +533,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal, test
       p.value = unname(test$p.value),
       statistic = unname(test$statistic),
       parameter = NA_real_,
+      paired = FALSE, n_matched = NA_integer_, d_z = NA_real_,
       # The Hodges-Lehmann shift, so the point estimate matches the interval the
       # same call returns. A median difference would not sit inside that CI.
       estimate = unname(test$estimate %||% (median(a, na.rm = TRUE) - median(b, na.rm = TRUE))),
@@ -477,6 +558,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal, test
     p.value = unname(test$p.value),
     statistic = unname(test$statistic),
     parameter = unname(test$parameter),
+    paired = FALSE, n_matched = NA_integer_, d_z = NA_real_,
     estimate = mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE),
     conf.low = unname(test$conf.int[1] %||% NA_real_),
     conf.high = unname(test$conf.int[2] %||% NA_real_),
@@ -486,9 +568,15 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal, test
   )
 }
 
-run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, control_concentration, ttest_type) {
+run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, control_concentration, ttest_type,
+                                  paired = FALSE) {
   var_equal <- identical(ttest_type, "student")
   test_family <- if (identical(ttest_type, "wilcoxon")) "wilcoxon" else "t"
+  # Pairing is a t-test concept here; matched-pair ranks would be a signed rank
+  # test, a different procedure, so the rank option stays unpaired.
+  # NOTE the distinct name: `paired` is also a column in the result, and inside
+  # mutate() the data mask would shadow the argument.
+  use_paired <- isTRUE(paired) && !identical(test_family, "wilcoxon")
 
   if (comparison == "sample") {
     if (n_distinct(dat$sample) < 2) return(tibble(message = "Sample comparison requires at least two samples."))
@@ -503,7 +591,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
       sub <- dat %>% filter(concentration_label == strata$concentration_label[i], time_min == strata$time_min[i])
       bind_rows(lapply(seq_along(sample_pairs), function(k) {
         pair <- sample_pairs[[k]]
-        res <- run_two_group_test(sub, "sample", pair[1], pair[2], var_equal, test_family)
+        res <- run_two_group_test(sub, "sample", pair[1], pair[2], var_equal, test_family, use_paired)
         res %>%
           mutate(
             comparison_family = "Sample/vector within treatment and time",
@@ -526,7 +614,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
       sub <- dat %>% filter(sample == strata$sample[i], concentration_label == strata$concentration_label[i])
       bind_rows(lapply(seq_along(time_pairs), function(k) {
         pair <- time_pairs[[k]]
-        res <- run_two_group_test(sub, "time_min", pair[1], pair[2], var_equal, test_family)
+        res <- run_two_group_test(sub, "time_min", pair[1], pair[2], var_equal, test_family, use_paired)
         res %>%
           mutate(
             comparison_family = "Timepoints within sample/vector and treatment",
@@ -551,7 +639,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
       sub <- dat %>% filter(sample == strata$sample[i], time_min == strata$time_min[i])
       test_levels <- setdiff(levels(droplevels(sub$concentration_label)), control_concentration)
       bind_rows(lapply(test_levels, function(lvl) {
-        res <- run_two_group_test(sub, "concentration_label", lvl, control_concentration, var_equal, test_family)
+        res <- run_two_group_test(sub, "concentration_label", lvl, control_concentration, var_equal, test_family, use_paired)
         res %>%
           mutate(
             comparison_family = "Treatment versus control within sample/vector and time",
@@ -575,7 +663,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
       pairs <- combn(levs, 2, simplify = FALSE)
       bind_rows(lapply(seq_along(pairs), function(k) {
         pair <- pairs[[k]]
-        res <- run_two_group_test(sub, "concentration_label", pair[1], pair[2], var_equal, test_family)
+        res <- run_two_group_test(sub, "concentration_label", pair[1], pair[2], var_equal, test_family, use_paired)
         res %>%
           mutate(
             comparison_family = "All treatment pairs within sample/vector and time",
@@ -597,6 +685,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
   adjust_stats(out, p_adjust, adjustment_scope) %>%
     mutate(
       test = if (identical(test_family, "wilcoxon")) "Wilcoxon rank-sum on log10(CFU)"
+             else if (use_paired) "Paired t-test on log10(CFU), matched by replicate"
              else if (var_equal) "Student t-test on log10(CFU)"
              else "Welch t-test on log10(CFU)",
       estimate_log10_difference = estimate,
@@ -609,24 +698,13 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
     select(
       comparison_family, test, contrast, sample, concentration_label, time_min,
       estimate_log10_difference, conf.low, conf.high, fold_change, fold_change_low, fold_change_high,
-      hedges_g, statistic, parameter, p.value, q.value,
+      hedges_g, d_z, paired, n_matched, statistic, parameter, p.value, q.value,
       significance, p_adjust_method, adjustment_scope, message, everything()
     )
 }
 
-# Paired effect size for the survival readout. d_z uses the SD of the
-# within-replicate differences, which is a different denominator from the
-# two-sample Hedges' g -- conflating them overstates or understates the effect
-# by a large factor, so the two are reported under different column names.
-paired_dz <- function(d) {
-  if (length(d) < 2) return(NA_real_)
-  s <- sd(d)
-  if (!is.finite(s) || s == 0) return(NA_real_)
-  mean(d) / s
-}
-
 run_survival_stats <- function(surv, comparison, p_adjust, adjustment_scope,
-                               control_concentration, ttest_type) {
+                               control_concentration, ttest_type, paired = FALSE) {
   if (!is_survival_frame(surv)) {
     return(tibble(message = "Survival statistics require a paired survival frame."))
   }
@@ -641,15 +719,16 @@ run_survival_stats <- function(surv, comparison, p_adjust, adjustment_scope,
 
   if (!identical(comparison, "survival_vs_zero")) {
     # The survival frame carries the per-replicate log ratio in log10_cfu, so
-    # the existing pairwise machinery tests exactly the right quantity -- these
-    # comparisons are unpaired BETWEEN cells even though the values inside each
-    # cell are paired.
+    # the existing pairwise machinery tests exactly the right quantity. Whether
+    # these BETWEEN-cell comparisons are themselves paired depends on whether a
+    # replicate label means the same thing on both sides -- the caller's claim.
     out <- run_groupwise_t_tests(surv, comparison, p_adjust, adjustment_scope,
-                                 control_concentration, ttest_type)
+                                 control_concentration, ttest_type, paired = paired)
     if (nrow(out) > 0 && "test" %in% names(out)) {
       out <- out %>% mutate(
         test = sub("on log10\\(CFU\\)", "on log10 survival ratio", test),
-        effect_size_kind = "two-sample (Hedges g)"
+        effect_size_kind = ifelse(paired & !is.na(d_z),
+                                  "paired (d_z)", "two-sample (Hedges g)")
       )
     }
     return(out)
@@ -1417,6 +1496,13 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       !(identical(resolved_cmp, "survival_vs_zero") && !is_survival) &&
       !(identical(resolved_cmp, "time") && is_survival)
     if (stats_ran) {
+      # A paired between-construct test rests on a claim the data cannot prove,
+      # so the figure has to state that the claim was made.
+      if (is_survival && isTRUE(input$surv_match_replicates) &&
+          !identical(resolved_cmp, "survival_vs_zero")) {
+        caption_parts <- c(caption_parts,
+          "replicates treated as matched across groups, so the comparison is paired")
+      }
       caption_parts <- c(caption_parts, if (identical(resolved_cmp, "survival_vs_zero") && is_survival) {
         paste0("one-sample t-test of the log10 survival ratio against no change; ",
                sub("^.*; ", "", stats_caption(input$stats_method, input$p_adjust)))
@@ -3279,7 +3365,10 @@ server <- function(input, output, session) {
                        selected = levels(dat$sample), multiple = TRUE),
         selectInput("surv_baseline", "Baseline timepoint", choices = tl, selected = tl[1]),
         selectInput("surv_readout", "Readout timepoint", choices = tl, selected = tl[length(tl)]),
-        helpText("Survival is the readout divided by the baseline within each replicate. Both timepoints are consumed to form the ratio, so there is no timepoint filter in this mode.")
+        helpText("Survival is the readout divided by the baseline within each replicate. Both timepoints are consumed to form the ratio, so there is no timepoint filter in this mode."),
+        checkboxInput("surv_match_replicates",
+                      "Replicate labels match across samples and treatments", value = FALSE),
+        helpText("Tick this only if replicate 1 of one construct and replicate 1 of another really are the same experiment -- one split culture, one day. When they are, comparisons between constructs and between doses are run as PAIRED tests, which removes day-to-day variation and is markedly more sensitive. When they are not, ticking it invents a pairing and the p values are wrong. Nothing in the CSV can settle this, so it is off by default.")
       ))
     }
     if (input$plot_mode == "combined") {
@@ -3375,7 +3464,8 @@ server <- function(input, output, session) {
         surv = plot_data(), comparison = cmp, p_adjust = input$p_adjust,
         adjustment_scope = input$p_adjust_scope,
         control_concentration = input$control_concentration,
-        ttest_type = input$stats_method
+        ttest_type = input$stats_method,
+        paired = isTRUE(input$surv_match_replicates)
       ))
     }
     if (identical(cmp, "survival_vs_zero")) {

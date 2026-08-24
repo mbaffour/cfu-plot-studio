@@ -19,3 +19,6 @@ Desktop.ini
 
 # Launcher private library (created on first run)
 .Rlibrary/
+
+# Default device R opens when a script draws headlessly
+Rplots.pdf

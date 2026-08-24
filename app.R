@@ -23,11 +23,63 @@ clean_names <- function(x) {
   trimws(x)
 }
 
+MM_PER_INCH <- 25.4
+
+# Screen pixels per figure inch for the preview. The preview canvas is sized to
+# export_inches * PREVIEW_PPI and the device resolution is set to the same
+# number, so a 7 pt tick label occupies the same fraction of the figure on
+# screen as it will in the exported file. Fixed rather than user-adjustable
+# because renderPlot() forces `res` once and never re-reads it.
+PREVIEW_PPI <- 144
+
+# Figure width/height are entered in whichever unit the user picked, but every
+# export path (ggsave, officer, gifski) wants inches. Convert at the boundary so
+# there is exactly one place where the unit is interpreted.
+size_to_inches <- function(x, units, fallback = NA_real_) {
+  x <- suppressWarnings(as.numeric(x))
+  if (length(x) != 1 || is.na(x) || !is.finite(x) || x <= 0) return(fallback)
+  if (identical(units, "mm")) x / MM_PER_INCH else x
+}
+
+# Emit a live function's own source into the exported reproducible script, so
+# the script and the app can never drift apart.
+exported_function_source <- function(name) {
+  # Resolve in the environment these helpers were defined in, which is the app's
+  # top level whether it was sourced or run by shiny::runApp().
+  fn <- get(name, envir = environment(exported_function_source))
+  lhs <- if (make.names(name) == name) name else paste0("`", name, "`")
+  paste0(lhs, " <- ", paste(deparse(fn), collapse = "\n"))
+}
+
+format_figure_size <- function(width_in, height_in, dpi) {
+  if (!is.finite(width_in) || !is.finite(height_in)) return("Figure size is not set.")
+  sprintf(
+    "%.2f x %.2f in  (%.0f x %.0f mm)  at %s DPI  =  %d x %d px",
+    width_in, height_in, width_in * MM_PER_INCH, height_in * MM_PER_INCH,
+    if (is.finite(dpi)) format(dpi) else "?",
+    round(width_in * dpi), round(height_in * dpi)
+  )
+}
+
 guess_column <- function(cols, candidates) {
-  cols_clean <- tolower(gsub("[^a-z0-9]+", "", cols))
-  candidates_clean <- tolower(gsub("[^a-z0-9]+", "", candidates))
+  # Lowercase BEFORE stripping to [a-z0-9], or every capital letter in a header is
+  # deleted rather than folded ("CFU" -> "", "Sample" -> "ample").
+  norm <- function(x) gsub("[^a-z0-9]+", "", tolower(x))
+  cols_clean <- norm(cols)
+  candidates_clean <- norm(candidates)
+  candidates_clean <- candidates_clean[nzchar(candidates_clean)]
+
   hit <- match(candidates_clean, cols_clean, nomatch = 0)
-  if (any(hit > 0)) cols[hit[hit > 0][1]] else cols[1]
+  if (any(hit > 0)) return(cols[hit[hit > 0][1]])
+
+  # Fall back to a header that contains a candidate, so real bench headers like
+  # "inducer_concentration" or "CFU_per_mL" still find "concentration" / "cfu".
+  for (cand in candidates_clean) {
+    idx <- which(grepl(cand, cols_clean, fixed = TRUE))
+    if (length(idx) > 0) return(cols[idx[1]])
+  }
+
+  cols[1]
 }
 
 format_label <- function(x, unit = "", append_unit = TRUE) {
@@ -68,39 +120,40 @@ scale_breaks_or_default <- function(x) {
 
 plot_setting_ids <- c(
   "plot_mode", "comparison", "stats_method", "p_adjust", "p_adjust_scope", "label_kind", "show_ns",
-  "y_mode", "error_type", "variation_display", "show_points", "y_min", "y_max",
+  "y_mode", "chart_geom", "error_type", "variation_display", "show_points", "y_min", "y_max",
   "plot_title", "plot_subtitle", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption",
-  "x_label", "treatment_unit", "append_treatment_unit", "time_unit", "append_time_unit",
-  "legend_title", "bar_orientation", "plot_theme", "plot_box", "show_y_ticks",
+  "x_label", "y_label", "treatment_unit", "append_treatment_unit", "time_unit", "append_time_unit",
+  "show_n_labels", "legend_title", "bar_orientation", "plot_theme", "plot_box", "show_y_ticks",
   "show_minor_y_ticks", "show_y_grid", "show_minor_y_grid", "y_major_step", "y_minor_step",
   "y_tick_length", "minor_y_tick_length", "axis_line_width", "box_line_width",
   "axis_color", "grid_color", "bar_outline_color", "bar_outline_width", "errorbar_width",
   "sample_color_1", "sample_color_2", "time_color_1", "time_color_2", "single_color", "stat_color",
-  "bar_width", "dodge_width", "point_size", "point_alpha", "jitter_width",
+  "bar_width", "dodge_width", "point_size", "point_alpha", "jitter_width", "jitter_seed",
   "font_size", "title_size", "subtitle_size", "stat_size", "x_angle",
   "legend_position", "legend_x", "legend_y", "legend_just_x", "legend_just_y",
-  "download_width", "download_height", "download_dpi", "animation_fps", "animation_duration",
+  "size_units", "download_width", "download_height", "download_dpi", "animation_fps", "animation_duration",
   "animation_dpi", "ppt_editable"
 )
 
 select_setting_ids <- c(
   "plot_mode", "comparison", "stats_method", "p_adjust", "p_adjust_scope", "y_mode",
-  "error_type", "variation_display", "bar_orientation", "plot_theme", "legend_position"
+  "error_type", "variation_display", "bar_orientation", "plot_theme", "legend_position",
+  "size_units", "chart_geom"
 )
 
 radio_setting_ids <- c("label_kind")
 
 checkbox_setting_ids <- c(
   "show_ns", "show_points", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption", "append_treatment_unit",
-  "append_time_unit", "plot_box", "show_y_ticks", "show_minor_y_ticks", "show_y_grid",
+  "append_time_unit", "show_n_labels", "plot_box", "show_y_ticks", "show_minor_y_ticks", "show_y_grid",
   "show_minor_y_grid", "ppt_editable"
 )
 
-text_setting_ids <- c("plot_title", "plot_subtitle", "x_label", "treatment_unit", "time_unit", "legend_title")
+text_setting_ids <- c("plot_title", "plot_subtitle", "x_label", "y_label", "treatment_unit", "time_unit", "legend_title")
 
 numeric_setting_ids <- c(
   "y_min", "y_max", "y_major_step", "y_minor_step", "download_width", "download_height",
-  "download_dpi", "animation_dpi"
+  "download_dpi", "animation_dpi", "jitter_seed"
 )
 
 slider_setting_ids <- setdiff(
@@ -317,18 +370,57 @@ adjust_stats <- function(out, p_adjust, adjustment_scope) {
     )
 }
 
-run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal) {
+# Hedges' g: Cohen's d with the small-sample correction. CFU assays run n=3, and
+# at n=3 the uncorrected d overstates the effect by roughly a third.
+hedges_g <- function(a, b) {
+  na <- length(a); nb <- length(b)
+  if (na < 2 || nb < 2) return(NA_real_)
+  s_pooled <- sqrt(((na - 1) * var(a) + (nb - 1) * var(b)) / (na + nb - 2))
+  if (!is.finite(s_pooled) || s_pooled == 0) return(NA_real_)
+  d <- (mean(a) - mean(b)) / s_pooled
+  df <- na + nb - 2
+  d * (1 - 3 / (4 * df - 1))
+}
+
+empty_two_group_result <- function(a, b, note) {
+  tibble(
+    p.value = NA_real_, statistic = NA_real_, parameter = NA_real_,
+    estimate = mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE),
+    conf.low = NA_real_, conf.high = NA_real_,
+    hedges_g = NA_real_, stderr = NA_real_, message = note
+  )
+}
+
+run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal, test_family = "t") {
   a <- dat %>% filter(.data[[group_col]] == level_a) %>% pull(log10_cfu)
   b <- dat %>% filter(.data[[group_col]] == level_b) %>% pull(log10_cfu)
 
   if (length(a) < 2 || length(b) < 2) {
+    return(empty_two_group_result(a, b, "Each group needs at least two replicates for a test."))
+  }
+
+  if (identical(test_family, "wilcoxon")) {
+    # With n=3 vs n=3 the smallest attainable two-sided p is 0.1, so a rank test
+    # on a typical CFU assay can never reach 0.05. Report it, do not hide it.
+    test <- tryCatch(
+      suppressWarnings(wilcox.test(a, b, conf.int = TRUE, exact = FALSE)),
+      error = function(e) e
+    )
+    if (inherits(test, "error")) return(empty_two_group_result(a, b, conditionMessage(test)))
     return(tibble(
-      p.value = NA_real_,
-      statistic = NA_real_,
+      p.value = unname(test$p.value),
+      statistic = unname(test$statistic),
       parameter = NA_real_,
-      estimate = mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE),
+      # The Hodges-Lehmann shift, so the point estimate matches the interval the
+      # same call returns. A median difference would not sit inside that CI.
+      estimate = unname(test$estimate %||% (median(a, na.rm = TRUE) - median(b, na.rm = TRUE))),
+      conf.low = unname(test$conf.int[1] %||% NA_real_),
+      conf.high = unname(test$conf.int[2] %||% NA_real_),
+      hedges_g = hedges_g(a, b),
       stderr = NA_real_,
-      message = "Each group needs at least two replicates for a t-test."
+      message = if (min(length(a), length(b)) < 4) {
+        "Rank test: with this n the smallest attainable p may exceed 0.05."
+      } else NA_character_
     ))
   }
 
@@ -338,14 +430,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal) {
   )
 
   if (inherits(test, "error")) {
-    return(tibble(
-      p.value = NA_real_,
-      statistic = NA_real_,
-      parameter = NA_real_,
-      estimate = mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE),
-      stderr = NA_real_,
-      message = conditionMessage(test)
-    ))
+    return(empty_two_group_result(a, b, conditionMessage(test)))
   }
 
   tibble(
@@ -353,6 +438,9 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal) {
     statistic = unname(test$statistic),
     parameter = unname(test$parameter),
     estimate = mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE),
+    conf.low = unname(test$conf.int[1] %||% NA_real_),
+    conf.high = unname(test$conf.int[2] %||% NA_real_),
+    hedges_g = hedges_g(a, b),
     stderr = unname(test$stderr %||% NA_real_),
     message = NA_character_
   )
@@ -360,6 +448,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal) {
 
 run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, control_concentration, ttest_type) {
   var_equal <- identical(ttest_type, "student")
+  test_family <- if (identical(ttest_type, "wilcoxon")) "wilcoxon" else "t"
 
   if (comparison == "sample") {
     if (n_distinct(dat$sample) < 2) return(tibble(message = "Sample comparison requires at least two samples."))
@@ -367,7 +456,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
     strata <- dat %>% distinct(concentration_label, time_min)
     out <- bind_rows(lapply(seq_len(nrow(strata)), function(i) {
       sub <- dat %>% filter(concentration_label == strata$concentration_label[i], time_min == strata$time_min[i])
-      res <- run_two_group_test(sub, "sample", levels_to_compare[1], levels_to_compare[2], var_equal)
+      res <- run_two_group_test(sub, "sample", levels_to_compare[1], levels_to_compare[2], var_equal, test_family)
       res %>%
         mutate(
           comparison_family = "Sample/vector within treatment and time",
@@ -386,7 +475,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
     strata <- dat %>% distinct(sample, concentration_label)
     out <- bind_rows(lapply(seq_len(nrow(strata)), function(i) {
       sub <- dat %>% filter(sample == strata$sample[i], concentration_label == strata$concentration_label[i])
-      res <- run_two_group_test(sub, "time_min", levels_to_compare[1], levels_to_compare[2], var_equal)
+      res <- run_two_group_test(sub, "time_min", levels_to_compare[1], levels_to_compare[2], var_equal, test_family)
       res %>%
         mutate(
           comparison_family = "Timepoints within sample/vector and treatment",
@@ -409,7 +498,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
       sub <- dat %>% filter(sample == strata$sample[i], time_min == strata$time_min[i])
       test_levels <- setdiff(levels(droplevels(sub$concentration_label)), control_concentration)
       bind_rows(lapply(test_levels, function(lvl) {
-        res <- run_two_group_test(sub, "concentration_label", lvl, control_concentration, var_equal)
+        res <- run_two_group_test(sub, "concentration_label", lvl, control_concentration, var_equal, test_family)
         res %>%
           mutate(
             comparison_family = "Treatment versus control within sample/vector and time",
@@ -431,7 +520,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
       levs <- levels(droplevels(sub$concentration_label))
       pairs <- combn(levs, 2, simplify = FALSE)
       bind_rows(lapply(pairs, function(pair) {
-        res <- run_two_group_test(sub, "concentration_label", pair[1], pair[2], var_equal)
+        res <- run_two_group_test(sub, "concentration_label", pair[1], pair[2], var_equal, test_family)
         res %>%
           mutate(
             comparison_family = "All treatment pairs within sample/vector and time",
@@ -451,13 +540,20 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
 
   adjust_stats(out, p_adjust, adjustment_scope) %>%
     mutate(
-      test = if (var_equal) "Student t-test on log10(CFU)" else "Welch t-test on log10(CFU)",
+      test = if (identical(test_family, "wilcoxon")) "Wilcoxon rank-sum on log10(CFU)"
+             else if (var_equal) "Student t-test on log10(CFU)"
+             else "Welch t-test on log10(CFU)",
       estimate_log10_difference = estimate,
-      fold_change = 10^estimate
+      # The test runs on log10, so the CI transforms straight into a fold-change
+      # interval -- the scale the result is actually reported on.
+      fold_change = 10^estimate,
+      fold_change_low = 10^conf.low,
+      fold_change_high = 10^conf.high
     ) %>%
     select(
       comparison_family, test, contrast, sample, concentration_label, time_min,
-      estimate_log10_difference, fold_change, statistic, parameter, p.value, q.value,
+      estimate_log10_difference, conf.low, conf.high, fold_change, fold_change_low, fold_change_high,
+      hedges_g, statistic, parameter, p.value, q.value,
       significance, p_adjust_method, adjustment_scope, message, everything()
     )
 }
@@ -556,23 +652,18 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type) {
       max_y = max(plot_y, na.rm = TRUE),
       .groups = "drop"
     ) %>%
+    # error_type is a single string, not a column, so this is an if/else and not
+    # a case_when -- dplyr 1.2 deprecated scalar-LHS case_when for exactly this.
     mutate(
-      err_y = case_when(
-        error_type == "SD" ~ sd_y,
-        error_type == "SEM" ~ sem_y,
-        error_type == "95% CI" ~ qt(0.975, pmax(n - 1, 1)) * sem_y,
-        TRUE ~ sd_y
-      ),
-      ymin = case_when(
-        error_type == "IQR" ~ q1_y,
-        error_type == "Range (min-max)" ~ min_y,
-        TRUE ~ mean_y - err_y
-      ),
-      ymax = case_when(
-        error_type == "IQR" ~ q3_y,
-        error_type == "Range (min-max)" ~ max_y,
-        TRUE ~ mean_y + err_y
-      ),
+      err_y = if (error_type == "SEM") sem_y
+              else if (error_type == "95% CI") qt(0.975, pmax(n - 1, 1)) * sem_y
+              else sd_y,
+      ymin = if (error_type == "IQR") q1_y
+             else if (error_type == "Range (min-max)") min_y
+             else mean_y - err_y,
+      ymax = if (error_type == "IQR") q3_y
+             else if (error_type == "Range (min-max)") max_y
+             else mean_y + err_y,
       ymin = pmax(ymin, if (y_mode == "raw_log_axis") .Machine$double.eps else 0)
     )
 }
@@ -651,7 +742,10 @@ expand_reveal <- function(x, total_steps) {
 }
 
 make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input) {
-  y_lab <- if (y_mode == "log10") expression(log[10]~"CFU") else "CFU"
+  # CFU/mL, CFU/plate and CFU/OD are different quantities; let the axis say which.
+  y_quantity <- trimws(input$y_label %||% "")
+  if (!nzchar(y_quantity)) y_quantity <- "CFU/mL"
+  y_lab <- if (y_mode == "log10") bquote(log[10] ~ .(y_quantity)) else y_quantity
   y_min <- axis_limit(input$y_min)
   y_max <- axis_limit(input$y_max)
   if (y_mode == "raw_log_axis" && !is.na(y_min) && y_min <= 0) {
@@ -674,12 +768,43 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   errorbar_lwd <- input$errorbar_width %||% 0.55
   stat_col <- input$stat_color %||% "grey15"
   variation_display <- input$variation_display %||% "errorbar"
+  chart_geom <- input$chart_geom %||% "bar"
+  draw_bars <- identical(chart_geom, "bar")
 
-  # Auto methods caption: names error-bar type, and (when stats are shown) the
-  # test + multiple-comparison correction. User can disable via the sidebar.
+  # When every group has the same n, one phrase in the caption says it better
+  # than a label under every bar. Per-bar labels are only worth their clutter
+  # when n actually varies -- which, after the CFU<=0 filter, it often does.
+  group_ns <- sumdat$n[is.finite(sumdat$n)]
+  n_is_constant <- length(group_ns) > 0 && length(unique(group_ns)) == 1
+  draw_n_labels <- isTRUE(input$show_n_labels) && length(group_ns) > 0 && !n_is_constant
+
+  # The n row is drawn outside the panel, so it has to be placed past whatever
+  # vertical space the tick labels take -- which grows with the label angle.
+  base_pt <- input$font_size %||% 11
+  n_label_pt <- max(5, base_pt * 0.82)
+  # A fixed seed makes the jittered replicate points land in the same place on
+  # every render, which is what lets the exported script reproduce the figure.
+  jitter_seed <- suppressWarnings(as.integer(input$jitter_seed %||% 1))
+  if (length(jitter_seed) != 1 || is.na(jitter_seed)) jitter_seed <- 1L
+  x_angle_rad <- (input$x_angle %||% 0) * pi / 180
+  max_x_chars <- suppressWarnings(max(nchar(as.character(unique(sumdat$concentration_label))), 1, na.rm = TRUE))
+  tick_extent_pt <- base_pt * (cos(x_angle_rad) + max_x_chars * 0.55 * sin(x_angle_rad))
+  n_row_offset_pt <- 5 + tick_extent_pt + 4
+  n_caption <- if (length(group_ns) == 0) {
+    ""
+  } else if (n_is_constant) {
+    paste0("n = ", group_ns[1], " replicates per group")
+  } else if (draw_n_labels) {
+    paste0("n = ", min(group_ns), "-", max(group_ns), " replicates per group (n row under the axis)")
+  } else {
+    paste0("n = ", min(group_ns), "-", max(group_ns), " replicates per group")
+  }
+
+  # Auto methods caption: names error-bar type, replicate n, and (when stats are
+  # shown) the test + multiple-comparison correction. Disable via the sidebar.
   caption_text <- NULL
   if (isTRUE(input$show_method_caption %||% TRUE)) {
-    caption_parts <- c(error_type_caption(error_type, variation_display))
+    caption_parts <- c(error_type_caption(error_type, variation_display), n_caption)
     stats_on <- !identical(input$comparison %||% "auto", "none")
     if (stats_on) {
       caption_parts <- c(caption_parts, stats_caption(input$stats_method, input$p_adjust))
@@ -689,6 +814,12 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       caption_text <- paste(caption_parts, collapse = "; ")
       substr(caption_text, 1, 1) <- toupper(substr(caption_text, 1, 1))
       caption_text <- paste0(caption_text, ".")
+      # ggplot will not wrap a caption, it just runs off the page. Wrap it here
+      # against the real export width so the methods line survives the export.
+      fig_width_in <- size_to_inches(input$download_width, input$size_units %||% "in", fallback = 8.2)
+      caption_pt <- (input$subtitle_size %||% 10) * 0.92
+      chars_per_line <- max(24, floor(fig_width_in * 72 / (caption_pt * 0.58)))
+      caption_text <- paste(strwrap(caption_text, width = chars_per_line), collapse = "\n")
     }
   }
 
@@ -804,20 +935,73 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     )
   }
 
+  # Bars encode magnitude by length from zero, which a log axis does not support
+  # honestly -- on log10(CFU) a bar from 0 is a bar from 1 CFU/mL, an arbitrary
+  # baseline. Points let the axis start near the data, which is how viable counts
+  # are normally shown. `draw_bars` picks between the two.
+  add_mean_layer <- function(plot_obj, position_obj, fixed_fill = NULL) {
+    args <- list(position = position_obj, color = bar_outline_col)
+    if (!is.null(fixed_fill)) args$fill <- fixed_fill
+    if (draw_bars) {
+      return(plot_obj + do.call(geom_col, c(args, list(
+        width = input$bar_width, linewidth = bar_outline_lwd
+      ))))
+    }
+    # "Replicate points only" already draws every replicate; a mean marker on top
+    # would be a second, differently-defined point.
+    if (identical(variation_display, "none")) return(plot_obj)
+    plot_obj + do.call(geom_point, c(args, list(
+      shape = 21, size = (input$point_size %||% 1.8) * 1.9, stroke = 0.45
+    )))
+  }
+
+  # Replicate n per bar, drawn just below the axis. Reviewers ask for n on the
+  # figure, not only in a supplementary table -- and after the CFU<=0 filter the
+  # n is not always the n you plated, so it has to be read off the plotted data.
+  add_n_labels <- function(plot_obj, position_obj, group_var = NULL) {
+    # A constant n is already stated once in the caption; repeating it under
+    # every bar is noise, and the labels collide on narrow single-column figures.
+    if (!draw_n_labels) return(plot_obj)
+    # Anchor to a real y value, not -Inf: on a log10 axis -Inf transforms to NaN
+    # and every label is silently dropped.
+    n_y <- if (!is.na(y_min)) y_min else finite_y[1]
+    if (identical(y_mode, "raw_log_axis") && (!is.finite(n_y) || n_y <= 0)) {
+      n_y <- suppressWarnings(min(sumdat$ymin[sumdat$ymin > 0], na.rm = TRUE))
+    }
+    if (!is.finite(n_y)) return(plot_obj)
+    n_mapping <- if (is.null(group_var)) {
+      aes(x = concentration_label, y = n_y, label = n)
+    } else {
+      aes(x = concentration_label, y = n_y, label = n, group = .data[[group_var]])
+    }
+    plot_obj + geom_text(
+      data = sumdat,
+      mapping = n_mapping,
+      inherit.aes = FALSE,
+      position = position_obj,
+      # vjust is in multiples of this text's own height, so convert the required
+      # point offset into that unit.
+      vjust = 1 + n_row_offset_pt / n_label_pt,
+      size = n_label_pt * 0.3528,
+      color = stat_col
+    )
+  }
+
   if (plot_mode == "combined") {
     sample_colors <- named_palette(levels(dat$sample), c(input$sample_color_1, input$sample_color_2))
     dodge_pos <- position_dodge(width = input$dodge_width)
-    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = sample)) +
-      geom_col(position = dodge_pos, width = input$bar_width, color = bar_outline_col, linewidth = bar_outline_lwd)
+    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = sample))
+    p <- add_mean_layer(p, dodge_pos)
     p <- add_interval_layer(p, dodge_pos, width = 0.22)
     if (isTRUE(input$show_points)) {
       p <- p + geom_point(
         data = dat,
         aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = sample),
-        position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width),
+        position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width, seed = jitter_seed),
         shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
       )
     }
+    p <- add_n_labels(p, dodge_pos, "sample")
     p <- p +
       facet_wrap(~ time_min, nrow = 1) +
       scale_x_discrete(drop = FALSE) +
@@ -826,33 +1010,35 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   } else if (plot_mode == "sample_both") {
     time_colors <- named_palette(levels(dat$time_min), c(input$time_color_1, input$time_color_2))
     dodge_pos <- position_dodge(width = input$dodge_width)
-    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = time_min)) +
-      geom_col(position = dodge_pos, width = input$bar_width, color = bar_outline_col, linewidth = bar_outline_lwd)
+    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = time_min))
+    p <- add_mean_layer(p, dodge_pos)
     p <- add_interval_layer(p, dodge_pos, width = 0.22)
     if (isTRUE(input$show_points)) {
       p <- p + geom_point(
         data = dat,
         aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = time_min),
-        position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width),
+        position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width, seed = jitter_seed),
         shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
       )
     }
+    p <- add_n_labels(p, dodge_pos, "time_min")
     p <- p +
       scale_x_discrete(drop = FALSE) +
       scale_fill_manual(values = time_colors) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   } else {
-    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y)) +
-      geom_col(width = input$bar_width, fill = input$single_color, color = bar_outline_col, linewidth = bar_outline_lwd)
+    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y))
+    p <- add_mean_layer(p, position_identity(), fixed_fill = input$single_color)
     p <- add_interval_layer(p, position_identity(), width = 0.2)
     if (isTRUE(input$show_points)) {
       p <- p + geom_point(
         data = dat,
         aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu),
-        position = position_jitter(width = input$jitter_width, height = 0),
+        position = position_jitter(width = input$jitter_width, height = 0, seed = jitter_seed),
         shape = 21, size = input$point_size, fill = input$single_color, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
       )
     }
+    p <- add_n_labels(p, position_identity())
     p <- p +
       scale_x_discrete(drop = FALSE) +
       labs(x = input$x_label, y = y_lab, title = input$plot_title, subtitle = subtitle_text)
@@ -869,28 +1055,28 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   p <- p + base_theme +
     theme(plot.caption = element_text(size = (input$subtitle_size %||% 10) * 0.92, color = "grey35", hjust = 0))
 
+  # The n row sits outside the panel between the tick labels and the axis title,
+  # so the title has to move down and the plot needs bottom margin for both.
+  if (draw_n_labels) {
+    # The axis title is already positioned below the tick labels, so it only
+    # needs the extra height the n row adds -- not the tick extent again.
+    p <- p + theme(
+      axis.title.x = element_text(margin = margin(t = n_label_pt + 7, unit = "pt")),
+      plot.margin = margin(5.5, 5.5, 8, 5.5, "pt")
+    )
+  }
+
   if (y_mode == "raw_log_axis") {
     p <- p + scale_y_log10(breaks = major_breaks, minor_breaks = minor_breaks, guide = y_guide)
-    if (identical(input$bar_orientation, "horizontal")) {
-      p <- if (has_y_limits) {
-        p + coord_flip(ylim = coord_limits, clip = "off")
-      } else {
-        p + coord_flip(clip = "off")
-      }
-    } else if (has_y_limits) {
-      p <- p + coord_cartesian(ylim = coord_limits, clip = "off")
-    }
   } else {
     p <- p + scale_y_continuous(breaks = major_breaks, minor_breaks = minor_breaks, guide = y_guide, expand = expansion(mult = c(0, 0.08)))
-    if (identical(input$bar_orientation, "horizontal")) {
-      p <- if (has_y_limits) {
-        p + coord_flip(ylim = coord_limits, clip = "off")
-      } else {
-        p + coord_flip(clip = "off")
-      }
-    } else if (has_y_limits) {
-      p <- p + coord_cartesian(ylim = coord_limits, clip = "off")
-    }
+  }
+
+  coord_ylim <- if (has_y_limits) coord_limits else NULL
+  p <- if (identical(input$bar_orientation, "horizontal")) {
+    p + coord_flip(ylim = coord_ylim, clip = "off")
+  } else {
+    p + coord_cartesian(ylim = coord_ylim, clip = "off")
   }
 
   p
@@ -1345,6 +1531,31 @@ ui <- fluidPage(
     }
     .copy-status { color: #36613a; display: inline-block; margin-left: 8px; min-height: 20px; }
     .qc-ok { color: #2e6b35; font-weight: 600; }
+    /* The preview canvas is the true export geometry, so it must not be
+       stretched to the container width -- it scrolls instead. */
+    .preview-frame {
+      overflow: auto;
+      background:
+        linear-gradient(45deg, #eef1f2 25%, transparent 25%, transparent 75%, #eef1f2 75%),
+        linear-gradient(45deg, #eef1f2 25%, #f8fafa 25%, #f8fafa 75%, #eef1f2 75%);
+      background-size: 16px 16px;
+      background-position: 0 0, 8px 8px;
+      border: 1px solid #d5dedf;
+      border-radius: 6px;
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+    .preview-frame .shiny-plot-output {
+      background: #ffffff;
+      box-shadow: 0 1px 6px rgba(20, 40, 45, 0.16);
+      margin: 0 auto;
+    }
+    .size-readout {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: #536b6f;
+      margin: 6px 0 10px;
+    }
     @media (max-width: 980px) {
       .lab-hero { align-items: flex-start; }
       .petri-stage { width: 170px; min-width: 170px; }
@@ -1491,8 +1702,10 @@ ui <- fluidPage(
       selectInput("stats_method", "Statistical test", choices = c(
         "Welch t-test on log10(CFU)" = "welch",
         "Student t-test on log10(CFU)" = "student",
+        "Wilcoxon rank-sum on log10(CFU)" = "wilcoxon",
         "Linear model + emmeans" = "emmeans"
       ), selected = "welch"),
+      helpText("The rank test drops the normality assumption, but it also has very little power at n=3: with three versus three replicates the smallest two-sided p it can return is 0.1, so nothing can reach 0.05. The Statistics tab flags this per row."),
       selectInput("p_adjust", "Multiple-comparison correction", choices = c("BH", "holm", "bonferroni", "none"), selected = "BH"),
       selectInput("p_adjust_scope", "Correction scope", choices = c(
         "Across current table" = "global",
@@ -1503,6 +1716,11 @@ ui <- fluidPage(
       helpText("Default stats use replicate-level Welch t-tests on log10(CFU). Use emmeans when you want model-based marginal means."),
       tags$hr(),
       selectInput("y_mode", "Y-axis", choices = c("log10(CFU)" = "log10", "Raw CFU on log axis" = "raw_log_axis"), selected = "log10"),
+      selectInput("chart_geom", "Mean shown as", choices = c(
+        "Bars from zero" = "bar",
+        "Points (no bars)" = "point"
+      ), selected = "bar"),
+      helpText("A bar reads as a length from zero, which on a log axis means a length from 1 CFU/mL. For viable counts spanning decades, points let the axis start near the data. Use 'Auto y-axis' after switching."),
       selectInput("error_type", "Variation summary", choices = c("SD", "SEM", "95% CI", "IQR", "Range (min-max)"), selected = "SD"),
       selectInput("variation_display", "Variation display", choices = c(
         "Capped error bars" = "errorbar",
@@ -1520,12 +1738,24 @@ ui <- fluidPage(
       actionButton("preset_clean", "Clean no-stats preset"),
       tags$hr(),
       h4("Figure size"),
+      selectInput("size_units", "Size units", choices = c("Inches" = "in", "Millimetres" = "mm"), selected = "in"),
+      fluidRow(
+        column(6, numericInput("download_width", "Width", value = 8.2, min = 0.5, max = 600, step = 0.1)),
+        column(6, numericInput("download_height", "Height", value = 4.8, min = 0.5, max = 600, step = 0.1))
+      ),
+      numericInput("download_dpi", "Export DPI (raster)", value = 600, min = 72, max = 1200, step = 50),
+      div(class = "size-readout", textOutput("figure_size_readout", inline = TRUE)),
       fluidRow(
         column(4, actionButton("size_single_col", "Single column")),
         column(4, actionButton("size_double_col", "Double column")),
         column(4, actionButton("size_square", "Square"))
       ),
-      helpText("These presets set export dimensions in inches so figures are reproducible across projects."),
+      br(),
+      fluidRow(
+        column(6, actionButton("size_nature_single", "Nature 1-col (89 mm)")),
+        column(6, actionButton("size_nature_double", "Nature 2-col (183 mm)"))
+      ),
+      helpText("Switching units converts the numbers, so the physical figure stays the same size. The preview above the export buttons is drawn at exactly this geometry, so the font sizes you see are the font sizes you get."),
       tags$hr(),
       textInput("plot_title", "Plot title", value = "CFU assay summary"),
       textInput("plot_subtitle", "Plot subtitle", value = "Stars show BH-adjusted comparisons: ns, * q<0.05, ** q<0.01, *** q<0.001"),
@@ -1533,6 +1763,9 @@ ui <- fluidPage(
       checkboxInput("hide_subtitle_no_stats", "Hide subtitle when statistics are set to None", value = TRUE),
       checkboxInput("show_method_caption", "Show methods caption (error-bar type, test, correction)", value = TRUE),
       textInput("x_label", "X-axis label", value = "Treatment"),
+      textInput("y_label", "Y-axis quantity", value = "CFU/mL"),
+      helpText("Name the quantity with its unit -- CFU/mL, CFU/plate, CFU/OD600. In log10 mode this is drawn as log10 of whatever you type."),
+      checkboxInput("show_n_labels", "Show replicate n under each bar", value = TRUE),
       textInput("treatment_unit", "Treatment unit suffix", value = ""),
       checkboxInput("append_treatment_unit", "Append unit to numeric treatment labels", value = FALSE),
       textInput("time_unit", "Time unit suffix", value = "min"),
@@ -1574,6 +1807,8 @@ ui <- fluidPage(
       sliderInput("point_size", "Point size", min = 0.8, max = 4, value = 1.8),
       sliderInput("point_alpha", "Point alpha", min = 0.2, max = 1, value = 0.9),
       sliderInput("jitter_width", "Point jitter", min = 0, max = 0.25, value = 0.08),
+      numericInput("jitter_seed", "Jitter seed", value = 1, min = 1, max = 99999, step = 1),
+      helpText("The seed fixes where the jittered replicate points land, so re-exporting the same figure -- or running the exported R script -- puts every point back in the same place. Change it only to reshuffle overlapping points."),
       sliderInput("font_size", "Base font size", min = 8, max = 18, value = 11),
       sliderInput("title_size", "Title font size", min = 9, max = 24, value = 14),
       sliderInput("subtitle_size", "Subtitle font size", min = 7, max = 16, value = 10),
@@ -1621,14 +1856,12 @@ ui <- fluidPage(
               span(class = "guide-text", "Size presets keep figure geometry consistent across CFU projects, talks, and manuscript panels.")
             )
           ),
-          plotOutput("cfu_plot", height = "650px"),
+          div(class = "preview-frame", plotOutput("cfu_plot", height = "auto")),
+          div(class = "size-readout", textOutput("figure_size_caption", inline = TRUE)),
           fluidRow(
-            column(2, numericInput("download_width", "Width", value = 8.2, min = 3, max = 20)),
-            column(2, numericInput("download_height", "Height", value = 4.8, min = 3, max = 20)),
-            column(2, numericInput("download_dpi", "DPI", value = 600, min = 72, max = 1200)),
-            column(2, downloadButton("download_png", "PNG")),
-            column(2, downloadButton("download_pdf", "PDF")),
-            column(2, downloadButton("download_svg", "SVG"))
+            column(4, downloadButton("download_png", "PNG")),
+            column(4, downloadButton("download_pdf", "PDF")),
+            column(4, downloadButton("download_svg", "SVG"))
           ),
           br(),
           fluidRow(
@@ -1717,12 +1950,30 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$auto_y_axis, {
-    if (identical(input$y_mode, "log10")) {
-      updateNumericInput(session, "y_min", value = 0)
+    # Bars must keep their baseline -- a bar chart cropped away from zero
+    # misstates every ratio the reader takes off it. Points carry no such
+    # promise, so they can be framed around the data.
+    if (identical(input$chart_geom %||% "bar", "bar")) {
+      updateNumericInput(session, "y_min", value = if (identical(input$y_mode, "log10")) 0 else NA)
       updateNumericInput(session, "y_max", value = NA)
-    } else {
+      return()
+    }
+    span <- tryCatch({
+      sumdat <- current_summary()
+      if (is.null(sumdat) || nrow(sumdat) == 0) NULL else range(c(sumdat$ymin, sumdat$ymax), finite = TRUE)
+    }, error = function(e) NULL)
+    if (is.null(span) || !all(is.finite(span)) || span[1] >= span[2]) {
       updateNumericInput(session, "y_min", value = NA)
       updateNumericInput(session, "y_max", value = NA)
+      return()
+    }
+    if (identical(input$y_mode, "log10")) {
+      pad <- max(0.25, diff(span) * 0.18)
+      updateNumericInput(session, "y_min", value = floor((span[1] - pad) * 2) / 2)
+      updateNumericInput(session, "y_max", value = ceiling((span[2] + pad) * 2) / 2)
+    } else {
+      updateNumericInput(session, "y_min", value = signif(span[1] / 3, 2))
+      updateNumericInput(session, "y_max", value = signif(span[2] * 3, 2))
     }
   })
 
@@ -1771,22 +2022,62 @@ server <- function(input, output, session) {
     showNotification("Applied Okabe-Ito colorblind-safe palette.", type = "message")
   })
 
+  # --- Figure geometry -------------------------------------------------------
+  # Canonical geometry is always inches; input$download_* holds whatever unit the
+  # user is currently typing in.
+  export_width  <- reactive(size_to_inches(input$download_width,  input$size_units %||% "in", fallback = 8.2))
+  export_height <- reactive(size_to_inches(input$download_height, input$size_units %||% "in", fallback = 4.8))
+  export_dpi <- reactive({
+    d <- suppressWarnings(as.numeric(input$download_dpi))
+    if (length(d) != 1 || is.na(d) || !is.finite(d) || d < 72) 600 else d
+  })
+
+  # Flipping the unit selector must not resize the figure, so convert the
+  # numbers in the boxes to keep the physical size fixed.
+  size_units_previous <- reactiveVal("in")
+  observeEvent(input$size_units, {
+    old <- size_units_previous()
+    new <- input$size_units
+    if (identical(old, new)) return()
+    convert <- function(x) {
+      x <- suppressWarnings(as.numeric(x))
+      if (length(x) != 1 || is.na(x) || !is.finite(x)) return(x)
+      if (identical(new, "mm")) round(x * MM_PER_INCH, 1) else round(x / MM_PER_INCH, 2)
+    }
+    updateNumericInput(session, "download_width", value = convert(input$download_width))
+    updateNumericInput(session, "download_height", value = convert(input$download_height))
+    size_units_previous(new)
+  }, ignoreInit = TRUE)
+
+  # Presets are written in inches, so convert on the way in if the user is in mm.
+  set_figure_size <- function(width_in, height_in, dpi = 600) {
+    to_display <- function(x) if (identical(input$size_units %||% "in", "mm")) round(x * MM_PER_INCH, 1) else round(x, 2)
+    updateNumericInput(session, "download_width", value = to_display(width_in))
+    updateNumericInput(session, "download_height", value = to_display(height_in))
+    updateNumericInput(session, "download_dpi", value = dpi)
+  }
+
+  output$figure_size_readout <- renderText({
+    format_figure_size(export_width(), export_height(), export_dpi())
+  })
+
+  output$figure_size_caption <- renderText({
+    paste0("Preview drawn at the export geometry: ", format_figure_size(export_width(), export_height(), export_dpi()))
+  })
+
+  observeEvent(input$size_nature_single, set_figure_size(89 / MM_PER_INCH, 70 / MM_PER_INCH, 600))
+  observeEvent(input$size_nature_double, set_figure_size(183 / MM_PER_INCH, 110 / MM_PER_INCH, 600))
+
   observeEvent(input$size_single_col, {
-    updateNumericInput(session, "download_width", value = 3.35)
-    updateNumericInput(session, "download_height", value = 2.65)
-    updateNumericInput(session, "download_dpi", value = 600)
+    set_figure_size(3.35, 2.65, 600)
   })
 
   observeEvent(input$size_double_col, {
-    updateNumericInput(session, "download_width", value = 7.0)
-    updateNumericInput(session, "download_height", value = 4.2)
-    updateNumericInput(session, "download_dpi", value = 600)
+    set_figure_size(7.0, 4.2, 600)
   })
 
   observeEvent(input$size_square, {
-    updateNumericInput(session, "download_width", value = 4.5)
-    updateNumericInput(session, "download_height", value = 4.5)
-    updateNumericInput(session, "download_dpi", value = 600)
+    set_figure_size(4.5, 4.5, 600)
   })
 
   observeEvent(input$preset_file, {
@@ -1823,11 +2114,25 @@ server <- function(input, output, session) {
   output$mapping_ui <- renderUI({
     cols <- names(raw_data())
     tagList(
-      selectInput("col_sample", "Sample/vector column", choices = cols, selected = guess_column(cols, c("Sample", "sample", "strain", "vector"))),
-      selectInput("col_conc", "Treatment/dose/condition column", choices = cols, selected = guess_column(cols, c("Treatment", "condition", "dose", "concentration"))),
-      selectInput("col_time", "Time column", choices = cols, selected = guess_column(cols, c("Time", "time", "timepoint"))),
-      selectInput("col_rep", "Replicate column", choices = cols, selected = guess_column(cols, c("Replicate", "replicate", "rep"))),
-      selectInput("col_cfu", "CFU column", choices = cols, selected = guess_column(cols, c("CFU", "cfu", "count")))
+      selectInput("col_sample", "Sample/vector column", choices = cols, selected = guess_column(cols, c("sample", "strain", "vector", "construct", "plasmid", "genotype", "group"))),
+      selectInput("col_conc", "Treatment/dose/condition column", choices = cols, selected = guess_column(cols, c("treatment", "condition", "dose", "concentration", "inducer", "induction", "iptg", "arabinose", "atc"))),
+      selectInput("col_time", "Time column", choices = cols, selected = guess_column(cols, c("time", "timepoint", "minutes", "hours"))),
+      selectInput("col_rep", "Replicate column", choices = cols, selected = guess_column(cols, c("replicate", "rep", "biorep", "trial"))),
+      selectInput("col_cfu", "CFU column", choices = cols, selected = guess_column(cols, c("cfu", "cfuperml", "cfuml", "count", "colonies", "titer", "titre")))
+    )
+  })
+
+  dropped_rows <- reactive({
+    raw <- raw_data()
+    mapping <- column_mapping()
+    vals <- suppressWarnings(as.numeric(raw[[mapping$cfu]]))
+    non_numeric <- sum(is.na(vals))
+    nonpositive <- sum(vals <= 0, na.rm = TRUE)
+    list(
+      total = nrow(raw),
+      non_numeric = non_numeric,
+      nonpositive = nonpositive,
+      lost = non_numeric + nonpositive
     )
   })
 
@@ -1869,6 +2174,24 @@ server <- function(input, output, session) {
     } else {
       div(class = "lab-tip ok", "Visible groups have replicate data for SD/error bars and replicate-level statistics.")
     }
+    # Rows the pipeline discards never reach the figure, the summary, or the
+    # tests. Dropping them quietly makes n look larger than it is.
+    drop <- dropped_rows()
+    drop_tip <- if (drop$lost > 0) {
+      reasons <- c(
+        if (drop$nonpositive > 0) paste0(drop$nonpositive, " with CFU <= 0"),
+        if (drop$non_numeric > 0) paste0(drop$non_numeric, " non-numeric or blank")
+      )
+      div(
+        class = "lab-tip warn",
+        sprintf(
+          "%d of %d source rows are excluded (%s). log10 is undefined for these, so they are absent from the figure, the summary and every test -- the plotted n is the surviving n. See the QC tab.",
+          drop$lost, drop$total, paste(reasons, collapse = ", ")
+        )
+      )
+    } else {
+      NULL
+    }
     div(
       class = "lab-overview",
       div(
@@ -1904,6 +2227,7 @@ server <- function(input, output, session) {
         )
       ),
       tip,
+      drop_tip,
       tags$span(
         style = "display:none;",
         data_source_label()
@@ -2026,21 +2350,39 @@ server <- function(input, output, session) {
       ),
       add_check(
         "Export resolution",
-        !is.na(input$download_dpi) && input$download_dpi >= 300,
-        paste0("DPI is ", input$download_dpi, "."),
-        paste0("DPI is ", input$download_dpi, "; use at least 300, preferably 600 for raster exports.")
+        export_dpi() >= 300,
+        paste0("DPI is ", export_dpi(), "."),
+        paste0("DPI is ", export_dpi(), "; use at least 300, preferably 600 for raster exports.")
       ),
       add_check(
         "Figure size",
-        !is.na(input$download_width) && !is.na(input$download_height) && input$download_width >= 3 && input$download_height >= 2.5,
-        paste0("Export size is ", input$download_width, " x ", input$download_height, " in."),
-        "Export width/height may be too small for manuscript text and labels."
+        is.finite(export_width()) && is.finite(export_height()) &&
+          export_width() * MM_PER_INCH >= 50 && export_height() * MM_PER_INCH >= 40,
+        paste0("Export size is ", format_figure_size(export_width(), export_height(), export_dpi()), "."),
+        paste0("Export size is ", format_figure_size(export_width(), export_height(), export_dpi()),
+               "; below roughly 50 x 40 mm most journals will not hold the text legible.")
       ),
       add_check(
         "Base font size",
         !is.na(input$font_size) && input$font_size >= 9,
-        paste0("Base font size is ", input$font_size, "."),
-        "Base font size is below 9; check readability after export."
+        paste0("Base font size is ", input$font_size, " pt at the export size."),
+        "Base font size is below 9 pt; check readability after export."
+      ),
+      add_check(
+        "Y-axis quantity",
+        nzchar(trimws(input$y_label %||% "")) && grepl("/|per ", input$y_label %||% "", ignore.case = TRUE),
+        paste0("Y axis is labelled '", input$y_label, "'."),
+        paste0("Y axis is labelled '", input$y_label %||% "", "'; state the denominator (CFU/mL, CFU/plate, CFU/OD600) so the number is interpretable.")
+      ),
+      add_check(
+        "Replicate n on figure",
+        isTRUE(input$show_n_labels) || isTRUE(input$show_method_caption),
+        if (length(unique(sumdat$n)) == 1) {
+          paste0("n = ", sumdat$n[1], " for every group; stated once in the methods caption.")
+        } else {
+          "n varies between groups and is drawn as a row under the axis."
+        },
+        "Replicate n appears nowhere on the figure; turn on the n row or the methods caption."
       ),
       add_check(
         "X-label density",
@@ -2076,9 +2418,12 @@ server <- function(input, output, session) {
     )
   })
 
-  output$cfu_plot <- renderPlot({
-    current_plot()
-  }, res = 120)
+  output$cfu_plot <- renderPlot(
+    current_plot(),
+    width = function() round(export_width() * PREVIEW_PPI),
+    height = function() round(export_height() * PREVIEW_PPI),
+    res = PREVIEW_PPI
+  )
 
   output$cleaned_table <- renderDT({
     datatable(cfu_data(), options = list(pageLength = 12, scrollX = TRUE))
@@ -2112,9 +2457,10 @@ server <- function(input, output, session) {
     ggsave(
       filename = file,
       plot = current_plot(),
-      width = input$download_width,
-      height = input$download_height,
-      dpi = input$download_dpi,
+      width = export_width(),
+      height = export_height(),
+      units = "in",
+      dpi = export_dpi(),
       device = device
     )
   }
@@ -2125,12 +2471,15 @@ server <- function(input, output, session) {
       officer::ph_with(doc, rvg::dml(ggobj = plot_obj), location = officer::ph_location_fullsize())
     } else {
       tmp <- tempfile(fileext = ".png")
+      # Raster fallback for the static slide: use the figure export DPI, not the
+      # GIF DPI (default 150), or a non-rvg PowerPoint comes out soft.
       ggsave(
         filename = tmp,
         plot = plot_obj,
-        width = input$download_width,
-        height = input$download_height,
-        dpi = input$animation_dpi
+        width = export_width(),
+        height = export_height(),
+        units = "in",
+        dpi = export_dpi()
       )
       officer::ph_with(doc, officer::external_img(tmp), location = officer::ph_location_fullsize())
     }
@@ -2232,90 +2581,35 @@ server <- function(input, output, session) {
       paste0("plot_mode <- ", plot_mode_code),
       paste0("y_mode <- ", y_mode_code),
       "",
-      "`%||%` <- function(x, y) if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x",
-      "named_palette <- function(levels_vec, seed_colors) {",
-      "  levels_vec <- as.character(levels_vec)",
-      "  seed_colors <- unname(seed_colors)",
-      "  if (length(levels_vec) <= length(seed_colors)) setNames(seed_colors[seq_along(levels_vec)], levels_vec)",
-      "  else setNames(c(seed_colors, grDevices::hcl.colors(length(levels_vec) - length(seed_colors), palette = 'Dark 3')), levels_vec)",
-      "}",
+      "# The figure builder below is the app's own make_cfu_plot(), emitted",
+      "# verbatim. Keeping one implementation is the only way the exported script",
+      "# can be trusted to reproduce what was on screen.",
+      paste0("MM_PER_INCH <- ", MM_PER_INCH),
+      exported_function_source("%||%"),
+      exported_function_source("axis_limit"),
+      exported_function_source("size_to_inches"),
+      exported_function_source("scale_breaks_or_default"),
+      exported_function_source("axis_step_breaks"),
+      exported_function_source("named_palette"),
+      exported_function_source("error_type_caption"),
+      exported_function_source("stats_caption"),
+      exported_function_source("make_cfu_plot"),
       "",
-      "axis_col <- settings$axis_color %||% 'grey15'",
-      "outline_col <- settings$bar_outline_color %||% 'grey20'",
-      "variation_display <- settings$variation_display %||% 'errorbar'",
-      "dodge_pos <- position_dodge(width = settings$dodge_width %||% 0.78)",
-      "base_theme <- theme_classic(base_size = settings$font_size %||% 11) +",
-      "  theme(",
-      "    plot.title = element_text(face = 'bold', size = settings$title_size %||% 14),",
-      "    plot.subtitle = element_text(size = settings$subtitle_size %||% 10, color = 'grey30'),",
-      "    axis.text.x = element_text(angle = settings$x_angle %||% 35, hjust = 1),",
-      "    legend.position = settings$legend_position %||% 'top',",
-      "    strip.background = element_rect(fill = 'grey92', color = NA),",
-      "    strip.text = element_text(face = 'bold'),",
-      "    axis.ticks.y = element_line(color = axis_col, linewidth = settings$axis_line_width %||% 0.6),",
-      "    axis.line = element_line(color = axis_col, linewidth = settings$axis_line_width %||% 0.6),",
-      "    panel.grid.major.y = if (isTRUE(settings$show_y_grid)) element_line(color = settings$grid_color %||% 'grey87', linewidth = 0.3) else element_blank(),",
-      "    panel.border = if (isTRUE(settings$plot_box)) element_rect(color = axis_col, fill = NA, linewidth = settings$box_line_width %||% 0.6) else element_blank()",
-      "  )",
-      "",
-      "add_interval <- function(p, pos, width = 0.22) {",
-      "  if (identical(variation_display, 'none')) return(p)",
-      "  if (identical(variation_display, 'linerange')) return(p + geom_linerange(aes(ymin = ymin, ymax = ymax), position = pos, linewidth = settings$errorbar_width %||% 0.55, color = axis_col, show.legend = FALSE))",
-      "  if (identical(variation_display, 'pointrange')) return(p + geom_pointrange(aes(y = mean_y, ymin = ymin, ymax = ymax), position = pos, linewidth = settings$errorbar_width %||% 0.55, color = axis_col, show.legend = FALSE))",
-      "  if (identical(variation_display, 'crossbar')) return(p + geom_crossbar(aes(y = mean_y, ymin = ymin, ymax = ymax), position = pos, width = width * 1.35, linewidth = settings$errorbar_width %||% 0.55, color = axis_col, fill = NA, show.legend = FALSE))",
-      "  p + geom_errorbar(aes(ymin = ymin, ymax = ymax), position = pos, width = width, linewidth = settings$errorbar_width %||% 0.55, color = axis_col, show.legend = FALSE)",
-      "}",
-      "",
-      "subtitle_text <- if (isTRUE(settings$show_subtitle)) settings$plot_subtitle else NULL",
-      "y_lab <- if (identical(y_mode, 'log10')) expression(log[10]~'CFU') else 'CFU'",
-      "",
-      "# Methods caption: names error-bar type and (when stats shown) test + correction.",
-      "caption_text <- NULL",
-      "if (isTRUE(settings$show_method_caption %||% TRUE)) {",
-      "  err_txt <- switch(settings$error_type %||% 'SD',",
-      "    'SD' = 'Error bars show mean ± SD', 'SEM' = 'Error bars show mean ± SEM',",
-      "    '95% CI' = 'Error bars show mean with 95% CI', 'IQR' = 'Intervals show median IQR (Q1-Q3)',",
-      "    'Range (min-max)' = 'Intervals show min-max range', paste0('Error bars: ', settings$error_type))",
-      "  if (identical(settings$variation_display %||% 'errorbar', 'none')) err_txt <- NULL",
-      "  parts <- err_txt",
-      "  if (!identical(settings$comparison %||% 'auto', 'none')) {",
-      "    test_txt <- switch(settings$stats_method %||% 'welch', 'welch' = 'Welch t-test on log10(CFU)',",
-      "      'student' = 'Student t-test on log10(CFU)', 'emmeans' = 'linear model + emmeans on log10(CFU)', 'statistical test')",
-      "    corr_txt <- switch(settings$p_adjust %||% 'BH', 'BH' = 'Benjamini-Hochberg FDR', 'holm' = 'Holm',",
-      "      'bonferroni' = 'Bonferroni', 'none' = 'no', settings$p_adjust)",
-      "    parts <- c(parts, paste0(test_txt, '; ', corr_txt, ' correction'))",
-      "  }",
-      "  if (length(parts) > 0) caption_text <- paste0(paste(parts, collapse = '; '), '.')",
-      "}",
-      "",
-      "if (identical(plot_mode, 'combined')) {",
-      "  pal <- named_palette(levels(sumdat$sample), c(settings$sample_color_1, settings$sample_color_2))",
-      "  p <- ggplot(sumdat, aes(concentration_label, mean_y, fill = sample)) +",
-      "    geom_col(position = dodge_pos, width = settings$bar_width %||% 0.68, color = outline_col, linewidth = settings$bar_outline_width %||% 0.25)",
-      "  p <- add_interval(p, dodge_pos)",
-      "  if (isTRUE(settings$show_points)) p <- p + geom_point(data = dat, aes(concentration_label, if (identical(y_mode, 'log10')) log10_cfu else cfu, fill = sample), position = position_jitterdodge(jitter.width = settings$jitter_width %||% 0.08, dodge.width = settings$dodge_width %||% 0.78), shape = 21, size = settings$point_size %||% 1.8, color = outline_col, stroke = 0.25, alpha = settings$point_alpha %||% 0.9)",
-      "  p <- p + facet_wrap(~ time_min, nrow = 1) + scale_fill_manual(values = pal)",
-      "} else if (identical(plot_mode, 'sample_both')) {",
-      "  pal <- named_palette(levels(sumdat$time_min), c(settings$time_color_1, settings$time_color_2))",
-      "  p <- ggplot(sumdat, aes(concentration_label, mean_y, fill = time_min)) +",
-      "    geom_col(position = dodge_pos, width = settings$bar_width %||% 0.68, color = outline_col, linewidth = settings$bar_outline_width %||% 0.25)",
-      "  p <- add_interval(p, dodge_pos)",
-      "  if (isTRUE(settings$show_points)) p <- p + geom_point(data = dat, aes(concentration_label, if (identical(y_mode, 'log10')) log10_cfu else cfu, fill = time_min), position = position_jitterdodge(jitter.width = settings$jitter_width %||% 0.08, dodge.width = settings$dodge_width %||% 0.78), shape = 21, size = settings$point_size %||% 1.8, color = outline_col, stroke = 0.25, alpha = settings$point_alpha %||% 0.9)",
-      "  p <- p + scale_fill_manual(values = pal)",
-      "} else {",
-      "  p <- ggplot(sumdat, aes(concentration_label, mean_y)) +",
-      "    geom_col(width = settings$bar_width %||% 0.68, fill = settings$single_color %||% '#7AA6C2', color = outline_col, linewidth = settings$bar_outline_width %||% 0.25)",
-      "  p <- add_interval(p, position_identity(), width = 0.2)",
-      "  if (isTRUE(settings$show_points)) p <- p + geom_point(data = dat, aes(concentration_label, if (identical(y_mode, 'log10')) log10_cfu else cfu), position = position_jitter(width = settings$jitter_width %||% 0.08, height = 0), shape = 21, size = settings$point_size %||% 1.8, fill = settings$single_color %||% '#7AA6C2', color = outline_col, stroke = 0.25, alpha = settings$point_alpha %||% 0.9)",
-      "}",
-      "",
-      "p <- p + scale_x_discrete(drop = FALSE) + labs(x = settings$x_label %||% 'Treatment', y = y_lab, fill = settings$legend_title %||% '', title = settings$plot_title %||% '', subtitle = subtitle_text, caption = caption_text) + base_theme + theme(plot.caption = element_text(size = (settings$subtitle_size %||% 10) * 0.92, color = 'grey35', hjust = 0))",
-      "if (nrow(ann) > 0 && all(c('x', 'y', 'label') %in% names(ann))) p <- p + geom_text(data = ann, aes(x = x, y = y, label = label), inherit.aes = FALSE, size = settings$stat_size %||% 3, color = settings$stat_color %||% 'grey15')",
-      "if (identical(y_mode, 'raw_log_axis')) p <- p + scale_y_log10() else p <- p + scale_y_continuous(expand = expansion(mult = c(0, 0.08)))",
-      "if (identical(settings$bar_orientation, 'horizontal')) p <- p + coord_flip(clip = 'off')",
+      "if (!'y' %in% names(ann)) ann$y <- numeric(0)",
+      "p <- make_cfu_plot(",
+      "  dat = dat, sumdat = sumdat, ann = ann,",
+      "  plot_mode = plot_mode, y_mode = y_mode,",
+      "  error_type = settings$error_type %||% 'SD',",
+      "  input = settings",
+      ")",
       "",
       "print(p)",
-      "ggsave('cfu_plot_recreated.png', p, width = settings$download_width %||% 8.2, height = settings$download_height %||% 4.8, dpi = settings$download_dpi %||% 600)"
+      "ggsave(",
+      "  'cfu_plot_recreated.png', p,",
+      "  width = size_to_inches(settings$download_width, settings$size_units %||% 'in', 8.2),",
+      "  height = size_to_inches(settings$download_height, settings$size_units %||% 'in', 4.8),",
+      "  units = 'in', dpi = settings$download_dpi %||% 600",
+      ")"
     ), collapse = "\n")
   })
 
@@ -2350,8 +2644,8 @@ server <- function(input, output, session) {
         anim$plot,
         nframes = nframes,
         fps = input$animation_fps,
-        width = input$download_width,
-        height = input$download_height,
+        width = export_width(),
+        height = export_height(),
         units = "in",
         res = input$animation_dpi,
         renderer = gganimate::gifski_renderer()

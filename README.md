@@ -8,9 +8,10 @@ The app is designed for microbiology lab workflows where data are usually collec
 
 - Imports replicate-level CSV files without requiring a fixed column order.
 - Maps sample/vector, treatment/dose/condition, timepoint, replicate, and CFU columns inside the app.
-- Plots CFU summaries as bar plots with SD, SEM, 95% CI, IQR, or min-max variation intervals.
+- Plots CFU summaries as bar plots or point plots with SD, SEM, 95% CI, IQR, or min-max variation intervals.
 - Shows individual replicate points on top of bars.
-- Runs replicate-level statistics on `log10(CFU)`.
+- Draws the figure preview at the exact export geometry, so the font sizes on screen are the font sizes in the exported file.
+- Runs replicate-level statistics on `log10(CFU)`, reporting the confidence interval, fold-change interval, and Hedges' g alongside each p value.
 - Supports sample/vector comparisons, timepoint comparisons, treatment versus control, and all treatment-pair comparisons.
 - Exports cleaned data, summary tables, QC tables, statistics, and ANOVA tables.
 - Exports figures as high-resolution PNG, PDF, SVG, animated GIF, and PowerPoint.
@@ -86,12 +87,40 @@ $env:CFU_APP_PORT = "4267"
 Rscript run_app.R
 ```
 
+## Figure Size
+
+Width and height are entered in inches or millimetres; switching the unit converts the
+numbers so the physical figure stays the same size. A readout under the size boxes
+always states the geometry both ways plus the resulting pixel dimensions, for example
+`3.50 x 2.76 in (89 x 70 mm) at 600 DPI = 2100 x 1656 px`.
+
+The on-screen preview is rendered at that exact geometry rather than stretched to fill
+the browser pane. Because the preview device resolution scales with it, an 8 pt tick
+label occupies the same fraction of the figure on screen as it will in the exported
+file — so a figure tuned against the preview does not need re-tuning after export.
+
+Presets: single column (3.35 x 2.65 in), double column (7.0 x 4.2 in), square
+(4.5 x 4.5 in), Nature single column (89 mm), Nature double column (183 mm). All set
+600 DPI.
+
+## Bars Or Points
+
+A bar encodes its value as a length measured from zero. On a `log10(CFU)` axis that
+baseline is 1 CFU/mL, which is arbitrary, and viable counts spanning 10^8 to 10^11
+leave most of the panel empty. Setting **Mean shown as** to *Points (no bars)* draws
+the group mean as a marker instead, which allows the axis to be framed on the data.
+*Auto y-axis* respects the distinction: it keeps the zero baseline for bars and fits
+the range to the data for points.
+
 ## Publication Figure Controls
 
 The app includes controls for:
 
-- Exact export width, height, and DPI.
-- Reproducible size presets for single-column, double-column, and square figures.
+- Exact export width, height, and DPI, in inches or millimetres.
+- Reproducible size presets for single-column, double-column, square, and Nature-width figures.
+- A custom Y-axis quantity (`CFU/mL`, `CFU/plate`, `CFU/OD600`), wrapped in log10 automatically.
+- A replicate-n row under the axis when n differs between groups, or a single n statement in the methods caption when it does not.
+- A jitter seed, so replicate points land in the same place on every re-export.
 - Log10 CFU or raw CFU on a log axis.
 - Manual y-axis minimum and maximum.
 - Major and minor y-axis tick spacing.
@@ -104,9 +133,27 @@ The app includes controls for:
 - Custom colors for samples, timepoints, bars, outlines, axes, grids, and statistic labels.
 - Treatment units, time units, and optional unit suffixes.
 
+## Data That Cannot Be Plotted
+
+`log10` is undefined at or below zero, so rows with a non-positive or non-numeric CFU
+value are excluded from the figure, the summary, and every test. Background-subtracted
+counts can legitimately land below zero, so this is common. The app states how many
+rows were dropped and why in a banner above the figure, and the plotted `n` is always
+the surviving `n` — not the number of wells plated.
+
 ## Statistics
 
-The default statistics use Welch t-tests on `log10(CFU)` values. The app also supports Student t-tests and model-based marginal means through `emmeans`.
+The default statistics use Welch t-tests on `log10(CFU)` values. The app also supports
+Student t-tests, Wilcoxon rank-sum tests, and model-based marginal means through `emmeans`.
+
+Each comparison reports the log10 difference with its confidence interval, the same
+interval back-transformed to a fold-change range, and Hedges' g (Cohen's d with the
+small-sample correction, which matters at n = 3).
+
+The rank test is offered because `log10(CFU)` normality is an assumption, not a fact —
+but note that with three versus three replicates the smallest attainable two-sided p is
+0.1, so no comparison can reach 0.05. Rows produced under that condition carry a note
+saying so.
 
 Multiple-comparison correction options include:
 

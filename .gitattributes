@@ -1,0 +1,8 @@
+# Batch files must keep CRLF: cmd.exe misparses labels and blocks in LF-only
+# .bat files, so `goto :failed` can silently fall through.
+*.bat text eol=crlf
+
+# Everything else is normalised to LF in the repo.
+*.R    text eol=lf
+*.md   text eol=lf
+*.csv  text eol=lf

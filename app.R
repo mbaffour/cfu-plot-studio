@@ -51,6 +51,57 @@ exported_function_source <- function(name) {
   paste0(lhs, " <- ", paste(deparse(fn), collapse = "\n"))
 }
 
+# ---------------------------------------------------------------------------
+# Fixed panel geometry
+# ---------------------------------------------------------------------------
+# ggplot sizes the PANEL last: it takes whatever is left after the legend, the
+# titles, the axis labels and the caption have claimed their space. Two figures
+# exported at the same width therefore have different-sized data areas the
+# moment their legends differ -- measured on a 7 x 4.4 in figure, a long legend
+# and a three-line caption shrink the panel from 5.62 x 3.62 in to 4.31 x 3.29,
+# a 30% change in width with identical data. Panels that are meant to be
+# compared side by side cannot be built that way.
+#
+# Pinning the panel cells to absolute units inverts the priority: the data area
+# is fixed and the figure grows around it.
+fix_panel_size <- function(p, panel_w_in, panel_h_in) {
+  g <- if (inherits(p, "gtable")) p else ggplot2::ggplotGrob(p)
+  lay <- g$layout[grepl("^panel", g$layout$name), , drop = FALSE]
+  if (nrow(lay) == 0) return(g)
+  if (is.finite(panel_w_in) && panel_w_in > 0) {
+    g$widths[unique(lay$l)] <- grid::unit(panel_w_in, "in")
+  }
+  if (is.finite(panel_h_in) && panel_h_in > 0) {
+    g$heights[unique(lay$t)] <- grid::unit(panel_h_in, "in")
+  }
+  g
+}
+
+# Measuring text-shaped grobs needs an open device, and the answer depends on
+# its resolution. Do the measuring on a throwaway device matching the export so
+# the number does not drift between the preview and the file.
+with_measure_device <- function(expr, dpi = 300) {
+  f <- tempfile(fileext = ".png")
+  grDevices::png(f, width = 30, height = 30, units = "in", res = max(72, dpi))
+  on.exit({grDevices::dev.off(); unlink(f)}, add = TRUE)
+  force(expr)
+}
+
+# Total figure size a pinned gtable needs. A cell still measured in "null" units
+# has no intrinsic size and converts to zero, which would silently understate
+# the total, so those are counted and reported rather than dropped.
+gtable_size_in <- function(g, dpi = 300) {
+  with_measure_device({
+    w <- sum(grid::convertWidth(g$widths, "in", valueOnly = TRUE))
+    h <- sum(grid::convertHeight(g$heights, "in", valueOnly = TRUE))
+    list(
+      width = w, height = h,
+      unresolved = sum(as.character(grid::unitType(g$widths)) == "null") +
+                   sum(as.character(grid::unitType(g$heights)) == "null")
+    )
+  }, dpi = dpi)
+}
+
 format_figure_size <- function(width_in, height_in, dpi) {
   if (!is.finite(width_in) || !is.finite(height_in)) return("Figure size is not set.")
   sprintf(
@@ -133,7 +184,7 @@ plot_setting_ids <- c(
   "font_size", "title_size", "subtitle_size", "stat_size", "x_angle",
   "title_hjust", "subtitle_hjust", "caption_hjust", "x_title_hjust", "y_title_hjust",
   "legend_position", "legend_x", "legend_y", "legend_just_x", "legend_just_y",
-  "size_units", "download_width", "download_height", "download_dpi", "animation_fps", "animation_duration",
+  "size_mode", "size_units", "download_width", "download_height", "download_dpi", "animation_fps", "animation_duration",
   "animation_dpi", "ppt_editable"
 )
 
@@ -144,7 +195,7 @@ select_setting_ids <- c(
   # slider_setting_ids is a setdiff residual, so a select id missing from this
   # list gets updateSliderInput called against it: no error, no effect, and the
   # preset silently fails to restore.
-  "surv_baseline", "surv_readout", "surv_scale"
+  "surv_baseline", "surv_readout", "surv_scale", "size_mode"
 )
 
 radio_setting_ids <- c("label_kind")
@@ -1530,6 +1581,10 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       # ggplot will not wrap a caption, it just runs off the page. Wrap it here
       # against the real export width so the methods line survives the export.
       fig_width_in <- size_to_inches(input$download_width, input$size_units %||% "in", fallback = 8.2)
+      # In panel mode that number is the data area, not the figure. The caption
+      # runs the full figure width, so allow for the y axis and margins that sit
+      # outside the panel -- otherwise every caption wraps far too early.
+      if (identical(input$size_mode %||% "total", "panel")) fig_width_in <- fig_width_in + 1.4
       caption_pt <- (subtitle_size %||% 10) * 0.92
       chars_per_line <- max(24, floor(fig_width_in * 72 / (caption_pt * 0.58)))
       caption_text <- paste(strwrap(caption_text, width = chars_per_line), collapse = "\n")
@@ -2577,6 +2632,11 @@ ui <- fluidPage(
       actionButton("preset_clean", "Clean no-stats preset"),
       tags$hr(),
       h4("Figure size"),
+      selectInput("size_mode", "Width and height describe", choices = c(
+        "The whole figure" = "total",
+        "The plot panel only" = "panel"
+      ), selected = "total"),
+      helpText("ggplot gives the panel whatever space is left after the legend, titles and caption, so two figures at the same width end up with different-sized data areas. Choose 'The plot panel only' to pin the data area instead and let the figure grow around it -- panels then stay comparable however the labelling changes."),
       selectInput("size_units", "Size units", choices = c("Inches" = "in", "Millimetres" = "mm"), selected = "in"),
       fluidRow(
         column(6, numericInput("download_width", "Width", value = 8.2, min = 0.5, max = 600, step = 0.1)),
@@ -2921,8 +2981,15 @@ server <- function(input, output, session) {
   # --- Figure geometry -------------------------------------------------------
   # Canonical geometry is always inches; input$download_* holds whatever unit the
   # user is currently typing in.
-  export_width  <- reactive(size_to_inches(input$download_width,  input$size_units %||% "in", fallback = 8.2))
-  export_height <- reactive(size_to_inches(input$download_height, input$size_units %||% "in", fallback = 4.8))
+  panel_mode <- reactive(identical(input$size_mode %||% "total", "panel"))
+
+  # In panel mode the width/height boxes describe the DATA AREA, so the figure
+  # size stops being an input and becomes a consequence.
+  requested_width  <- reactive(size_to_inches(input$download_width,  input$size_units %||% "in", fallback = 8.2))
+  requested_height <- reactive(size_to_inches(input$download_height, input$size_units %||% "in", fallback = 4.8))
+
+  export_width  <- reactive(if (panel_mode()) figure_geometry()$width  else requested_width())
+  export_height <- reactive(if (panel_mode()) figure_geometry()$height else requested_height())
   export_dpi <- reactive({
     d <- suppressWarnings(as.numeric(input$download_dpi))
     if (length(d) != 1 || is.na(d) || !is.finite(d) || d < 72) 600 else d
@@ -2947,6 +3014,18 @@ server <- function(input, output, session) {
 
   # Presets are written in inches, so convert on the way in if the user is in mm.
   set_figure_size <- function(width_in, height_in, dpi = 600) {
+    # The presets are journal FIGURE widths. In panel mode the boxes mean the
+    # data area, so hand back the panel that yields that figure rather than
+    # silently reinterpreting a 89 mm figure as an 89 mm panel.
+    if (isTRUE(panel_mode())) {
+      geo <- tryCatch(figure_geometry(), error = function(e) NULL)
+      if (!is.null(geo) && is.finite(geo$width) && is.finite(geo$height)) {
+        deco_w <- max(geo$width - requested_width(), 0)
+        deco_h <- max(geo$height - requested_height(), 0)
+        width_in <- max(width_in - deco_w, 0.5)
+        height_in <- max(height_in - deco_h, 0.5)
+      }
+    }
     to_display <- function(x) if (identical(input$size_units %||% "in", "mm")) round(x * MM_PER_INCH, 1) else round(x, 2)
     updateNumericInput(session, "download_width", value = to_display(width_in))
     updateNumericInput(session, "download_height", value = to_display(height_in))
@@ -2954,11 +3033,23 @@ server <- function(input, output, session) {
   }
 
   output$figure_size_readout <- renderText({
-    format_figure_size(export_width(), export_height(), export_dpi())
+    if (!panel_mode()) return(format_figure_size(export_width(), export_height(), export_dpi()))
+    geo <- figure_geometry()
+    paste0(
+      "Panel pinned at ",
+      sprintf("%.2f x %.2f in (%.0f x %.0f mm)", requested_width(), requested_height(),
+              requested_width() * MM_PER_INCH, requested_height() * MM_PER_INCH),
+      "  ->  figure ", format_figure_size(geo$width, geo$height, export_dpi()),
+      if (isTRUE(geo$unresolved > 0)) "  [some layout cells have no fixed size; check the export]" else ""
+    )
   })
 
   output$figure_size_caption <- renderText({
-    paste0("Preview drawn at the export geometry: ", format_figure_size(export_width(), export_height(), export_dpi()))
+    paste0(
+      if (panel_mode()) "Panel fixed; figure sized around it. " else "",
+      "Preview drawn at the export geometry: ",
+      format_figure_size(export_width(), export_height(), export_dpi())
+    )
   })
 
   observeEvent(input$size_nature_single, set_figure_size(89 / MM_PER_INCH, 70 / MM_PER_INCH, 600))
@@ -3537,6 +3628,17 @@ server <- function(input, output, session) {
         paste0("DPI is ", export_dpi(), "; use at least 300, preferably 600 for raster exports.")
       ),
       add_check(
+        "Panel geometry",
+        !panel_mode() || (is.finite(requested_width()) && is.finite(requested_height()) &&
+                          isTRUE(figure_geometry()$unresolved == 0)),
+        if (!panel_mode())
+          "Panel size follows the figure size; it will change if the legend or labels change."
+        else
+          sprintf("Data area pinned at %.2f x %.2f in, so it is identical across figures however they are labelled.",
+                  requested_width(), requested_height()),
+        "Panel is pinned but some layout cells still have no fixed size, so the exported figure may not match the computed geometry."
+      ),
+      add_check(
         "Figure size",
         is.finite(export_width()) && is.finite(export_height()) &&
           export_width() * MM_PER_INCH >= 50 && export_height() * MM_PER_INCH >= 40,
@@ -3633,8 +3735,25 @@ server <- function(input, output, session) {
     )
   })
 
+  # The object that is actually drawn and exported. In panel mode it is a gtable
+  # whose panel cells are pinned; otherwise it is the ggplot unchanged, so the
+  # default path is byte-for-byte what it was before this option existed.
+  current_grob <- reactive({
+    p <- current_plot()
+    if (!panel_mode()) return(p)
+    fix_panel_size(p, requested_width(), requested_height())
+  })
+
+  # Size the figure around the pinned panel. Measured on a device matching the
+  # export so the preview and the file agree.
+  figure_geometry <- reactive({
+    g <- fix_panel_size(current_plot(), requested_width(), requested_height())
+    sz <- gtable_size_in(g, dpi = export_dpi())
+    list(width = sz$width, height = sz$height, unresolved = sz$unresolved)
+  })
+
   output$cfu_plot <- renderPlot(
-    current_plot(),
+    { g <- current_grob(); if (inherits(g, "gtable")) { grid::grid.newpage(); grid::grid.draw(g) } else g },
     width = function() round(export_width() * PREVIEW_PPI),
     height = function() round(export_height() * PREVIEW_PPI),
     res = PREVIEW_PPI
@@ -3673,7 +3792,7 @@ server <- function(input, output, session) {
   save_plot_file <- function(file, device) {
     ggsave(
       filename = file,
-      plot = current_plot(),
+      plot = current_grob(),
       width = export_width(),
       height = export_height(),
       units = "in",
@@ -3685,7 +3804,14 @@ server <- function(input, output, session) {
   add_plot_slide <- function(doc, plot_obj) {
     doc <- officer::add_slide(doc, layout = "Blank", master = "Office Theme")
     if (isTRUE(input$ppt_editable) && requireNamespace("rvg", quietly = TRUE)) {
-      officer::ph_with(doc, rvg::dml(ggobj = plot_obj), location = officer::ph_location_fullsize())
+      # rvg::dml(ggobj=) only accepts a ggplot. A pinned panel is a gtable, so
+      # it is drawn through the code path instead -- still editable vector art.
+      vec <- if (inherits(plot_obj, "gtable")) {
+        rvg::dml(code = {grid::grid.newpage(); grid::grid.draw(plot_obj)})
+      } else {
+        rvg::dml(ggobj = plot_obj)
+      }
+      officer::ph_with(doc, vec, location = officer::ph_location_fullsize())
     } else {
       tmp <- tempfile(fileext = ".png")
       # Raster fallback for the static slide: use the figure export DPI, not the
@@ -3705,7 +3831,7 @@ server <- function(input, output, session) {
   save_pptx_file <- function(file) {
     validate(need(requireNamespace("officer", quietly = TRUE), "Package officer is required for PowerPoint export."))
     doc <- officer::read_pptx()
-    doc <- add_plot_slide(doc, current_plot())
+    doc <- add_plot_slide(doc, current_grob())
     print(doc, target = file)
   }
 
@@ -3814,6 +3940,9 @@ server <- function(input, output, session) {
       exported_function_source("scale_breaks_or_default"),
       exported_function_source("axis_step_breaks"),
       exported_function_source("named_palette"),
+      exported_function_source("fix_panel_size"),
+      exported_function_source("with_measure_device"),
+      exported_function_source("gtable_size_in"),
       exported_function_source("survival_axis_label"),
       exported_function_source("survival_scale_labeller"),
       exported_function_source("resolve_auto_comparison"),
@@ -3833,11 +3962,24 @@ server <- function(input, output, session) {
       "  input = settings",
       ")",
       "",
-      "print(p)",
+      "",
+      "w_in <- size_to_inches(settings$download_width, settings$size_units %||% 'in', 8.2)",
+      "h_in <- size_to_inches(settings$download_height, settings$size_units %||% 'in', 4.8)",
+      "",
+      "if (identical(settings$size_mode %||% 'total', 'panel')) {",
+      "  # Width and height describe the DATA AREA. Pin the panel cells and let",
+      "  # the figure size follow, so the panel matches the app exactly.",
+      "  obj <- fix_panel_size(p, w_in, h_in)",
+      "  geo <- gtable_size_in(obj, dpi = settings$download_dpi %||% 600)",
+      "  w_in <- geo$width; h_in <- geo$height",
+      "} else {",
+      "  obj <- p",
+      "}",
+      "",
+      "grid::grid.newpage(); grid::grid.draw(if (inherits(obj, 'gtable')) obj else ggplotGrob(obj))",
       "ggsave(",
-      "  'cfu_plot_recreated.png', p,",
-      "  width = size_to_inches(settings$download_width, settings$size_units %||% 'in', 8.2),",
-      "  height = size_to_inches(settings$download_height, settings$size_units %||% 'in', 4.8),",
+      "  'cfu_plot_recreated.png', obj,",
+      "  width = w_in, height = h_in,",
       "  units = 'in', dpi = settings$download_dpi %||% 600",
       ")"
     ), collapse = "\n")
@@ -3870,6 +4012,12 @@ server <- function(input, output, session) {
         input = input,
         bar_palette = bar_palette()
       )
+      if (panel_mode()) {
+        showNotification(
+          "GIF frames are animated from the ggplot, so the panel is not pinned in the GIF. The still exports are.",
+          type = "warning", duration = 8
+        )
+      }
       nframes <- max(anim$steps, round(input$animation_duration * input$animation_fps))
       rendered <- gganimate::animate(
         anim$plot,

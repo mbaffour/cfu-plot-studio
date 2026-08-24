@@ -119,6 +119,40 @@ Presets: single column (3.35 x 2.65 in), double column (7.0 x 4.2 in), square
 (4.5 x 4.5 in), Nature single column (89 mm), Nature double column (183 mm). All set
 600 DPI.
 
+## Keeping The Data Area Fixed
+
+ggplot sizes the panel last: it gets whatever space is left after the legend, the titles,
+the axis labels and the caption have taken theirs. Two figures exported at the same width
+therefore have different-sized data areas the moment their labelling differs. Measured on
+a 7 x 4.4 in figure from this app, moving the legend from the top to the right side
+shrinks the panel from 6.39 in wide to 3.83 in — a 40% loss of data area with the data
+untouched. Panels meant to be compared side by side cannot be built that way.
+
+Set **Width and height describe** to *The plot panel only* and the priority inverts: the
+data area is pinned to exactly the size you asked for and the figure grows around it. The
+readout then shows both, for example
+
+```
+Panel pinned at 4.20 x 2.60 in (107 x 66 mm)  ->  figure 6.18 x 4.27 in ...
+```
+
+Two survival figures from the same data, one plain and one with a side legend, a long
+title and angled axis labels, both come out with a panel of exactly 4.200 x 2.600 in while
+their figures differ (4.80 x 4.68 in versus 6.18 x 4.27 in). That is the point: the
+comparable thing stays constant and the rest gives way.
+
+Notes:
+
+- With facets, **each** panel gets the size, so one facet of a multi-panel figure is
+  directly comparable with a single-panel figure at the same setting.
+- The journal size presets are figure widths. In panel mode they set the panel that
+  produces that figure, rather than silently reinterpreting an 89 mm figure as an 89 mm
+  panel.
+- PNG, PDF, SVG, the preview and PowerPoint all honour the pinned panel. Animated GIF does
+  not — gganimate builds its frames from the ggplot rather than the laid-out table — and
+  the app says so when you export one.
+- The default is still *The whole figure*, and that path is unchanged.
+
 ## Bars Or Points
 
 A bar encodes its value as a length measured from zero. On a `log10(CFU)` axis that
@@ -278,6 +312,7 @@ names the type it used.
 ## Testing
 
 ```bash
+Rscript tests/test_panel_size.R
 Rscript tests/test_survival.R
 Rscript tests/test_statistics.R
 Rscript tests/test_column_matching.R

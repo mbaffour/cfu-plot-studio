@@ -1,5 +1,53 @@
 # Publication-Quality Audit Notes
 
+## Round 5 — 2026-08-24: fixed panel geometry
+
+ggplot allocates the panel LAST -- it receives whatever is left once the legend, titles,
+axis labels and caption have claimed their space. The consequence is that the data area
+is a residual, not a setting, and two figures exported at the same size have different
+data areas as soon as their labelling differs.
+
+Measured on this app's own figures at 7 x 4.4 in:
+
+| variant | panel |
+| --- | --- |
+| plain, legend on top | 6.39 x 2.66 in |
+| long title, long x label, stats on | 6.39 x 2.54 in |
+| angled labels, n row, legend at bottom | 6.39 x 2.30 in |
+| legend moved to the right | **3.83 x 3.21 in** |
+
+Moving the legend to the side costs 40% of the panel width. Panels intended for
+side-by-side comparison cannot be produced this way, which is what the request was about.
+
+**The fix** inverts the priority: `fix_panel_size()` replaces the panel cells' `null`
+units with absolute inches, so the data area is fixed and the figure grows around it.
+`gtable_size_in()` then reports the figure size that follows. All four variants above pin
+to exactly 4.000 x 2.400 in, and their figures differ instead.
+
+Design decisions worth keeping:
+
+- **Each panel** gets the size, not the panel region as a whole, so one facet of a
+  multi-panel figure is comparable with a single-panel figure at the same setting.
+- Text-shaped grobs cannot be measured without an open device, and the answer depends on
+  its resolution, so `with_measure_device()` measures on a throwaway device matching the
+  export DPI. Otherwise the preview and the file disagree.
+- Cells left in `null` units convert to zero and would silently understate the total, so
+  they are counted and surfaced in the readout and in Figure QA rather than dropped.
+- The journal presets are FIGURE widths. In panel mode they are converted to the panel
+  that yields that figure, rather than reinterpreting an 89 mm figure as an 89 mm panel.
+- The caption wraps against the figure width, which in panel mode is not the number in the
+  width box, so an allowance is added for the axis and margins outside the panel.
+- `rvg::dml(ggobj=)` only accepts a ggplot; a pinned panel is a gtable, so PowerPoint takes
+  the `code=` path and stays editable vector art.
+- gganimate builds frames from the ggplot, not the laid-out table, so GIF export cannot
+  honour the pinned panel. The app says so at export time rather than silently unpinning.
+- Default is unchanged (`size_mode = "total"`), so every existing preset and figure
+  behaves exactly as before.
+
+Locked by `tests/test_panel_size.R`, which measures the rendered gtable rather than
+trusting the settings, and includes the unpinned baseline so the regression is visible if
+the pinning ever stops working.
+
 ## Round 4 — 2026-08-24: the paired survival readout
 
 The readout an induction time-course is actually about. Designed against a four-way

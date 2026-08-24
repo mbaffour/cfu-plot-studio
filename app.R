@@ -374,6 +374,14 @@ run_anova <- function(dat) {
 adjust_stats <- function(out, p_adjust, adjustment_scope) {
   if (nrow(out) == 0 || !"p.value" %in% names(out)) return(out)
 
+  # mutate() DELETES a column assigned NULL rather than filling it, so a missing
+  # correction method silently removes p_adjust_method and the select() at the
+  # end of the caller then fails with "column doesn't exist". Normalise both
+  # settings to their UI defaults before they are recorded.
+  usable <- function(x) length(x) == 1 && !is.na(x) && nzchar(as.character(x))
+  p_adjust <- if (usable(p_adjust)) as.character(p_adjust) else "BH"
+  adjustment_scope <- if (usable(adjustment_scope)) as.character(adjustment_scope) else "global"
+
   if (identical(adjustment_scope, "within_panel") && "panel" %in% names(out)) {
     out <- out %>%
       group_by(panel) %>%
@@ -1106,7 +1114,7 @@ annotation_data <- function(stats, sumdat, comparison, plot_mode, label_kind, sh
   }
   if (nrow(stats) == 0) return(tibble())
 
-  label_col <- if (label_kind == "stars") "label_stars" else "label_q"
+  label_col <- if (identical(label_kind %||% "stars", "q")) "label_q" else "label_stars"
   stats <- stats %>%
     mutate(label = .data[[label_col]])
 
@@ -1272,6 +1280,27 @@ bar_keys <- function(dat, plot_mode) {
 bar_color_input_id <- function(key) paste0("barcol_", make.names(key))
 
 make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input, bar_palette = NULL) {
+  # Style settings, defaulted individually. The app always supplies these from
+  # its UI, but the exported script hands over a plain list a user may edit by
+  # hand, and a missing numeric reaches theme_classic(base_size = NULL) and
+  # fails with a message naming neither the setting nor the caller.
+  # Read one at a time rather than via as.list(input): converting the whole
+  # reactivevalues object would make the figure depend on EVERY input and
+  # re-render on unrelated changes.
+  font_size <- input$font_size %||% 11
+  title_size <- input$title_size %||% 14
+  subtitle_size <- input$subtitle_size %||% 10
+  stat_size <- input$stat_size %||% 3
+  x_angle <- input$x_angle %||% 35
+  bar_width <- input$bar_width %||% 0.68
+  dodge_width <- input$dodge_width %||% 0.78
+  point_size <- input$point_size %||% 1.8
+  point_alpha <- input$point_alpha %||% 0.9
+  jitter_width <- input$jitter_width %||% 0.08
+  axis_line_width <- input$axis_line_width %||% 0.6
+  box_line_width <- input$box_line_width %||% 0.6
+  y_tick_length <- input$y_tick_length %||% 4
+
   is_survival <- identical(plot_mode, "survival")
   # The plotted quantity is already a log10 ratio. Sending it through the
   # raw-CFU log axis would log it a second time: the reference line collapses to
@@ -1345,13 +1374,13 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
 
   # The n row is drawn outside the panel, so it has to be placed past whatever
   # vertical space the tick labels take -- which grows with the label angle.
-  base_pt <- input$font_size %||% 11
+  base_pt <- font_size %||% 11
   n_label_pt <- max(5, base_pt * 0.82)
   # A fixed seed makes the jittered replicate points land in the same place on
   # every render, which is what lets the exported script reproduce the figure.
   jitter_seed <- suppressWarnings(as.integer(input$jitter_seed %||% 1))
   if (length(jitter_seed) != 1 || is.na(jitter_seed)) jitter_seed <- 1L
-  x_angle_rad <- (input$x_angle %||% 0) * pi / 180
+  x_angle_rad <- (x_angle %||% 0) * pi / 180
   max_x_chars <- suppressWarnings(max(nchar(as.character(unique(sumdat$concentration_label))), 1, na.rm = TRUE))
   tick_extent_pt <- base_pt * (cos(x_angle_rad) + max_x_chars * 0.55 * sin(x_angle_rad))
   n_row_offset_pt <- 5 + tick_extent_pt + 4
@@ -1415,7 +1444,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       # ggplot will not wrap a caption, it just runs off the page. Wrap it here
       # against the real export width so the methods line survives the export.
       fig_width_in <- size_to_inches(input$download_width, input$size_units %||% "in", fallback = 8.2)
-      caption_pt <- (input$subtitle_size %||% 10) * 0.92
+      caption_pt <- (subtitle_size %||% 10) * 0.92
       chars_per_line <- max(24, floor(fig_width_in * 72 / (caption_pt * 0.58)))
       caption_text <- paste(strwrap(caption_text, width = chars_per_line), collapse = "\n")
     }
@@ -1445,48 +1474,48 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     theme(legend.position = legend_pos)
   }
 
-  base_theme <- theme_classic(base_size = input$font_size) +
+  base_theme <- theme_classic(base_size = font_size) +
     theme(
-      plot.title = element_text(face = "bold", size = input$title_size),
-      plot.subtitle = element_text(size = input$subtitle_size, color = "grey30"),
-      axis.text.x = element_text(angle = input$x_angle, hjust = 1),
+      plot.title = element_text(face = "bold", size = title_size),
+      plot.subtitle = element_text(size = subtitle_size, color = "grey30"),
+      axis.text.x = element_text(angle = x_angle, hjust = 1),
       strip.background = element_rect(fill = "grey92", color = NA),
       strip.text = element_text(face = "bold"),
-      axis.ticks.y = if (isTRUE(input$show_y_ticks)) element_line(color = axis_col, linewidth = input$axis_line_width) else element_blank(),
-      axis.minor.ticks.y.left = if (use_minor_ticks) element_line(color = axis_col, linewidth = input$axis_line_width * 0.75) else element_blank(),
-      axis.ticks.length.y = grid::unit(input$y_tick_length, "pt"),
+      axis.ticks.y = if (isTRUE(input$show_y_ticks)) element_line(color = axis_col, linewidth = axis_line_width) else element_blank(),
+      axis.minor.ticks.y.left = if (use_minor_ticks) element_line(color = axis_col, linewidth = axis_line_width * 0.75) else element_blank(),
+      axis.ticks.length.y = grid::unit(y_tick_length, "pt"),
       axis.minor.ticks.length.y = grid::unit(input$minor_y_tick_length %||% 2, "pt"),
-      axis.line = element_line(color = axis_col, linewidth = input$axis_line_width),
+      axis.line = element_line(color = axis_col, linewidth = axis_line_width),
       panel.grid.major.y = if (isTRUE(input$show_y_grid)) element_line(color = grid_col, linewidth = 0.3) else element_blank(),
       panel.grid.minor.y = if (isTRUE(input$show_minor_y_grid)) element_line(color = grid_col, linewidth = 0.18) else element_blank(),
-      panel.border = if (isTRUE(input$plot_box)) element_rect(color = axis_col, fill = NA, linewidth = input$box_line_width) else element_blank()
+      panel.border = if (isTRUE(input$plot_box)) element_rect(color = axis_col, fill = NA, linewidth = box_line_width) else element_blank()
     ) +
     legend_theme
 
   if (identical(plot_theme, "minimal_grid")) {
-    base_theme <- theme_minimal(base_size = input$font_size) +
+    base_theme <- theme_minimal(base_size = font_size) +
       theme(
-        plot.title = element_text(face = "bold", size = input$title_size),
-        plot.subtitle = element_text(size = input$subtitle_size, color = "grey30"),
-        axis.text.x = element_text(angle = input$x_angle, hjust = 1),
+        plot.title = element_text(face = "bold", size = title_size),
+        plot.subtitle = element_text(size = subtitle_size, color = "grey30"),
+        axis.text.x = element_text(angle = x_angle, hjust = 1),
         strip.background = element_rect(fill = "grey95", color = NA),
         strip.text = element_text(face = "bold"),
         panel.grid.major.x = element_blank(),
         panel.grid.minor.x = element_blank(),
         panel.grid.major.y = element_line(color = grid_col, linewidth = 0.3),
         panel.grid.minor.y = if (isTRUE(input$show_minor_y_grid)) element_line(color = grid_col, linewidth = 0.18) else element_blank(),
-        axis.line = element_line(color = axis_col, linewidth = input$axis_line_width),
-        axis.ticks.y = if (isTRUE(input$show_y_ticks)) element_line(color = axis_col, linewidth = input$axis_line_width) else element_blank(),
-        axis.minor.ticks.y.left = if (use_minor_ticks) element_line(color = axis_col, linewidth = input$axis_line_width * 0.75) else element_blank(),
-        axis.ticks.length.y = grid::unit(input$y_tick_length, "pt"),
+        axis.line = element_line(color = axis_col, linewidth = axis_line_width),
+        axis.ticks.y = if (isTRUE(input$show_y_ticks)) element_line(color = axis_col, linewidth = axis_line_width) else element_blank(),
+        axis.minor.ticks.y.left = if (use_minor_ticks) element_line(color = axis_col, linewidth = axis_line_width * 0.75) else element_blank(),
+        axis.ticks.length.y = grid::unit(y_tick_length, "pt"),
         axis.minor.ticks.length.y = grid::unit(input$minor_y_tick_length %||% 2, "pt"),
-        panel.border = if (isTRUE(input$plot_box)) element_rect(color = axis_col, fill = NA, linewidth = input$box_line_width) else element_blank()
+        panel.border = if (isTRUE(input$plot_box)) element_rect(color = axis_col, fill = NA, linewidth = box_line_width) else element_blank()
       ) +
       legend_theme
   } else if (identical(plot_theme, "boxed")) {
     base_theme <- base_theme +
       theme(
-        panel.border = element_rect(color = axis_col, fill = NA, linewidth = input$box_line_width),
+        panel.border = element_rect(color = axis_col, fill = NA, linewidth = box_line_width),
         axis.line = element_blank()
       )
   }
@@ -1507,7 +1536,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
         aes(y = mean_y, ymin = ymin, ymax = ymax),
         position = position_obj,
         linewidth = errorbar_lwd,
-        size = input$point_size * 0.75,
+        size = point_size * 0.75,
         color = axis_col,
         show.legend = FALSE
       ))
@@ -1542,14 +1571,14 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     if (!is.null(fixed_fill)) args$fill <- fixed_fill
     if (draw_bars) {
       return(plot_obj + do.call(geom_col, c(args, list(
-        width = input$bar_width, linewidth = bar_outline_lwd
+        width = bar_width, linewidth = bar_outline_lwd
       ))))
     }
     # "Replicate points only" already draws every replicate; a mean marker on top
     # would be a second, differently-defined point.
     if (identical(variation_display, "none")) return(plot_obj)
     plot_obj + do.call(geom_point, c(args, list(
-      shape = 21, size = (input$point_size %||% 1.8) * 1.9, stroke = 0.45
+      shape = 21, size = (point_size %||% 1.8) * 1.9, stroke = 0.45
     )))
   }
 
@@ -1597,7 +1626,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   if (plot_mode == "survival") {
     sample_colors <- named_palette(levels(droplevels(sumdat$sample)),
                                    c(input$sample_color_1, input$sample_color_2))
-    dodge_pos <- position_dodge(width = input$dodge_width)
+    dodge_pos <- position_dodge(width = dodge_width)
     p <- if (per_bar_color) {
       ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = sample))
     } else {
@@ -1605,7 +1634,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     }
     # The no-change reference is what the whole figure is read against, so it is
     # drawn first (underneath the data) and is not optional.
-    p <- p + geom_hline(yintercept = 0, linewidth = input$axis_line_width %||% 0.6,
+    p <- p + geom_hline(yintercept = 0, linewidth = axis_line_width %||% 0.6,
                         color = axis_col, linetype = "22")
     p <- add_mean_layer(p, dodge_pos)
     p <- add_interval_layer(p, dodge_pos, width = 0.22)
@@ -1617,8 +1646,8 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       }
       p <- p + geom_point(
         data = dat, point_aes,
-        position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width, seed = jitter_seed),
-        shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
+        position = position_jitterdodge(jitter.width = jitter_width, dodge.width = dodge_width, seed = jitter_seed),
+        shape = 21, size = point_size, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
       )
     }
     p <- add_n_labels(p, dodge_pos, "sample")
@@ -1630,7 +1659,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
            title = input$plot_title, subtitle = subtitle_text)
   } else if (plot_mode == "combined") {
     sample_colors <- named_palette(levels(dat$sample), c(input$sample_color_1, input$sample_color_2))
-    dodge_pos <- position_dodge(width = input$dodge_width)
+    dodge_pos <- position_dodge(width = dodge_width)
     # group stays on the sample even when fill moves to bar_key: position_dodge
     # allocates one slot per group, so dodging by a key that also varies with x
     # would ask for one slot per bar in the whole panel.
@@ -1650,8 +1679,8 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       p <- p + geom_point(
         data = dat,
         point_aes,
-        position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width, seed = jitter_seed),
-        shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
+        position = position_jitterdodge(jitter.width = jitter_width, dodge.width = dodge_width, seed = jitter_seed),
+        shape = 21, size = point_size, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
       )
     }
     p <- add_n_labels(p, dodge_pos, "sample")
@@ -1663,7 +1692,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   } else if (plot_mode == "sample_both") {
     time_colors <- named_palette(levels(dat$time_min), c(input$time_color_1, input$time_color_2))
-    dodge_pos <- position_dodge(width = input$dodge_width)
+    dodge_pos <- position_dodge(width = dodge_width)
     p <- if (per_bar_color) {
       ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = time_min))
     } else {
@@ -1680,8 +1709,8 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       p <- p + geom_point(
         data = dat,
         point_aes,
-        position = position_jitterdodge(jitter.width = input$jitter_width, dodge.width = input$dodge_width, seed = jitter_seed),
-        shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
+        position = position_jitterdodge(jitter.width = jitter_width, dodge.width = dodge_width, seed = jitter_seed),
+        shape = 21, size = point_size, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
       )
     }
     p <- add_n_labels(p, dodge_pos, "time_min")
@@ -1704,15 +1733,15 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
         p <- p + geom_point(
           data = dat,
           aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = bar_key),
-          position = position_jitter(width = input$jitter_width, height = 0, seed = jitter_seed),
-          shape = 21, size = input$point_size, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
+          position = position_jitter(width = jitter_width, height = 0, seed = jitter_seed),
+          shape = 21, size = point_size, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
         )
       } else {
         p <- p + geom_point(
           data = dat,
           aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu),
-          position = position_jitter(width = input$jitter_width, height = 0, seed = jitter_seed),
-          shape = 21, size = input$point_size, fill = input$single_color, color = bar_outline_col, stroke = 0.25, alpha = input$point_alpha
+          position = position_jitter(width = jitter_width, height = 0, seed = jitter_seed),
+          shape = 21, size = point_size, fill = input$single_color, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
         )
       }
     }
@@ -1732,7 +1761,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       aes(x = x, y = y, label = label)
     }
     p <- p + geom_text(data = ann, ann_aes, inherit.aes = FALSE,
-                       size = input$stat_size, color = stat_col)
+                       size = stat_size, color = stat_col)
   }
 
   if (!is.null(caption_text)) {
@@ -1741,10 +1770,10 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
 
   p <- p + base_theme +
     theme(
-      plot.title = element_text(face = "bold", size = input$title_size, hjust = input$title_hjust %||% 0),
-      plot.subtitle = element_text(size = input$subtitle_size, color = "grey30", hjust = input$subtitle_hjust %||% 0),
+      plot.title = element_text(face = "bold", size = title_size, hjust = input$title_hjust %||% 0),
+      plot.subtitle = element_text(size = subtitle_size, color = "grey30", hjust = input$subtitle_hjust %||% 0),
       plot.caption = element_text(
-        size = (input$subtitle_size %||% 10) * 0.92, color = "grey35",
+        size = (subtitle_size %||% 10) * 0.92, color = "grey35",
         hjust = input$caption_hjust %||% 0
       ),
       axis.title.x = element_text(hjust = input$x_title_hjust %||% 0.5),

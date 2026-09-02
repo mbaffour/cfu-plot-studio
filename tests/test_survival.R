@@ -346,8 +346,13 @@ ok("a rank test stays unpaired rather than silently changing procedure",
    !isTRUE(wx$paired[1]) && grepl("Wilcoxon", wx$test[1]))
 
 cat("\n-- the real gp75 file --\n")
-raw <- readr::read_csv("../gp75 cfu all reps_vault dummy.csv", show_col_types = FALSE, trim_ws = TRUE)
-if (!inherits(raw, "try-error") && nrow(raw) > 0) {
+# This block checks against a dataset that lives outside the repository on the
+# author's machine. Skip it (rather than error) when that file is not present,
+# so the suite still runs for other contributors and in CI.
+gp75_path <- "../gp75 cfu all reps_vault dummy.csv"
+raw <- if (file.exists(gp75_path)) readr::read_csv(gp75_path, show_col_types = FALSE, trim_ws = TRUE) else NULL
+if (is.null(raw)) cat("   (skipped: private gp75 file not present)\n")
+if (!is.null(raw) && nrow(raw) > 0) {
   names(raw) <- clean_names(names(raw))
   gd <- prep(raw)
   gs <- pair_survival(gd, "0 min", "120 min")

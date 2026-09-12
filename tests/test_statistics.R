@@ -413,6 +413,54 @@ ok("the two means are still the different numbers they always were",
    eq(gs$geometric_mean_cfu, 1e7) && eq(gs$arithmetic_mean_cfu, mean(c(1e6, 1e7, 1e8))))
 
 
+
+# ---------------------------------------------------------------------------
+# CPS-6: advisory assumption diagnostics
+# ---------------------------------------------------------------------------
+# Advisory by design: these must NOT switch a test, only describe the data.
+cat("\n-- assumption diagnostics (CPS-6) --\n")
+tight <- c(8.00, 8.01, 7.99)                 # sd = 0.01
+wide  <- c(6.0, 8.0, 10.0)                   # sd = 2.0, variance 40000x
+dv <- mk(rep(c("A", "B"), each = 3), rep(0, 6), rep(0, 6), rep(1:3, 2), 10^c(tight, wide))
+diag <- assumption_diagnostics(dv)
+ok("one diagnostic row per cell", nrow(diag) == 2, paste("rows", nrow(diag)))
+ok("the SD is the log10 SD the tests see",
+   eq(sort(diag$sd_log10), sort(c(sd(tight), sd(wide)))))
+ok("the variance ratio is against the narrowest cell",
+   eq(max(diag$variance_ratio_vs_smallest), signif(var(wide) / var(tight), 4)))
+ok("and a 4x-plus difference is flagged",
+   any(grepl("more than 4x", diag$note, fixed = TRUE)))
+ok("max_variance_ratio picks the worst cell",
+   eq(max_variance_ratio(diag), max(diag$variance_ratio_vs_smallest)))
+
+# Diagnostics run on the AGGREGATED units, or they describe plates rather than
+# the thing that was tested.
+dtec <- mk(rep("A", 8), rep(0, 8), rep(0, 8), rep(paste0("R", 1:2), each = 4),
+           10^c(8.00, 8.02, 7.98, 8.00, 9.00, 9.02, 8.98, 9.00))
+ok("diagnostics are computed on the tested units, not the wells",
+   assumption_diagnostics(dtec)$n == 2, paste(assumption_diagnostics(dtec)$n))
+
+# The awkward cells that make shapiro.test() error must not take the table down.
+ok("a constant cell is described, not an error",
+   { cc <- assumption_diagnostics(mk(rep("A", 3), rep(0, 3), rep(0, 3), 1:3, rep(1e8, 3)))
+     is.na(cc$shapiro_p) && grepl("Zero spread", cc$note, fixed = TRUE) })
+ok("an n = 1 cell is described, not an error",
+   { c1 <- assumption_diagnostics(mk("A", 0, 0, 1, 1e8))
+     nrow(c1) == 1 && grepl("n < 2", c1$note, fixed = TRUE) })
+ok("an empty frame gives an empty table",
+   nrow(assumption_diagnostics(mk(character(0), numeric(0), numeric(0),
+                                  character(0), numeric(0)))) == 0)
+ok("Shapiro runs where it is defined",
+   { set.seed(3)
+     sk <- mk(rep("A", 8), rep(0, 8), rep(0, 8), 1:8, 10^rnorm(8, 8, .2))
+     is.finite(assumption_diagnostics(sk)$shapiro_p) })
+
+# Advisory means advisory: the same data, the same test, whatever the spread.
+ok("the diagnostics do not change any p-value",
+   eq(run_groupwise_t_tests(dv, "sample", "none", "global", "0", "welch")$p.value,
+      unname(t.test(tight, wide)$p.value)))
+
+
 cat(sprintf("\n%s\n", strrep("-", 60)))
 if (fails == 0) {
   cat("ALL STATISTICS TESTS PASSED\n")

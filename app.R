@@ -701,6 +701,102 @@ raw_qc_summary <- function(raw, mapping) {
   )
 }
 
+# ---------------------------------------------------------------------------
+# Assumption diagnostics (advisory)
+# ---------------------------------------------------------------------------
+# CPS-6. The app offers a Student t-test (var.equal = TRUE) with no equal-
+# variance check, and the emmeans/ANOVA path pools ONE residual variance across
+# every cell -- routinely violated when a sterilised group sits beside a growing
+# one. These numbers do not gate anything and no test is auto-switched: at n = 3
+# a formal normality test has almost no power, so using one as a gate would be
+# worse than useless. They are here so the user can see the shape of the data
+# before choosing.
+#
+# Computed on the AGGREGATED frame, because that is what the tests see.
+assumption_diagnostics <- function(dat) {
+  dat <- aggregate_biological_replicates(dat)
+  if (!is.data.frame(dat) || nrow(dat) == 0) return(tibble())
+  out <- dat %>%
+    group_by(sample, concentration_label, time_min) %>%
+    summarize(
+      n = dplyr::n(),
+      mean_log10 = mean(log10_cfu),
+      sd_log10 = sd(log10_cfu),
+      # shapiro.test() errors below n = 3 and above n = 5000, and on constant
+      # input; all three are ordinary in a CFU cell.
+      shapiro_p = if (dplyr::n() >= 3 && dplyr::n() <= 5000 &&
+                      isTRUE(sd(log10_cfu) > 0)) {
+        suppressWarnings(tryCatch(stats::shapiro.test(log10_cfu)$p.value,
+                                  error = function(e) NA_real_))
+      } else NA_real_,
+      .groups = "drop"
+    )
+  spreads <- out$sd_log10[is.finite(out$sd_log10) & out$sd_log10 > 0]
+  smallest_var <- if (length(spreads) > 0) min(spreads)^2 else NA_real_
+  out %>%
+    mutate(
+      variance_ratio_vs_smallest = if (is.na(smallest_var)) NA_real_
+                                   else signif(sd_log10^2 / smallest_var, 4),
+      note = case_when(
+        n < 2 ~ "n < 2: no spread to check.",
+        !is.finite(sd_log10) | sd_log10 == 0 ~ "Zero spread: variance-based tests are undefined for this cell.",
+        !is.na(variance_ratio_vs_smallest) & variance_ratio_vs_smallest > 4 ~
+          "Variance is more than 4x the smallest cell. Welch (the default) handles this; Student and the pooled-variance emmeans model do not.",
+        !is.na(shapiro_p) & shapiro_p < 0.05 ~
+          "Shapiro-Wilk p < 0.05 on log10(CFU). Advisory only -- consider the rank test, and note that Shapiro has little power at n = 3.",
+        TRUE ~ "OK"
+      )
+    )
+}
+
+# The single number worth putting in front of someone who picked Student.
+max_variance_ratio <- function(diag) {
+  if (!is.data.frame(diag) || nrow(diag) == 0) return(NA_real_)
+  v <- diag$variance_ratio_vs_smallest
+  v <- v[is.finite(v)]
+  if (length(v) == 0) NA_real_ else max(v)
+}
+
+# ---------------------------------------------------------------------------
+# CSV dialects
+# ---------------------------------------------------------------------------
+# CPS-9. A European plate-reader or Excel export writes `1,5E+08` with `;`
+# separators. read_csv()'s default locale parses that to a character column,
+# then to NA, and the !is.na(cfu) filter drops the lot. The drop banner does
+# report it, so it failed loudly rather than silently -- but there was no way to
+# load the file at all.
+detect_csv_format <- function(path) {
+  lines <- tryCatch(readLines(path, n = 5, warn = FALSE), error = function(e) character(0))
+  if (length(lines) == 0) return("comma")
+  count_char <- function(ch) sum(vapply(lines, function(l) {
+    m <- gregexpr(ch, l, fixed = TRUE)[[1]]
+    if (length(m) == 1 && m[1] == -1L) 0L else length(m)
+  }, integer(1)))
+  n_semi <- count_char(";")
+  n_tab <- count_char("\t")
+  n_comma <- count_char(",")
+  if (n_semi > n_comma && n_semi >= n_tab) "semicolon"
+  else if (n_tab > n_comma && n_tab > n_semi) "tab"
+  else "comma"
+}
+
+read_cfu_csv <- function(path, csv_format = "auto") {
+  fmt <- if (identical(csv_format, "auto") || is.null(csv_format)) detect_csv_format(path) else csv_format
+  raw <- switch(
+    fmt,
+    # A semicolon-separated file is a decimal-comma file in practice: that is
+    # the whole reason the separator was changed.
+    "semicolon" = readr::read_delim(
+      path, delim = ";", show_col_types = FALSE, trim_ws = TRUE,
+      locale = readr::locale(decimal_mark = ",", grouping_mark = ".")
+    ),
+    "tab" = readr::read_delim(path, delim = "\t", show_col_types = FALSE, trim_ws = TRUE),
+    readr::read_csv(path, show_col_types = FALSE, trim_ws = TRUE)
+  )
+  attr(raw, "csv_format") <- fmt
+  raw
+}
+
 model_formula <- function(dat) {
   terms <- c("sample", "concentration_label", "time_min")
   usable <- terms[vapply(terms, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
@@ -3081,7 +3177,15 @@ ui <- fluidPage(
   ),
   sidebarLayout(
     sidebarPanel(
-      fileInput("file", "Upload CFU CSV", accept = ".csv"),
+      fileInput("file", "Upload CFU CSV", accept = c(".csv", ".tsv", ".txt")),
+      # CPS-9: a European export writes 1,5E+08 with ; separators. Auto-detect
+      # covers the common case; the explicit settings cover the rest.
+      selectInput("csv_format", "CSV dialect", choices = c(
+        "Detect automatically" = "auto",
+        "Comma-separated, dot decimal (1.5E+08)" = "comma",
+        "Semicolon-separated, comma decimal (1,5E+08)" = "semicolon",
+        "Tab-separated" = "tab"
+      ), selected = "auto"),
       actionButton("use_demo", "Load dummy example data"),
       downloadButton("download_template", "Download dummy/template CSV"),
       tags$hr(),
@@ -3355,7 +3459,12 @@ ui <- fluidPage(
           DTOutput("raw_qc_table"),
           h4("Replicate groups"),
           DTOutput("replicate_qc_table"),
-          downloadButton("download_qc", "Download QC CSV")
+          downloadButton("download_qc", "Download QC CSV"),
+          # CPS-6: advisory only. Nothing here switches a test.
+          h4("Spread and distribution (advisory)"),
+          div(class = "lab-tip", uiOutput("assumption_note")),
+          DTOutput("assumption_table"),
+          downloadButton("download_assumptions", "Download diagnostics CSV")
         ),
         tabPanel("Statistics", br(), DTOutput("stats_table"), downloadButton("download_stats", "Download current stats CSV")),
         tabPanel(
@@ -3383,13 +3492,16 @@ server <- function(input, output, session) {
   })
 
   raw_data <- reactive({
+    fmt <- input$csv_format %||% "auto"
     if (identical(active_source(), "upload") && !is.null(input$file)) {
-      raw <- read_csv(input$file$datapath, show_col_types = FALSE, trim_ws = TRUE)
+      raw <- read_cfu_csv(input$file$datapath, fmt)
     } else {
       validate(need(file.exists(demo_file), "Upload a CSV or restore the dummy example data file."))
-      raw <- read_csv(demo_file, show_col_types = FALSE, trim_ws = TRUE)
+      raw <- read_cfu_csv(demo_file, fmt)
     }
+    fmt_used <- attr(raw, "csv_format")
     names(raw) <- clean_names(names(raw))
+    attr(raw, "csv_format") <- fmt_used
     raw
   })
 
@@ -4443,6 +4555,40 @@ server <- function(input, output, session) {
     datatable(current_stats(), options = list(pageLength = 15, scrollX = TRUE))
   })
 
+  current_assumptions <- reactive(assumption_diagnostics(plot_data()))
+
+  output$assumption_table <- renderDT({
+    datatable(current_assumptions(), options = list(pageLength = 12, scrollX = TRUE), rownames = FALSE)
+  })
+
+  output$assumption_note <- renderUI({
+    diag <- current_assumptions()
+    vr <- max_variance_ratio(diag)
+    base <- paste(
+      "Per-cell spread on log10(CFU), computed on the same aggregated units the tests use.",
+      "These are advisory: nothing here switches a test, and Shapiro-Wilk has almost no",
+      "power at n = 3, so a passing p is not evidence of normality."
+    )
+    if (identical(input$stats_method, "student") && is.finite(vr) && vr > 4) {
+      tagList(tags$strong("Student t-test with unequal spread. "),
+              sprintf(paste("The widest cell has %.1fx the variance of the narrowest.",
+                            "Student pools them; Welch, the default, does not."), vr),
+              tags$br(), base)
+    } else if (is_emmeans_method(input$stats_method) && is.finite(vr) && vr > 4) {
+      tagList(tags$strong("Pooled-variance model with unequal spread. "),
+              sprintf(paste("The widest cell has %.1fx the variance of the narrowest, and",
+                            "the linear model pools one residual variance across every cell."), vr),
+              tags$br(), base)
+    } else {
+      base
+    }
+  })
+
+  output$download_assumptions <- downloadHandler(
+    filename = function() "assumption_diagnostics.csv",
+    content = function(file) write_csv(current_assumptions(), file)
+  )
+
   output$omnibus_relationship <- renderUI({
     tagList(
       tags$strong("How this table relates to the Statistics tab: "),
@@ -4557,7 +4703,9 @@ server <- function(input, output, session) {
       app_git_sha = app_git_sha(),
       generated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
       data_source = data_source_label(),
+      csv_format = attr(raw_data(), "csv_format") %||% "comma",
       column_mapping = column_mapping(),
+      max_variance_ratio = max_variance_ratio(current_assumptions()),
       plot_mode = input$plot_mode,
       active_comparison = active_comparison(),
       # CPS-1/CPS-2: a bundle has to say what n counted and what scale the
@@ -4908,6 +5056,8 @@ server <- function(input, output, session) {
             })
         add("figure_qa.csv", "Publication-readiness checklist for this figure.",
             function(f) write_csv(figure_qa(), f))
+        add("assumption_diagnostics.csv", "Per-cell spread and normality checks on the tested units (advisory).",
+            function(f) write_csv(current_assumptions(), f))
         # CPS-3: only written when there is something to record, so a clean
         # dataset does not ship an empty file the README has to explain.
         if (lod_report()$n_affected > 0) {

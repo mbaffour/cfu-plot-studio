@@ -76,6 +76,7 @@ for (n in sort(names_in)) cat(sprintf("       %-26s %s bytes\n", n, format(listi
 expected <- c("figure.png", "figure.pdf", "figure.svg",
               "data_cleaned.csv", "data_plotted.csv", "summary.csv",
               "statistics.csv", "anova.csv", "qc_replicates.csv", "figure_qa.csv",
+              "assumption_diagnostics.csv",
               "recreate_figure.R", "plot_preset.json", "analysis_manifest.json",
               "README.txt")
 for (e in expected) ok(sprintf("contains %s", e), e %in% names_in)

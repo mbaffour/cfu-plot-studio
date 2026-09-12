@@ -460,7 +460,40 @@ format_q <- function(p) {
   ifelse(is.na(p), NA_character_, ifelse(p < 0.001, "q<0.001", paste0("q=", signif(p, 2))))
 }
 
-prep_cfu_data <- function(raw, mapping, treatment_unit = "", time_unit = "min", append_treatment_unit = TRUE, append_time_unit = TRUE) {
+# ---------------------------------------------------------------------------
+# Limit of detection
+# ---------------------------------------------------------------------------
+# A plate with no colonies is a real measurement -- "below the limit of
+# detection" -- not a missing one, and a sterilising treatment is exactly the
+# case where it happens. Dropping those wells biases the effect TOWARDS the
+# null: on control 1e8 x3 versus treated 1e2, 1e2, 0, discarding the zero
+# reports a 6.0-log reduction where censoring it at 1 CFU/mL gives 6.67.
+#
+# The default stays exclusion, because that is what every earlier version did
+# and changing it silently would move published numbers. But the choice is now
+# the user's, it is recorded, and the affected wells are named in the exports.
+LOD_DEFAULT <- 1          # 1 CFU/mL: the smallest countable titre on a neat plate.
+
+lod_substituted_value <- function(lod_value, lod_rule) {
+  v <- suppressWarnings(as.numeric(lod_value))
+  if (length(v) != 1 || !is.finite(v) || v <= 0) return(NA_real_)
+  if (identical(lod_rule, "half")) v / 2 else v
+}
+
+lod_rule_label <- function(lod_mode, lod_value, lod_rule) {
+  if (!identical(lod_mode, "substitute")) {
+    return("non-positive counts excluded (no LOD substitution)")
+  }
+  v <- lod_substituted_value(lod_value, lod_rule)
+  if (is.na(v)) return("LOD substitution requested but the LOD is not a positive number; counts were excluded")
+  paste0("non-positive counts set to ",
+         if (identical(lod_rule, "half")) "LOD/2" else "the LOD",
+         " = ", format(v, scientific = FALSE), " CFU (LOD = ",
+         format(as.numeric(lod_value), scientific = FALSE), ")")
+}
+
+prep_cfu_data <- function(raw, mapping, treatment_unit = "", time_unit = "min", append_treatment_unit = TRUE, append_time_unit = TRUE,
+                          lod_mode = "exclude", lod_value = LOD_DEFAULT, lod_rule = "lod") {
   names(raw) <- clean_names(names(raw))
 
   # Which column, if any, identifies the BIOLOGICAL replicate -- the independent
@@ -479,7 +512,19 @@ prep_cfu_data <- function(raw, mapping, treatment_unit = "", time_unit = "min", 
     bio_replicate = if (is.na(bio_col)) NA_character_ else as.character(raw[[bio_col]]),
     cfu = suppressWarnings(as.numeric(raw[[mapping$cfu]]))
   ) %>%
-    filter(!is.na(sample), !is.na(concentration_raw), !is.na(time_raw), !is.na(cfu), cfu > 0)
+    filter(!is.na(sample), !is.na(concentration_raw), !is.na(time_raw), !is.na(cfu))
+
+  # Censor at the LOD, or drop, according to the declared rule. Either way the
+  # row is marked, so the flag reaches the plotted frame, the summary and the
+  # exports rather than living only in a banner on screen.
+  sub_value <- lod_substituted_value(lod_value, lod_rule)
+  censor <- identical(lod_mode, "substitute") && !is.na(sub_value)
+  out <- out %>%
+    mutate(
+      lod_substituted = censor & (cfu <= 0),
+      cfu = ifelse(lod_substituted, sub_value, cfu)
+    ) %>%
+    filter(cfu > 0)
 
   conc_info <- format_label(out$concentration_raw, treatment_unit, append_treatment_unit)
   time_info <- format_label(out$time_raw, time_unit, append_time_unit)
@@ -574,17 +619,32 @@ aggregate_biological_replicates <- function(dat) {
 }
 
 summary_cfu <- function(dat) {
+  # CPS-10: the arithmetic columns are kept -- some readers genuinely want them
+  # -- but renamed so a column picked out of summary.csv cannot be mistaken for
+  # the quantity the figure draws and the tests analyse. On three wells at 1e6,
+  # 1e7 and 1e8 the arithmetic mean is 3.7e7 against a geometric mean of 1e7,
+  # and the old `mean_cfu` sat next to `geometric_mean_cfu` with nothing to
+  # distinguish them but the word. The geometric side now carries its own
+  # dispersion, as a multiplicative FACTOR: the interval is
+  # geometric_mean x/÷ geometric_sd_factor.
+  has_lod <- "lod_substituted" %in% names(dat)
+  has_bio <- "bio_replicate" %in% names(dat) && any(!is.na(dat$bio_replicate))
   dat %>%
     group_by(sample, concentration_label, time_min) %>%
     summarize(
       n = n(),
-      mean_cfu = mean(cfu),
-      sd_cfu = sd(cfu),
-      sem_cfu = sd_cfu / sqrt(n),
+      n_biological_replicates = if (has_bio) dplyr::n_distinct(bio_replicate[!is.na(bio_replicate)]) else NA_integer_,
+      n_lod_substituted = if (has_lod) sum(lod_substituted, na.rm = TRUE) else 0L,
       mean_log10_cfu = mean(log10_cfu),
       sd_log10_cfu = sd(log10_cfu),
       sem_log10_cfu = sd_log10_cfu / sqrt(n),
       geometric_mean_cfu = 10^mean_log10_cfu,
+      geometric_sd_factor = 10^sd_log10_cfu,
+      geometric_mean_low = geometric_mean_cfu / geometric_sd_factor,
+      geometric_mean_high = geometric_mean_cfu * geometric_sd_factor,
+      arithmetic_mean_cfu = mean(cfu),
+      arithmetic_sd_cfu = sd(cfu),
+      arithmetic_sem_cfu = arithmetic_sd_cfu / sqrt(n),
       .groups = "drop"
     )
 }
@@ -1538,6 +1598,7 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type, clamp_zero = TRUE) 
   # frame has no bio_replicate column because pairing already reduced it to one
   # row per replicate, and there `n` counts complete pairs.
   has_bio <- "bio_replicate" %in% names(dat) && any(!is.na(dat$bio_replicate))
+  has_lod <- "lod_substituted" %in% names(dat)
 
   out <- dat %>%
     mutate(plot_y = if (on_log) log10_cfu else cfu) %>%
@@ -1545,6 +1606,7 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type, clamp_zero = TRUE) 
     summarize(
       n = n(),
       n_bio = if (has_bio) dplyr::n_distinct(bio_replicate[!is.na(bio_replicate)]) else NA_integer_,
+      n_lod_substituted = if (has_lod) sum(lod_substituted, na.rm = TRUE) else 0L,
       mean_y = mean(plot_y, na.rm = TRUE),
       median_y = median(plot_y, na.rm = TRUE),
       sd_y = sd(plot_y, na.rm = TRUE),
@@ -1967,8 +2029,14 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
              input$surv_baseline %||% "baseline",
              ", paired within each replicate; the reference line is no change")
     } else NULL
+    # CPS-3: a censored well changes what the bar means, so the figure says so.
+    lod_caption <- if ("lod_substituted" %in% names(dat) &&
+                       any(dat$lod_substituted, na.rm = TRUE)) {
+      paste0(sum(dat$lod_substituted, na.rm = TRUE),
+             " well(s) were at or below the limit of detection and were censored at it")
+    } else NULL
     caption_parts <- c(error_type_caption(error_type, variation_display, y_mode, is_survival),
-                       survival_caption, n_caption)
+                       survival_caption, n_caption, lod_caption)
     resolved_cmp <- input$comparison %||% "auto"
     if (identical(resolved_cmp, "auto")) resolved_cmp <- resolve_auto_comparison(plot_mode)
     # A survival test outside survival mode, or a timepoint test inside it, is
@@ -3019,6 +3087,28 @@ ui <- fluidPage(
       tags$hr(),
       uiOutput("mapping_ui"),
       tags$hr(),
+      # CPS-3: zero colonies is a measurement, not a gap. Which of the two
+      # defensible treatments applies is the user's call, and it is recorded.
+      selectInput("lod_mode", "Counts at or below zero", choices = c(
+        "Exclude the well (default)" = "exclude",
+        "Substitute at the limit of detection" = "substitute"
+      ), selected = "exclude"),
+      conditionalPanel(
+        "input.lod_mode == 'substitute'",
+        numericInput("lod_value", "Limit of detection (CFU, same units as the CFU column)",
+                     value = LOD_DEFAULT, min = 0),
+        selectInput("lod_rule", "Substitute with", choices = c(
+          "The LOD itself" = "lod",
+          "LOD / 2" = "half"
+        ), selected = "lod")
+      ),
+      helpText(
+        "Excluding sterile wells biases a log-reduction towards the null, because the ",
+        "wells that vanish are the ones where the treatment worked. Substituting at the ",
+        "LOD keeps them as censored observations. Either way, the rule, the count and ",
+        "the affected wells are written into the QC tab, the manifest and the bundle."
+      ),
+      tags$hr(),
       selectInput(
         "plot_mode", "Plot mode",
         choices = c(
@@ -3812,7 +3902,39 @@ server <- function(input, output, session) {
       treatment_unit = input$treatment_unit %||% "",
       time_unit = input$time_unit %||% "min",
       append_treatment_unit = isTRUE(input$append_treatment_unit),
-      append_time_unit = isTRUE(input$append_time_unit)
+      append_time_unit = isTRUE(input$append_time_unit),
+      lod_mode = input$lod_mode %||% "exclude",
+      lod_value = input$lod_value %||% LOD_DEFAULT,
+      lod_rule = input$lod_rule %||% "lod"
+    )
+  })
+
+  # CPS-3: every well the LOD rule touched, named. The on-screen banner does not
+  # survive into a bundle, so this is what the manifest and the QC tab report.
+  lod_report <- reactive({
+    raw <- raw_data()
+    mapping <- column_mapping()
+    vals <- suppressWarnings(as.numeric(raw[[mapping$cfu]]))
+    idx <- which(!is.na(vals) & vals <= 0)
+    mode <- input$lod_mode %||% "exclude"
+    sub_value <- lod_substituted_value(input$lod_value %||% LOD_DEFAULT, input$lod_rule %||% "lod")
+    list(
+      mode = mode,
+      rule = lod_rule_label(mode, input$lod_value %||% LOD_DEFAULT, input$lod_rule %||% "lod"),
+      lod_value = as.numeric(input$lod_value %||% LOD_DEFAULT),
+      substituted_value = if (identical(mode, "substitute")) sub_value else NA_real_,
+      n_affected = length(idx),
+      n_substituted = if (identical(mode, "substitute") && !is.na(sub_value)) length(idx) else 0L,
+      n_excluded = if (identical(mode, "substitute") && !is.na(sub_value)) 0L else length(idx),
+      wells = if (length(idx) == 0) tibble() else tibble(
+        sample = as.character(raw[[mapping$sample]])[idx],
+        treatment = as.character(raw[[mapping$concentration]])[idx],
+        time = as.character(raw[[mapping$time]])[idx],
+        replicate = as.character(raw[[mapping$replicate]])[idx],
+        reported_cfu = vals[idx],
+        disposition = if (identical(mode, "substitute") && !is.na(sub_value))
+          paste0("substituted at ", format(sub_value, scientific = FALSE)) else "excluded"
+      )
     )
   })
 
@@ -4128,8 +4250,27 @@ server <- function(input, output, session) {
         details = if (isTRUE(pass)) details_ok else details_warn
       )
     }
+    lod <- lod_report()
     bind_rows(
       qa,
+      # CPS-1: the check a reader most needs, first.
+      add_check(
+        "Unit of replication",
+        has_biological_replicates(filtered_data()),
+        paste0("n counts biological replicates (",
+               replication_unit_label(filtered_data()), ")."),
+        "No biological replicate column was identified, so n counts measurements, not replicates. Results are labelled technical replicates only."
+      ),
+      # CPS-3: an exclusion that never reaches the bundle is not a record.
+      add_check(
+        "Non-positive counts",
+        lod$n_affected == 0 || lod$n_substituted > 0,
+        if (lod$n_affected == 0) "No well reported a count at or below zero."
+        else paste0(lod$n_affected, " well(s) reported a count at or below zero; ", lod$rule, "."),
+        paste0(lod$n_affected, " well(s) reported a count at or below zero and were EXCLUDED. ",
+               "Excluding them biases a log-reduction towards the null; consider LOD substitution. ",
+               "The affected wells are listed in the manifest and in lod_wells.csv.")
+      ),
       add_check(
         "Replicate groups",
         nrow(rep_counts) > 0 && min(rep_counts$n_reps, na.rm = TRUE) >= 2,
@@ -4427,6 +4568,19 @@ server <- function(input, output, session) {
         rows_before_aggregation = nrow(filtered_data()),
         units_after_aggregation = nrow(aggregate_biological_replicates(filtered_data()))
       ),
+      limit_of_detection = {
+        lod <- lod_report()
+        list(
+          mode = lod$mode,
+          rule = lod$rule,
+          lod_value = lod$lod_value,
+          substituted_value = lod$substituted_value,
+          wells_at_or_below_zero = lod$n_affected,
+          wells_substituted = lod$n_substituted,
+          wells_excluded = lod$n_excluded,
+          affected_wells = lod$wells
+        )
+      },
       summary_scale = list(
         y_mode = input$y_mode,
         centre_statistic = unique(as.character(current_summary()$centre_statistic %||% NA)),
@@ -4754,6 +4908,12 @@ server <- function(input, output, session) {
             })
         add("figure_qa.csv", "Publication-readiness checklist for this figure.",
             function(f) write_csv(figure_qa(), f))
+        # CPS-3: only written when there is something to record, so a clean
+        # dataset does not ship an empty file the README has to explain.
+        if (lod_report()$n_affected > 0) {
+          add("lod_wells.csv", "Wells reporting a count at or below zero, and what was done with each.",
+              function(f) write_csv(lod_report()$wells, f))
+        }
 
         bump("reproducibility")
         add("recreate_figure.R", "Standalone script that rebuilds this figure from embedded data.",

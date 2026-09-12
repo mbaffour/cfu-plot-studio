@@ -24,13 +24,13 @@ eq <- function(a, b, tol = 1e-8) isTRUE(all.equal(unname(a), unname(b), toleranc
 # `bio` says which column identifies the biological replicate: the Replicate
 # column by default (what the app's own mapping resolves to), or NA for a file
 # whose repeats are technical and unlabelled.
-mk <- function(sample, conc, time, rep, cfu, bio = "Replicate") {
+mk <- function(sample, conc, time, rep, cfu, bio = "Replicate", ...) {
   raw <- tibble::tibble(Sample = sample, inducer_concentration = conc,
                         Time = time, Replicate = rep, CFU = cfu)
   prep_cfu_data(raw, list(sample = "Sample", concentration = "inducer_concentration",
                           time = "Time", replicate = "Replicate",
                           bio_replicate = bio, cfu = "CFU"),
-                "", "min", FALSE, TRUE)
+                "", "min", FALSE, TRUE, ...)
 }
 
 cat("\n-- log10 transform and the non-positive filter --\n")
@@ -344,6 +344,73 @@ ok("the omnibus table says the t-test family is NOT its post-hoc",
    grepl("INDEPENDENT", run_anova(dm, "welch")$pairwise_family[1], fixed = TRUE))
 ok("and says Tukey IS its post-hoc",
    grepl("post-hoc family", run_anova(dm, "emmeans_tukey")$pairwise_family[1], fixed = TRUE))
+
+
+
+# ---------------------------------------------------------------------------
+# CPS-3: limit of detection
+# ---------------------------------------------------------------------------
+# The defect: cfu > 0 dropped sterile wells with no LOD option, no record in the
+# exports, and a `message` column that named an unrelated reason. Dropping them
+# biases a log-reduction TOWARDS the null.
+cat("\n-- limit of detection (CPS-3) --\n")
+# The audit's case: control 1e8 x3, treated 1e2, 1e2, 0.
+lod_cfu <- c(1e8, 1e8, 1e8, 1e2, 1e2, 0)
+lod_args <- list(sample = rep(c("ctrl", "treated"), each = 3), conc = rep(0, 6),
+                 time = rep(0, 6), rep = rep(1:3, 2), cfu = lod_cfu)
+
+d_excl <- do.call(mk, lod_args)
+ok("exclusion is still the default", nrow(d_excl) == 5, paste("rows", nrow(d_excl)))
+ok("the excluded-row flag exists and is all FALSE",
+   "lod_substituted" %in% names(d_excl) && !any(d_excl$lod_substituted))
+
+d_sub <- do.call(mk, c(lod_args, list(lod_mode = "substitute", lod_value = 1, lod_rule = "lod")))
+ok("substitution keeps the sterile well", nrow(d_sub) == 6)
+ok("and marks exactly that well", sum(d_sub$lod_substituted) == 1)
+ok("at the LOD itself", eq(d_sub$cfu[d_sub$lod_substituted], 1))
+ok("log10 of the censored well is log10(LOD)", eq(d_sub$log10_cfu[d_sub$lod_substituted], 0))
+ok("no other well is touched",
+   eq(sort(d_sub$cfu[!d_sub$lod_substituted]), sort(lod_cfu[lod_cfu > 0])))
+
+d_half <- do.call(mk, c(lod_args, list(lod_mode = "substitute", lod_value = 10, lod_rule = "half")))
+ok("the LOD/2 rule halves the LOD", eq(d_half$cfu[d_half$lod_substituted], 5))
+ok("a non-positive LOD falls back to exclusion rather than producing -Inf",
+   nrow(do.call(mk, c(lod_args, list(lod_mode = "substitute", lod_value = 0)))) == 5)
+
+# The number the audit computed by hand: 6.667 log censored vs 6.000 dropped.
+red <- function(d) mean(d$log10_cfu[d$sample == "ctrl"]) - mean(d$log10_cfu[d$sample == "treated"])
+ok("censoring at LOD = 1 gives the 6.667-log reduction", eq(red(d_sub), 8 - 4/3),
+   sprintf("%.4f", red(d_sub)))
+ok("dropping the zero understates it as 6.000", eq(red(d_excl), 6))
+ok("so the two rules genuinely disagree", !eq(red(d_sub), red(d_excl)))
+
+ok("the substituted count reaches the summary",
+   sum(summary_cfu(d_sub)$n_lod_substituted) == 1)
+ok("and the plotted summary", sum(plot_summary(d_sub, "combined", "log10", "SD")$n_lod_substituted) == 1)
+ok("the rule is describable for the manifest and the caption",
+   grepl("LOD/2", lod_rule_label("substitute", 10, "half"), fixed = TRUE) &&
+     grepl("excluded", lod_rule_label("exclude", 1, "lod"), fixed = TRUE),
+   lod_rule_label("substitute", 10, "half"))
+ok("a censored well survives aggregation to its biological replicate",
+   { ag <- aggregate_biological_replicates(d_sub); sum(ag$lod_substituted) == 1 })
+
+# ---------------------------------------------------------------------------
+# CPS-10: arithmetic and geometric summaries cannot be confused
+# ---------------------------------------------------------------------------
+cat("\n-- summary.csv column names (CPS-10) --\n")
+dsum <- mk(rep("A", 3), rep(0, 3), rep(0, 3), 1:3, c(1e6, 1e7, 1e8))
+gs <- summary_cfu(dsum)
+ok("the arithmetic columns say so in their names",
+   all(c("arithmetic_mean_cfu", "arithmetic_sd_cfu", "arithmetic_sem_cfu") %in% names(gs)))
+ok("the bare names that invited the mistake are gone",
+   !any(c("mean_cfu", "sd_cfu", "sem_cfu") %in% names(gs)))
+ok("the geometric side now carries dispersion",
+   eq(gs$geometric_sd_factor, 10^sd(log10(c(1e6, 1e7, 1e8)))))
+ok("and a multiplicative interval around it",
+   eq(gs$geometric_mean_low, gs$geometric_mean_cfu / gs$geometric_sd_factor) &&
+     eq(gs$geometric_mean_high, gs$geometric_mean_cfu * gs$geometric_sd_factor))
+ok("the two means are still the different numbers they always were",
+   eq(gs$geometric_mean_cfu, 1e7) && eq(gs$arithmetic_mean_cfu, mean(c(1e6, 1e7, 1e8))))
 
 
 cat(sprintf("\n%s\n", strrep("-", 60)))

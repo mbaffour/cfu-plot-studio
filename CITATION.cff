@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 message: "If you use CFU Plot Studio, please cite it using the metadata from this file."
 title: "CFU Plot Studio"
-version: "0.1.0"
-date-released: "2026-05-24"
+version: "0.2.0"
+date-released: "2026-09-12"
 type: software
 abstract: "An R Shiny app for publication-ready CFU plotting, replicate-level statistics, figure QC, and reproducible figure exports."
 authors:

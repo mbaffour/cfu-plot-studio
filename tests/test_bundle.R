@@ -87,6 +87,13 @@ ex <- file.path(tempdir(), paste0("bundle_", as.integer(runif(1, 1, 1e9))))
 dir.create(ex, recursive = TRUE, showWarnings = FALSE)
 zip::unzip(zipfile, exdir = ex)
 
+# CPS-4: "contains figure.pdf" is not enough -- the old defect shipped a file
+# that was present and unreadable. Check the magic bytes.
+cat("\n-- the vector exports are real files (CPS-4) --\n")
+ok("figure.pdf has a valid %PDF header", file_looks_like(file.path(ex, "figure.pdf"), "pdf"))
+ok("figure.png has a valid PNG header", file_looks_like(file.path(ex, "figure.png"), "png"))
+ok("figure.svg is really SVG", file_looks_like(file.path(ex, "figure.svg"), "svg"))
+
 readme <- paste(readLines(file.path(ex, "README.txt"), warn = FALSE), collapse = "\n")
 cat("\n-- the README --\n")
 ok("names the source file", grepl(basename(csv), readme, fixed = TRUE))
@@ -122,6 +129,11 @@ pj <- jsonlite::read_json(file.path(ex, "plot_preset.json"))
 ok("the preset records the plot mode", identical(pj$settings$plot_mode, "survival"))
 mj <- jsonlite::read_json(file.path(ex, "analysis_manifest.json"))
 ok("the manifest records the readout", identical(mj$visible_data$readout, "paired survival ratio"))
+# CPS-8: a bundle that cannot name the code that produced it is not reproducible.
+ok("the manifest carries the app version", identical(mj$app_version, APP_VERSION),
+   paste("manifest:", mj$app_version %||% "<absent>", "constant:", APP_VERSION))
+ok("the README names the app version", grepl(APP_VERSION, readme, fixed = TRUE))
+ok("the recreate script names the app version", any(grepl(APP_VERSION, scr, fixed = TRUE)))
 
 unlink(ex, recursive = TRUE); unlink(zipfile)
 if (file.exists("Rplots.pdf")) unlink("Rplots.pdf")

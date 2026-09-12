@@ -11,6 +11,29 @@ suppressPackageStartupMessages({
 
 demo_file <- "dummy_cfu_example.csv"
 
+# One version string for the whole app. A bundle whose manifest cannot name the
+# code that produced it is not reproducible, so this constant is the single
+# source of truth for the UI footer, the manifest, the bundle README and
+# CITATION.cff -- bump all of them together.
+APP_VERSION <- "0.2.0"
+
+# Git SHA of the working tree, when the app is run from a checkout. Absent in a
+# plain download, which is why it is optional rather than part of APP_VERSION.
+app_git_sha <- function() {
+  sha <- tryCatch(
+    suppressWarnings(system2("git", c("rev-parse", "--short", "HEAD"),
+                             stdout = TRUE, stderr = FALSE)),
+    error = function(e) character(0)
+  )
+  if (length(sha) != 1 || !nzchar(sha)) NA_character_ else sha
+}
+
+app_version_line <- function() {
+  sha <- app_git_sha()
+  if (is.na(sha)) paste0("CFU Plot Studio ", APP_VERSION)
+  else paste0("CFU Plot Studio ", APP_VERSION, " (", sha, ")")
+}
+
 `%||%` <- function(x, y) {
   if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x
 }
@@ -100,6 +123,93 @@ gtable_size_in <- function(g, dpi = 300) {
                    sum(as.character(grid::unitType(g$heights)) == "null")
     )
   }, dpi = dpi)
+}
+
+# ---------------------------------------------------------------------------
+# Export post-conditions
+# ---------------------------------------------------------------------------
+# ggsave() reports a dead graphics device as a WARNING, not an error: on macOS
+# without XQuartz, `cairo_pdf` emits "failed to load cairo DLL", writes nothing,
+# and returns cleanly. The download handler then hands the browser an empty
+# file and the bundle silently loses figure.pdf. capabilities("cairo") is TRUE
+# on exactly those machines, so it cannot be used as a guard -- the only
+# reliable test is to look at the bytes that were written.
+file_looks_like <- function(path, kind) {
+  if (is.null(path) || !file.exists(path)) return(FALSE)
+  size <- file.info(path)$size
+  if (!isTRUE(is.finite(size)) || size <= 0) return(FALSE)
+  if (is.null(kind)) return(TRUE)
+  head_bytes <- function(n) {
+    con <- file(path, "rb")
+    on.exit(close(con), add = TRUE)
+    readBin(con, "raw", n)
+  }
+  switch(
+    kind,
+    pdf = identical(rawToChar(head_bytes(4)), "%PDF"),
+    png = identical(as.integer(head_bytes(4)), c(137L, 80L, 78L, 71L)),
+    svg = any(grepl("<svg", readLines(path, n = 8, warn = FALSE), fixed = TRUE)),
+    TRUE
+  )
+}
+
+# Device chain per export format, most preferred first. cairo_pdf embeds fonts
+# and honours alpha; the base pdf device does neither as well, so it is a
+# fallback that has to be announced rather than a silent equivalent.
+plot_device_chain <- function(kind) {
+  switch(
+    kind,
+    png = list(png = "png"),
+    svg = list(svg = "svg"),
+    pdf = list(cairo_pdf = grDevices::cairo_pdf, pdf = grDevices::pdf),
+    stats::setNames(list(kind), kind)
+  )
+}
+
+# Try each device in turn and return the first that actually produced a readable
+# file. Never leaves a zero-byte file behind: a caller that gets ok = FALSE must
+# report the failure rather than ship an empty export.
+ggsave_checked <- function(filename, plot, kind, width, height, units = "in", dpi = 300,
+                           devices = plot_device_chain(kind)) {
+  notes <- character(0)
+  for (i in seq_along(devices)) {
+    dev_name <- names(devices)[i] %||% "device"
+    unlink(filename)
+    err <- tryCatch(
+      withCallingHandlers(
+        {
+          ggplot2::ggsave(filename = filename, plot = plot, width = width, height = height,
+                          units = units, dpi = dpi, device = devices[[i]])
+          NULL
+        },
+        warning = function(w) {
+          notes <<- c(notes, paste0(dev_name, ": ", conditionMessage(w)))
+          invokeRestart("muffleWarning")
+        }
+      ),
+      error = function(e) paste0(dev_name, ": ", conditionMessage(e))
+    )
+    if (!is.null(err)) {
+      notes <- c(notes, err)
+      next
+    }
+    if (file_looks_like(filename, kind)) {
+      return(list(
+        ok = TRUE, device = dev_name, fallback = i > 1L,
+        notes = notes,
+        message = if (i > 1L) paste0(
+          "The ", names(devices)[1], " device is unavailable on this machine, so the ",
+          toupper(kind), " was written with the ", dev_name,
+          " device instead. Fonts are not embedded; check the file before submitting it."
+        ) else NA_character_
+      ))
+    }
+    notes <- c(notes, paste0(dev_name, ": produced no readable ", kind, "."))
+  }
+  unlink(filename)
+  list(ok = FALSE, device = NA_character_, fallback = FALSE, notes = notes,
+       message = paste0("No available graphics device could write a ", kind, ": ",
+                        paste(notes, collapse = " | ")))
 }
 
 format_figure_size <- function(width_in, height_in, dpi) {
@@ -2117,6 +2227,12 @@ ui <- fluidPage(
       flex-wrap: wrap;
       gap: 8px;
     }
+    .app-version {
+      margin: 10px 0 0;
+      color: #5c7276;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
     .badge-pill {
       display: inline-flex;
       align-items: center;
@@ -2516,7 +2632,9 @@ ui <- fluidPage(
         span(class = "badge-pill", span(class = "badge-dot"), "Replicate aware"),
         span(class = "badge-pill", span(class = "badge-dot red"), "Stats ready"),
         span(class = "badge-pill", span(class = "badge-dot blue"), "Export polished")
-      )
+      ),
+      # A figure exported today has to be traceable to the code that drew it.
+      p(class = "app-version", textOutput("app_version_line", inline = TRUE))
     ),
     div(
       class = "petri-stage",
@@ -2833,6 +2951,8 @@ ui <- fluidPage(
 )
 
 server <- function(input, output, session) {
+  output$app_version_line <- renderText(app_version_line())
+
   active_source <- reactiveVal("demo")
 
   observeEvent(input$use_demo, {
@@ -3804,16 +3924,26 @@ server <- function(input, output, session) {
     datatable(figure_qa(), options = list(dom = "t", pageLength = 20, scrollX = TRUE), rownames = FALSE)
   })
 
-  save_plot_file <- function(file, device) {
-    ggsave(
+  # `kind` is the FORMAT, not the device: which device can actually write that
+  # format is decided per machine by ggsave_checked(). A format that cannot be
+  # written raises, so a download handler fails loudly and the bundle records
+  # the item as missing rather than adding an empty file.
+  save_plot_file <- function(file, kind, notify = TRUE) {
+    res <- ggsave_checked(
       filename = file,
       plot = current_grob(),
+      kind = kind,
       width = export_width(),
       height = export_height(),
       units = "in",
-      dpi = export_dpi(),
-      device = device
+      dpi = export_dpi()
     )
+    if (!isTRUE(res$ok)) stop(res$message, call. = FALSE)
+    if (isTRUE(res$fallback) && isTRUE(notify)) {
+      tryCatch(showNotification(res$message, type = "warning", duration = 10),
+               error = function(e) NULL)
+    }
+    invisible(res)
   }
 
   add_plot_slide <- function(doc, plot_obj) {
@@ -3887,6 +4017,8 @@ server <- function(input, output, session) {
   manifest_payload <- reactive({
     list(
       app = "CFU Plot Studio",
+      app_version = APP_VERSION,
+      app_git_sha = app_git_sha(),
       generated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
       data_source = data_source_label(),
       column_mapping = column_mapping(),
@@ -3928,6 +4060,7 @@ server <- function(input, output, session) {
 
     paste(c(
       "# Reproducible CFU Plot Studio figure export",
+      paste0("# App:       ", app_version_line()),
       paste0("# Generated: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
       "# This script rebuilds the visible figure from embedded filtered data, summary data, annotations, and plot settings.",
       "",
@@ -4007,7 +4140,7 @@ server <- function(input, output, session) {
 
   output$download_pdf <- downloadHandler(
     filename = function() "cfu_plot.pdf",
-    content = function(file) save_plot_file(file, cairo_pdf)
+    content = function(file) save_plot_file(file, "pdf")
   )
 
   output$download_svg <- downloadHandler(
@@ -4158,7 +4291,7 @@ server <- function(input, output, session) {
 
         bump("figures")
         add("figure.png", "Raster figure at the export DPI.", function(f) save_plot_file(f, "png"))
-        add("figure.pdf", "Vector figure for a manuscript.", function(f) save_plot_file(f, cairo_pdf))
+        add("figure.pdf", "Vector figure for a manuscript.", function(f) save_plot_file(f, "pdf"))
         add("figure.svg", "Vector figure for editing in Illustrator or Inkscape.", function(f) save_plot_file(f, "svg"))
 
         bump("PowerPoint")
@@ -4226,6 +4359,7 @@ server <- function(input, output, session) {
         bump("README")
         writeLines(c(
           "CFU Plot Studio export bundle",
+          paste0("App:     ", app_version_line()),
           paste0("Created: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
           paste0("Source:  ", if (!is.null(input$file)) input$file$name else "bundled example data"),
           paste0("Figure:  ", format_figure_size(export_width(), export_height(), export_dpi())),

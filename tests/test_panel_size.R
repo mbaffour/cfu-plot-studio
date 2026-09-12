@@ -160,6 +160,43 @@ r <- tryCatch({ ggsave(f, pinned$loud, width = geos$loud$width, height = geos$lo
 ok("a pinned gtable saves through ggsave", identical(r, "ok") && file.size(f) > 5000, r)
 unlink(f)
 
+# --- CPS-4: export post-conditions ----------------------------------------
+# The defect: cairo_pdf warns rather than errors when cairo cannot load, so the
+# old code returned cleanly having written nothing. Assert on the BYTES.
+cat("\n-- export post-conditions (CPS-4) --\n")
+fp <- tempfile(fileext = ".pdf")
+rp <- ggsave_checked(fp, pinned$loud, "pdf", width = geos$loud$width,
+                     height = geos$loud$height, units = "in", dpi = 100)
+ok("a PDF is produced on this machine", isTRUE(rp$ok), paste(rp$notes, collapse = " | "))
+ok("the PDF exists and is non-empty", file.exists(fp) && file.size(fp) > 0)
+ok("the PDF has a valid %PDF header", file_looks_like(fp, "pdf"))
+ok("the device that wrote it is named", !is.na(rp$device), rp$device)
+if (isTRUE(rp$fallback)) cat("       (fell back to", rp$device, "- cairo is unavailable here)\n")
+unlink(fp)
+
+fpng <- tempfile(fileext = ".png")
+rpng <- ggsave_checked(fpng, pinned$loud, "png", width = geos$loud$width,
+                       height = geos$loud$height, units = "in", dpi = 100)
+ok("a PNG is produced", isTRUE(rpng$ok) && file_looks_like(fpng, "png"))
+unlink(fpng)
+
+# A device chain that cannot work must fail loudly and leave NOTHING behind,
+# rather than a zero-byte file the bundle would happily ship.
+fbad <- tempfile(fileext = ".pdf")
+rbad <- ggsave_checked(fbad, pinned$loud, "pdf", width = geos$loud$width,
+                       height = geos$loud$height, units = "in", dpi = 100,
+                       devices = list(broken = function(...) stop("no device here")))
+ok("a dead device chain reports failure", isFALSE(rbad$ok))
+ok("and leaves no zero-byte file behind", !file.exists(fbad))
+ok("and says why", grepl("no device here", paste(rbad$notes, collapse = " "), fixed = TRUE))
+
+ok("a truncated file fails the header check",
+   { ft <- tempfile(fileext = ".pdf"); writeLines("not a pdf", ft)
+     res <- file_looks_like(ft, "pdf"); unlink(ft); isFALSE(res) })
+ok("an empty file fails the size check",
+   { ft <- tempfile(fileext = ".pdf"); file.create(ft)
+     res <- file_looks_like(ft, "pdf"); unlink(ft); isFALSE(res) })
+
 cat(sprintf("\n%s\n", strrep("-", 60)))
 if (fails == 0) cat("ALL PANEL SIZE TESTS PASSED\n") else {
   cat(sprintf("%d TEST(S) FAILED\n", fails)); quit(status = 1)

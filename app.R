@@ -362,18 +362,55 @@ okabe_ito <- c(
 )
 
 # Human-readable label for the variation/error-bar summary, for figure captions.
-error_type_caption <- function(error_type, variation_display = "errorbar") {
+#
+# CPS-2: the caption has to name the SCALE the summary was taken on, not just
+# the statistic. "Mean ± SD" under a log10 analysis is ambiguous between the
+# arithmetic mean of the counts and the geometric mean, and those differ by
+# 2.35x on a perfectly ordinary three-replicate CFU cell -- so the scale is
+# stated wherever the summary is a log-scale one.
+error_type_caption <- function(error_type, variation_display = "errorbar",
+                               y_mode = "log10", is_survival = FALSE) {
   if (identical(variation_display, "none")) return(NULL)
-  descr <- switch(
-    error_type %||% "SD",
-    "SD" = "error bars show mean ± SD",
-    "SEM" = "error bars show mean ± SEM",
-    "95% CI" = "error bars show mean with 95% CI",
+  error_type <- error_type %||% "SD"
+  # A survival figure already plots a log10 ratio and says so on the axis.
+  scale_txt <- if (isTRUE(is_survival)) ""
+               else if (identical(y_mode, "log10")) " of log10(CFU)"
+               else if (identical(y_mode, "raw_log_axis")) " of log10(CFU)"
+               else ""
+  if (identical(y_mode, "raw_log_axis") && !isTRUE(is_survival)) {
+    # The plotted centre is 10^mean(log10), i.e. the geometric mean, and the
+    # interval is multiplicative rather than symmetric.
+    return(switch(
+      error_type,
+      "SD" = "bars show the geometric mean, error bars the geometric mean x/÷ 10^SD of log10(CFU)",
+      "SEM" = "bars show the geometric mean, error bars the geometric mean x/÷ 10^SEM of log10(CFU)",
+      "95% CI" = "bars show the geometric mean with a 95% CI computed on log10(CFU) and back-transformed",
+      "IQR" = "intervals show the median and IQR (Q1-Q3) computed on log10(CFU) and back-transformed",
+      "Range (min-max)" = "intervals show the min-max range of the replicates",
+      paste0("error bars: ", error_type, " computed on log10(CFU) and back-transformed")
+    ))
+  }
+  switch(
+    error_type,
+    "SD" = paste0("error bars show mean ± SD", scale_txt),
+    "SEM" = paste0("error bars show mean ± SEM", scale_txt),
+    "95% CI" = paste0("error bars show mean with 95% CI", scale_txt),
     "IQR" = "intervals show median IQR (Q1-Q3)",
     "Range (min-max)" = "intervals show min-max range",
     paste0("error bars: ", error_type)
   )
-  descr
+}
+
+# The emmeans-based methods, and the family-wise adjustment each one asks
+# emmeans itself to apply. CPS-7: an ANOVA table displayed next to a
+# star-annotated figure reads as protected post-hoc testing, so the app now
+# offers the classical post-hoc procedures instead of only implying them.
+is_emmeans_method <- function(m) {
+  isTRUE((m %||% "") %in% c("emmeans", "emmeans_tukey", "emmeans_dunnett"))
+}
+
+emmeans_adjust_for <- function(m) {
+  switch(m %||% "", "emmeans_tukey" = "tukey", "emmeans_dunnett" = "dunnettx", "none")
 }
 
 # Names the statistical test + multiple-comparison correction for figure captions.
@@ -384,8 +421,15 @@ stats_caption <- function(stats_method, p_adjust) {
     "student" = "Student t-test on log10(CFU)",
     "wilcoxon" = "Wilcoxon rank-sum test on log10(CFU)",
     "emmeans" = "linear model + emmeans on log10(CFU)",
+    "emmeans_tukey" = "linear model + emmeans on log10(CFU), Tukey HSD post-hoc",
+    "emmeans_dunnett" = "linear model + emmeans on log10(CFU), Dunnett post-hoc versus the control",
     "statistical test"
   )
+  # Tukey and Dunnett carry their own family-wise control; reporting a second
+  # correction on top would describe a procedure that did not run.
+  if (is_emmeans_method(stats_method) && !identical(emmeans_adjust_for(stats_method), "none")) {
+    return(paste0(test_txt, "; family-wise error controlled by that procedure"))
+  }
   corr_txt <- switch(
     p_adjust %||% "BH",
     "BH" = "Benjamini-Hochberg FDR",
@@ -419,11 +463,20 @@ format_q <- function(p) {
 prep_cfu_data <- function(raw, mapping, treatment_unit = "", time_unit = "min", append_treatment_unit = TRUE, append_time_unit = TRUE) {
   names(raw) <- clean_names(names(raw))
 
+  # Which column, if any, identifies the BIOLOGICAL replicate -- the independent
+  # unit the statistics are entitled to count. NA means the user declared that
+  # this file has none, in which case every row is a technical measurement and
+  # the app has to say so rather than counting wells as replicates.
+  bio_col <- mapping$bio_replicate
+  bio_col <- if (is.null(bio_col) || length(bio_col) != 1 || is.na(bio_col) ||
+                 !nzchar(bio_col) || !(bio_col %in% names(raw))) NA_character_ else bio_col
+
   out <- tibble(
     sample = as.character(raw[[mapping$sample]]),
     concentration_raw = as.character(raw[[mapping$concentration]]),
     time_raw = as.character(raw[[mapping$time]]),
     replicate = as.character(raw[[mapping$replicate]]),
+    bio_replicate = if (is.na(bio_col)) NA_character_ else as.character(raw[[bio_col]]),
     cfu = suppressWarnings(as.numeric(raw[[mapping$cfu]]))
   ) %>%
     filter(!is.na(sample), !is.na(concentration_raw), !is.na(time_raw), !is.na(cfu), cfu > 0)
@@ -447,7 +500,76 @@ prep_cfu_data <- function(raw, mapping, treatment_unit = "", time_unit = "min", 
         labels = time_info$labels
       ),
       replicate = factor(replicate),
+      # Blank cells in a declared biological-replicate column are missing, not a
+      # group of their own: a well that does not say which biological replicate
+      # it belongs to cannot be counted as one.
+      bio_replicate = ifelse(is.na(bio_replicate) | !nzchar(trimws(bio_replicate)),
+                             NA_character_, trimws(bio_replicate)),
       log10_cfu = log10(cfu)
+    )
+}
+
+# ---------------------------------------------------------------------------
+# The unit of replication
+# ---------------------------------------------------------------------------
+# A CFU experiment produces two kinds of repeat measurement and they are not
+# interchangeable. Plating the same culture four times measures the plating;
+# growing four cultures measures the biology. Only the second is an independent
+# replicate, and only the second may be counted as n.
+#
+# Before this was enforced, every unpaired test pulled EVERY ROW in a group, so
+# three biological replicates plated four times each entered a t-test as n = 12
+# on 22 df. On a 0.4-log difference that is p = 9e-11 where the honest test on
+# the three biological means gives p = 0.008 -- seven orders of magnitude of
+# false confidence, from a design the app itself flags in the QC tab as
+# "duplicate replicate labels".
+#
+# The paired survival path always collapsed within a replicate label first, so
+# the two paths disagreed by construction about what a replicate was. They no
+# longer do.
+has_biological_replicates <- function(dat) {
+  is.data.frame(dat) && "bio_replicate" %in% names(dat) &&
+    nrow(dat) > 0 && any(!is.na(dat$bio_replicate))
+}
+
+replication_unit_label <- function(dat) {
+  if (has_biological_replicates(dat)) "biological replicate"
+  else "technical replicates only (no biological replicate column identified)"
+}
+
+# Collapse technical measurements to one value per biological replicate, on the
+# log10 scale -- the geometric mean of the plates, which is the quantity every
+# test in this app analyses. A survival frame arrives already collapsed (its own
+# pairing step does it), and a frame with no declared biological replicate
+# column is returned untouched so the caller can label the result honestly
+# rather than silently inventing a unit of replication.
+aggregate_biological_replicates <- function(dat) {
+  if (!is.data.frame(dat) || nrow(dat) == 0) return(dat)
+  if (is_survival_frame(dat)) return(dat)
+  if (!has_biological_replicates(dat)) {
+    if (!"n_technical" %in% names(dat)) dat$n_technical <- 1L
+    return(dat)
+  }
+  keep_first <- intersect(c("concentration_raw", "time_raw", "concentration_value",
+                            "time_value"), names(dat))
+  has_lod <- "lod_substituted" %in% names(dat)
+  dat %>%
+    filter(!is.na(bio_replicate)) %>%
+    group_by(sample, concentration_label, time_min, bio_replicate) %>%
+    summarize(
+      n_technical = dplyr::n(),
+      log10_cfu = mean(log10_cfu),
+      # A biological replicate is censored if ANY of its plates was, so the flag
+      # cannot be carried by first().
+      lod_substituted = if (has_lod) any(lod_substituted, na.rm = TRUE) else FALSE,
+      across(all_of(keep_first), ~ dplyr::first(.x)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      cfu = 10^log10_cfu,
+      # The biological replicate IS the replicate from here on, so anything that
+      # pairs or joins on `replicate` pairs on the right unit.
+      replicate = factor(bio_replicate)
     )
 }
 
@@ -468,21 +590,40 @@ summary_cfu <- function(dat) {
 }
 
 qc_summary <- function(dat) {
-  dat %>%
+  # Repeated replicate labels used to be flagged only as suspicious ("duplicate
+  # replicate labels") while every test went on counting them as independent.
+  # Now they are the documented way to enter technical repeats, so this table
+  # reports how many of each unit a cell holds and what n the tests will use.
+  has_bio <- "bio_replicate" %in% names(dat) && any(!is.na(dat$bio_replicate))
+  out <- dat %>%
     group_by(sample, concentration_label, time_min) %>%
     summarize(
+      biological_replicates = if (has_bio) dplyr::n_distinct(bio_replicate[!is.na(bio_replicate)]) else NA_integer_,
       replicates = n_distinct(replicate),
       rows = n(),
       min_cfu = min(cfu, na.rm = TRUE),
       max_cfu = max(cfu, na.rm = TRUE),
       mean_log10_cfu = mean(log10_cfu, na.rm = TRUE),
       sd_log10_cfu = sd(log10_cfu, na.rm = TRUE),
-      flag = case_when(
-        replicates < 2 ~ "Check: fewer than 2 replicates",
-        rows != replicates ~ "Check: duplicate replicate labels",
-        TRUE ~ "OK"
-      ),
       .groups = "drop"
+    )
+  # has_bio is a scalar, so this is an if/else and not a case_when branch --
+  # dplyr 1.2 deprecated scalar-LHS case_when for exactly this.
+  if (!has_bio) {
+    out$unit_of_replication <- "technical only"
+    out$flag <- "No biological replicate column identified: these rows are measurements, not replicates"
+    return(out)
+  }
+  out %>%
+    mutate(
+      unit_of_replication = "biological replicate",
+      flag = case_when(
+        biological_replicates < 2 ~ "Check: fewer than 2 biological replicates",
+        rows > biological_replicates ~ paste0(
+          rows, " technical measurements collapsed to ", biological_replicates,
+          " biological replicates before testing"),
+        TRUE ~ "OK"
+      )
     )
 }
 
@@ -510,8 +651,52 @@ model_formula <- function(dat) {
   }
 }
 
-run_anova <- function(dat) {
+# What the pairwise table beside the omnibus table actually is. CPS-7: BH across
+# a set of two-sample t-tests is a legitimate standalone procedure, but a reader
+# who sees an ANOVA next to a star-annotated figure will assume protected
+# post-hoc testing unless told otherwise. So the table says which it is.
+pairwise_family_note <- function(stats_method) {
+  switch(
+    stats_method %||% "welch",
+    "emmeans_tukey" = "The Statistics tab reports Tukey HSD contrasts from THIS model: a protected post-hoc family.",
+    "emmeans_dunnett" = "The Statistics tab reports Dunnett contrasts against the control from THIS model: a protected post-hoc family.",
+    "emmeans" = "The Statistics tab reports unadjusted emmeans contrasts from THIS model, corrected by the app's own multiple-comparison setting.",
+    "wilcoxon" = "The Statistics tab reports pairwise Wilcoxon rank-sum tests, corrected across that family. They are the nonparametric partner of this omnibus test, not a Dunn post-hoc.",
+    "The Statistics tab is an INDEPENDENT family of two-sample t-tests, not a post-hoc of this table. Its correction is applied across that family alone, and a non-significant omnibus does not gate it."
+  )
+}
+
+run_anova <- function(dat, stats_method = "welch") {
+  # CPS-1: the omnibus model gets the same unit of replication as everything
+  # else, or its residual df counts plates and its F is as inflated as the
+  # pairwise tests used to be.
+  unit <- replication_unit_label(dat)
+  dat <- aggregate_biological_replicates(dat)
   if (nrow(dat) < 3 || n_distinct(dat$log10_cfu) < 2) return(tibble())
+
+  # CPS-7: a rank-based pairwise family gets a rank-based omnibus. An F test
+  # printed above a table of Wilcoxon tests describes a different procedure from
+  # the one that produced the stars.
+  if (identical(stats_method, "wilcoxon")) {
+    terms <- c("sample", "concentration_label", "time_min")
+    usable <- terms[vapply(terms, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
+    if (length(usable) == 0) return(tibble())
+    grp <- interaction(dat[usable], drop = TRUE)
+    if (nlevels(grp) < 2) return(tibble())
+    kw <- tryCatch(stats::kruskal.test(dat$log10_cfu, grp), error = function(e) NULL)
+    if (is.null(kw)) return(tibble())
+    return(tibble(
+      term = paste(usable, collapse = " x "),
+      statistic = signif(unname(kw$statistic), 4),
+      df = unname(kw$parameter),
+      p.value = signif(unname(kw$p.value), 4),
+      ss_type = "Kruskal-Wallis rank sum test on log10(CFU)",
+      unit_of_replication = unit,
+      n_units = nrow(dat),
+      pairwise_family = pairwise_family_note(stats_method)
+    ))
+  }
+
   fit <- lm(model_formula(dat), data = dat)
   # CFU designs are routinely unbalanced by the time they reach the ANOVA: the
   # cfu > 0 filter removes whole replicates from some cells. Type I sequential
@@ -529,7 +714,10 @@ run_anova <- function(dat) {
   out %>%
     mutate(
       across(where(is.numeric), ~ signif(.x, 4)),
-      ss_type = ss_type
+      ss_type = ss_type,
+      unit_of_replication = unit,
+      n_units = nrow(dat),
+      pairwise_family = pairwise_family_note(stats_method)
     )
 }
 
@@ -592,6 +780,7 @@ empty_two_group_result <- function(a, b, note, paired = FALSE, n_matched = NA_in
   est <- mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE)
   if (!is.finite(est)) est <- NA_real_
   tibble(
+    n_a = length(a), n_b = length(b),
     p.value = NA_real_, statistic = NA_real_, parameter = NA_real_,
     estimate = est,
     conf.low = NA_real_, conf.high = NA_real_,
@@ -653,6 +842,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal,
                                     paired = TRUE, n_matched = mp$n_matched))
     }
     return(tibble(
+      n_a = length(a), n_b = length(b),
       p.value = unname(tt$p.value),
       statistic = unname(tt$statistic),
       parameter = unname(tt$parameter),
@@ -691,6 +881,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal,
       notes <- c(notes, "Ties present, so the normal approximation replaced the exact test.")
     }
     return(tibble(
+      n_a = length(a), n_b = length(b),
       p.value = unname(test$p.value),
       statistic = unname(test$statistic),
       parameter = NA_real_,
@@ -716,6 +907,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal,
   }
 
   tibble(
+    n_a = length(a), n_b = length(b),
     p.value = unname(test$p.value),
     statistic = unname(test$statistic),
     parameter = unname(test$parameter),
@@ -738,6 +930,11 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
   # NOTE the distinct name: `paired` is also a column in the result, and inside
   # mutate() the data mask would shadow the argument.
   use_paired <- isTRUE(paired) && !identical(test_family, "wilcoxon")
+
+  # CPS-1: one value per biological replicate BEFORE anything is compared.
+  # A survival frame is already at that unit and passes through untouched.
+  unit <- replication_unit_label(dat)
+  dat <- aggregate_biological_replicates(dat)
 
   if (comparison == "sample") {
     if (n_distinct(dat$sample) < 2) return(tibble(message = "Sample comparison requires at least two samples."))
@@ -849,6 +1046,8 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
              else if (use_paired) "Paired t-test on log10(CFU), matched by replicate"
              else if (var_equal) "Student t-test on log10(CFU)"
              else "Welch t-test on log10(CFU)",
+      # What n counts. Read this column before quoting an n in a manuscript.
+      unit_of_replication = unit,
       estimate_log10_difference = estimate,
       # The test runs on log10, so the CI transforms straight into a fold-change
       # interval -- the scale the result is actually reported on.
@@ -858,6 +1057,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
     ) %>%
     select(
       comparison_family, test, contrast, sample, concentration_label, time_min,
+      unit_of_replication, n_a, n_b,
       estimate_log10_difference, conf.low, conf.high, fold_change, fold_change_low, fold_change_high,
       hedges_g, d_z, paired, n_matched, statistic, parameter, p.value, q.value,
       significance, p_adjust_method, adjustment_scope, message, everything()
@@ -976,7 +1176,24 @@ run_survival_stats <- function(surv, comparison, p_adjust, adjustment_scope,
     )
 }
 
-run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
+run_contrast <- function(dat, comparison, p_adjust, control_concentration,
+                         adjustment_scope = "global", emm_adjust = "none") {
+  # CPS-1: the linear model is fitted to one row per biological replicate, not
+  # one row per plate, so its residual df is the df the design really has.
+  unit <- replication_unit_label(dat)
+  dat <- aggregate_biological_replicates(dat)
+  # Dunnett's procedure is defined for a set of treatment-versus-one-control
+  # contrasts. Asking for it on an all-pairs family would label the output with
+  # a procedure that did not run, so it degrades to no family-wise adjustment
+  # and says so on every row.
+  dunnett_note <- NA_character_
+  if (identical(emm_adjust, "dunnettx") && !identical(comparison, "concentration_vs_control")) {
+    emm_adjust <- "none"
+    dunnett_note <- paste(
+      "Dunnett is defined only against a single control, so it was not applied to this",
+      "all-pairs family; the app's own multiple-comparison correction was used instead."
+    )
+  }
   if (nrow(dat) < 3 || n_distinct(dat$log10_cfu) < 2) return(tibble())
   if (comparison == "sample" && n_distinct(dat$sample) < 2) return(tibble(message = "Sample comparison requires at least two samples."))
   if (comparison == "time" && n_distinct(dat$time_min) < 2) return(tibble(message = "Timepoint comparison requires at least two timepoints."))
@@ -985,6 +1202,21 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
   }
 
   fit <- lm(model_formula(dat), data = dat)
+
+  # CPS-5: which variables emmeans conditions on. Without them the result frame
+  # carries no `panel` column, so adjust_stats()' within_panel branch could not
+  # fire even when the user asked for it -- the sidebar control was inert for
+  # this method and the correction was silently global.
+  # Derived here rather than read back out of the branches below: those run
+  # inside tryCatch(), where `<<-` would write past this frame.
+  by_candidates <- switch(
+    comparison,
+    sample = c("concentration_label", "time_min"),
+    time = c("sample", "concentration_label"),
+    c("sample", "time_min")
+  )
+  used_by_vars <- by_candidates[vapply(by_candidates,
+                                       function(z) n_distinct(dat[[z]]) > 1, logical(1))]
 
   result <- tryCatch({
     if (comparison == "sample") {
@@ -995,7 +1227,7 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
       } else {
         ~ sample
       }
-      pairs(emmeans(fit, spec), adjust = "none")
+      pairs(emmeans(fit, spec), adjust = emm_adjust)
     } else if (comparison == "time") {
       by_vars <- c("sample", "concentration_label")
       by_vars <- by_vars[vapply(by_vars, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
@@ -1004,7 +1236,7 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
       } else {
         ~ time_min
       }
-      pairs(emmeans(fit, spec), adjust = "none")
+      pairs(emmeans(fit, spec), adjust = emm_adjust)
     } else if (comparison == "concentration_vs_control") {
       by_vars <- c("sample", "time_min")
       by_vars <- by_vars[vapply(by_vars, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
@@ -1019,7 +1251,7 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
       if (is.na(control_idx)) {
         stop("The selected control treatment is not present in the data.", call. = FALSE)
       }
-      contrast(emm, method = "trt.vs.ctrl", ref = control_idx, adjust = "none")
+      contrast(emm, method = "trt.vs.ctrl", ref = control_idx, adjust = emm_adjust)
     } else {
       by_vars <- c("sample", "time_min")
       by_vars <- by_vars[vapply(by_vars, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
@@ -1028,7 +1260,7 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
       } else {
         ~ concentration_label
       }
-      pairs(emmeans(fit, spec), adjust = "none")
+      pairs(emmeans(fit, spec), adjust = emm_adjust)
     }
   }, error = function(e) {
     tibble(message = conditionMessage(e))
@@ -1038,11 +1270,38 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
   if (nrow(out) == 0) return(out)
   if (!"p.value" %in% names(out)) return(out)
 
-  adjust_stats(out, p_adjust, "global") %>%
+  # The `by` variables ARE the panels: one comparison family per combination.
+  panel_vars <- intersect(used_by_vars, names(out))
+  if (length(panel_vars) > 0) {
+    out$panel <- do.call(paste, c(lapply(panel_vars, function(v) as.character(out[[v]])),
+                                  list(sep = " | ")))
+  } else {
+    # A single family. "Within each panel" and "across the table" are then the
+    # same thing, and saying so is better than silently relabelling the scope.
+    out$panel <- "all comparisons"
+  }
+
+  # CPS-7: when emmeans applied a family-wise adjustment of its own (Tukey,
+  # Dunnett), its p.value column is ALREADY adjusted. Running the app's
+  # correction over it again would be a double correction, so the second pass is
+  # disabled and the table records which procedure actually ran.
+  emm_adjusted <- !identical(emm_adjust, "none")
+  scope_used <- if (emm_adjusted) "emmeans family" else adjustment_scope
+
+  adjust_stats(out, if (emm_adjusted) "none" else p_adjust, scope_used) %>%
     mutate(
-      test = "Linear model + emmeans on log10(CFU)",
+      test = paste0(
+        "Linear model + emmeans on log10(CFU)",
+        switch(emm_adjust,
+               "tukey" = ", Tukey HSD across all pairs within each panel",
+               "dunnettx" = ", Dunnett versus the control within each panel",
+               "")
+      ),
+      unit_of_replication = unit,
+      emmeans_adjust = emm_adjust,
       estimate_log10_difference = estimate,
-      fold_change = 10^estimate
+      fold_change = 10^estimate,
+      message = if (is.na(dunnett_note)) NA_character_ else dunnett_note
     )
 }
 
@@ -1262,11 +1521,30 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type, clamp_zero = TRUE) 
     c("concentration_label", "sample", "time_min")
   )
 
-  dat %>%
-    mutate(plot_y = if (y_mode == "log10") log10_cfu else cfu) %>%
+  # CPS-2. Both y-axis modes plot the SAME quantity on the SAME log spacing and
+  # every test in this app runs on log10(CFU) -- so the summary is computed on
+  # log10 in both, and `raw_log_axis` merely back-transforms the result for
+  # display. Summarising on the raw scale instead (what this used to do) put the
+  # bar at the ARITHMETIC mean while the caption claimed a log10 analysis: on
+  # 1e6/1e7/1e8 that draws the bar at 2.35x the geometric mean the test
+  # analysed, and mean - SD came out NEGATIVE and was silently clamped to
+  # machine epsilon, drawing a whisker from the floor of the axis across
+  # twenty-odd decades. Back-transforming a log-scale interval instead gives a
+  # multiplicative interval, which is strictly positive by construction and is
+  # the interval the statistics correspond to.
+  on_log <- y_mode %in% c("log10", "raw_log_axis")
+  back_transform <- identical(y_mode, "raw_log_axis")
+  # Whether n can be quoted as independent replicates -- see CPS-1. A survival
+  # frame has no bio_replicate column because pairing already reduced it to one
+  # row per replicate, and there `n` counts complete pairs.
+  has_bio <- "bio_replicate" %in% names(dat) && any(!is.na(dat$bio_replicate))
+
+  out <- dat %>%
+    mutate(plot_y = if (on_log) log10_cfu else cfu) %>%
     group_by(across(all_of(group_cols))) %>%
     summarize(
       n = n(),
+      n_bio = if (has_bio) dplyr::n_distinct(bio_replicate[!is.na(bio_replicate)]) else NA_integer_,
       mean_y = mean(plot_y, na.rm = TRUE),
       median_y = median(plot_y, na.rm = TRUE),
       sd_y = sd(plot_y, na.rm = TRUE),
@@ -1288,17 +1566,37 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type, clamp_zero = TRUE) 
              else mean_y - err_y,
       ymax = if (error_type == "IQR") q3_y
              else if (error_type == "Range (min-max)") max_y
-             else mean_y + err_y,
-      # A log10 CFU count cannot go below 0, so clamping the lower whisker there
-      # is right for absolute counts. A log10 SURVIVAL RATIO is signed -- 0 is
-      # "no change", not a floor -- and clamping it would draw a group that lost
-      # a log as though its error bar reached no-change. Hence clamp_zero.
-      # The raw-log-axis floor is unconditional: that axis is log-transformed
-      # and cannot take zero whatever the quantity means.
-      ymin = if (y_mode == "raw_log_axis") pmax(ymin, .Machine$double.eps)
-             else if (isTRUE(clamp_zero)) pmax(ymin, 0)
-             else ymin
+             else mean_y + err_y
     )
+
+  if (back_transform) {
+    # 10^ of a log-scale summary: the centre is the geometric mean and the
+    # interval is multiplicative (centre x/÷ 10^err). Every value is > 0, so
+    # nothing needs clamping and nothing is silently moved.
+    out <- out %>%
+      mutate(
+        across(c(mean_y, median_y, q1_y, q3_y, min_y, max_y, ymin, ymax), ~ 10^.x),
+        # Kept in log10 units, which is the only scale on which they are
+        # defined; the multiplicative equivalent is the factor below.
+        err_factor = 10^err_y,
+        summary_scale = "log10, back-transformed",
+        centre_statistic = "geometric mean"
+      )
+  } else {
+    out <- out %>%
+      mutate(
+        # A log10 CFU count cannot go below 0, so clamping the lower whisker
+        # there is right for absolute counts. A log10 SURVIVAL RATIO is signed
+        # -- 0 is "no change", not a floor -- and clamping it would draw a group
+        # that lost a log as though its error bar reached no-change. Hence
+        # clamp_zero.
+        ymin = if (isTRUE(clamp_zero)) pmax(ymin, 0) else ymin,
+        err_factor = NA_real_,
+        summary_scale = if (on_log) "log10" else "raw",
+        centre_statistic = if (on_log) "mean of log10" else "arithmetic mean"
+      )
+  }
+  out
 }
 
 # Stable identity for one statistic label, so a nudge the user applies by
@@ -1608,8 +1906,17 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   # When every group has the same n, one phrase in the caption says it better
   # than a label under every bar. Per-bar labels are only worth their clutter
   # when n actually varies -- which, after the CFU<=0 filter, it often does.
-  group_ns <- sumdat$n[is.finite(sumdat$n)]
+  # CPS-1: the caption quotes the unit the STATISTICS count. When technical
+  # plates were collapsed, n_bio is smaller than the row count and n_bio is the
+  # honest number; when no biological replicate column was identified, the
+  # caption has to say that the wells are technical and n is not a replicate n.
+  bio_ns <- if ("n_bio" %in% names(sumdat)) sumdat$n_bio else rep(NA_integer_, nrow(sumdat))
+  have_bio <- length(bio_ns) > 0 && any(!is.na(bio_ns))
+  group_ns <- if (have_bio) bio_ns[is.finite(bio_ns)] else sumdat$n[is.finite(sumdat$n)]
+  wells_per_group <- sumdat$n[is.finite(sumdat$n)]
   n_is_constant <- length(group_ns) > 0 && length(unique(group_ns)) == 1
+  # The n row under the axis must show the same unit the caption quotes.
+  sumdat$n_label <- if (have_bio) sumdat$n_bio else sumdat$n
   draw_n_labels <- isTRUE(input$show_n_labels) && length(group_ns) > 0 && !n_is_constant
 
   # The n row is drawn outside the panel, so it has to be placed past whatever
@@ -1626,7 +1933,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   n_row_offset_pt <- 5 + tick_extent_pt + 4
   # On a survival figure n counts PAIRS, not wells: a well whose partner was
   # lost contributes nothing, so calling these "replicates" would overstate it.
-  n_unit <- if (is_survival) "complete pairs" else "replicates"
+  n_unit <- if (is_survival) "complete pairs"
+            else if (have_bio) "biological replicates"
+            else "technical replicates only - no biological replicate column was identified, so this n is not a replicate n"
   n_caption <- if (length(group_ns) == 0) {
     ""
   } else if (n_is_constant) {
@@ -1635,6 +1944,18 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     paste0("n = ", min(group_ns), "-", max(group_ns), " ", n_unit, " per group (n row under the axis)")
   } else {
     paste0("n = ", min(group_ns), "-", max(group_ns), " ", n_unit, " per group")
+  }
+  # Say how many plates went into each of those replicates, when it is more
+  # than one -- otherwise a reader counting points on the figure and the n in
+  # the caption gets two different numbers with no explanation.
+  if (have_bio && length(wells_per_group) == length(group_ns) &&
+      length(wells_per_group) > 0 && any(wells_per_group > group_ns)) {
+    n_caption <- paste0(
+      n_caption, " (",
+      if (length(unique(wells_per_group)) == 1) wells_per_group[1]
+      else paste0(min(wells_per_group), "-", max(wells_per_group)),
+      " technical measurements, averaged on the log10 scale before testing)"
+    )
   }
 
   # Auto methods caption: names error-bar type, replicate n, and (when stats are
@@ -1646,7 +1967,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
              input$surv_baseline %||% "baseline",
              ", paired within each replicate; the reference line is no change")
     } else NULL
-    caption_parts <- c(error_type_caption(error_type, variation_display),
+    caption_parts <- c(error_type_caption(error_type, variation_display, y_mode, is_survival),
                        survival_caption, n_caption)
     resolved_cmp <- input$comparison %||% "auto"
     if (identical(resolved_cmp, "auto")) resolved_cmp <- resolve_auto_comparison(plot_mode)
@@ -1857,9 +2178,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     }
     if (!is.finite(n_y)) return(plot_obj)
     n_mapping <- if (is.null(group_var)) {
-      aes(x = concentration_label, y = n_y, label = n)
+      aes(x = concentration_label, y = n_y, label = n_label)
     } else {
-      aes(x = concentration_label, y = n_y, label = n, group = .data[[group_var]])
+      aes(x = concentration_label, y = n_y, label = n_label, group = .data[[group_var]])
     }
     plot_obj + geom_text(
       data = sumdat,
@@ -2722,8 +3043,11 @@ ui <- fluidPage(
         "Welch t-test on log10(CFU)" = "welch",
         "Student t-test on log10(CFU)" = "student",
         "Wilcoxon rank-sum on log10(CFU)" = "wilcoxon",
-        "Linear model + emmeans" = "emmeans"
+        "Linear model + emmeans (app-side correction)" = "emmeans",
+        "Linear model + emmeans, Tukey HSD post-hoc" = "emmeans_tukey",
+        "Linear model + emmeans, Dunnett vs control" = "emmeans_dunnett"
       ), selected = "welch"),
+      helpText("Tukey and Dunnett are classical post-hoc procedures on the model the ANOVA tab reports, and they control the family-wise error themselves -- the correction setting below is then ignored and the table says so. The t-test and rank-test families are independent of that ANOVA; the ANOVA tab spells out which relationship applies."),
       helpText("The rank test drops the normality assumption, but it also has very little power at n=3: with three versus three replicates the smallest two-sided p it can return is 0.1, so nothing can reach 0.05. The Statistics tab flags this per row."),
       selectInput("p_adjust", "Multiple-comparison correction", choices = c("BH", "holm", "bonferroni", "none"), selected = "BH"),
       selectInput("p_adjust_scope", "Correction scope", choices = c(
@@ -2944,7 +3268,12 @@ ui <- fluidPage(
           downloadButton("download_qc", "Download QC CSV")
         ),
         tabPanel("Statistics", br(), DTOutput("stats_table"), downloadButton("download_stats", "Download current stats CSV")),
-        tabPanel("ANOVA", br(), DTOutput("anova_table"), downloadButton("download_anova", "Download ANOVA CSV"))
+        tabPanel(
+          "ANOVA", br(),
+          # CPS-7: state the relationship rather than letting the layout imply one.
+          div(class = "lab-tip", htmlOutput("omnibus_relationship")),
+          DTOutput("anova_table"), downloadButton("download_anova", "Download ANOVA CSV")
+        )
       )
     )
   )
@@ -2984,11 +3313,18 @@ server <- function(input, output, session) {
 
   column_mapping <- reactive({
     req(input$col_sample, input$col_conc, input$col_time, input$col_rep, input$col_cfu)
+    # Resolve the two sentinels to a real column name or to NA. Everything
+    # downstream sees only "a column, or none".
+    bio <- input$col_bio_rep %||% "__same__"
+    bio <- if (identical(bio, "__none__")) NA_character_
+           else if (identical(bio, "__same__")) input$col_rep
+           else bio
     list(
       sample = input$col_sample,
       concentration = input$col_conc,
       time = input$col_time,
       replicate = input$col_rep,
+      bio_replicate = bio,
       cfu = input$col_cfu
     )
   })
@@ -3246,6 +3582,25 @@ server <- function(input, output, session) {
       selectInput("col_conc", "Treatment/dose/condition column", choices = cols, selected = guess_column(cols, c("treatment", "condition", "dose", "concentration", "inducer", "induction", "iptg", "arabinose", "atc"))),
       selectInput("col_time", "Time column", choices = cols, selected = guess_column(cols, c("time", "timepoint", "minutes", "hours"))),
       selectInput("col_rep", "Replicate column", choices = cols, selected = guess_column(cols, c("replicate", "rep", "biorep", "trial"))),
+      # The unit of replication is a claim about how the experiment was run, and
+      # the CSV cannot settle it: four rows sharing a replicate label are four
+      # plates of one culture in some files and four cultures in others. The app
+      # refuses to guess, because guessing wrong multiplies n by the number of
+      # plates and moves every p-value with it.
+      selectInput(
+        "col_bio_rep", "Biological replicate column",
+        choices = c(
+          "Same as the replicate column above" = "__same__",
+          "None in this file - technical replicates only" = "__none__",
+          setNames(as.list(cols), cols)
+        ),
+        selected = "__same__"
+      ),
+      helpText(
+        "Which column identifies INDEPENDENT cultures. Rows that share a value here are ",
+        "technical repeats of one biological replicate and are averaged on the log10 scale ",
+        "before any test, so n counts cultures, not plates."
+      ),
       selectInput("col_cfu", "CFU column", choices = cols, selected = guess_column(cols, c("cfu", "cfuperml", "cfuml", "count", "colonies", "titer", "titre")))
     )
   })
@@ -3488,6 +3843,27 @@ server <- function(input, output, session) {
     } else {
       div(class = "lab-tip ok", "Visible groups have replicate data for SD/error bars and replicate-level statistics.")
     }
+    # CPS-1. The single most consequential thing the app cannot infer from the
+    # file: whether the repeated measurements are independent. Say it loudly,
+    # because everything downstream -- n, df, every p-value -- depends on it.
+    rep_tip <- if (!has_biological_replicates(dat)) {
+      div(
+        class = "lab-tip warn",
+        tags$strong("Technical replicates only. "),
+        "No biological replicate column is identified, so every row is treated as a ",
+        "separate measurement of the same thing. Tests, n and error bars are labelled ",
+        "\"technical replicates only\" and must not be reported as replicate-level ",
+        "statistics. Set the biological replicate column in the Data tab to fix this."
+      )
+    } else {
+      collapsed <- nrow(dat) - nrow(aggregate_biological_replicates(dat))
+      if (collapsed > 0) {
+        div(class = "lab-tip ok", sprintf(
+          "%d technical measurement(s) are averaged on the log10 scale into their biological replicate before any test, so n counts cultures rather than plates.",
+          collapsed
+        ))
+      } else NULL
+    }
     # Rows the pipeline discards never reach the figure, the summary, or the
     # tests. Dropping them quietly makes n look larger than it is.
     drop <- dropped_rows()
@@ -3568,6 +3944,7 @@ server <- function(input, output, session) {
           span(class = "metric-note", "Range per visible group")
         )
       ),
+      rep_tip,
       tip,
       drop_tip,
       pair_tip,
@@ -3649,13 +4026,18 @@ server <- function(input, output, session) {
   survival_pairs <- reactive({
     if (!identical(input$plot_mode, "survival")) return(NULL)
     req(input$surv_baseline, input$surv_readout)
-    pair_survival(filtered_data(), input$surv_baseline, input$surv_readout)
+    # Pair at the biological unit. pair_survival() collapses technical repeats
+    # within a replicate label already; aggregating first is what makes that
+    # label the BIOLOGICAL replicate when the user mapped a separate column.
+    pair_survival(aggregate_biological_replicates(filtered_data()),
+                  input$surv_baseline, input$surv_readout)
   })
 
   survival_qc <- reactive({
     if (!identical(input$plot_mode, "survival")) return(NULL)
     req(input$surv_baseline, input$surv_readout)
-    survival_pairing_qc(filtered_data(), input$surv_baseline, input$surv_readout)
+    survival_pairing_qc(aggregate_biological_replicates(filtered_data()),
+                        input$surv_baseline, input$surv_readout)
   })
 
   plot_data <- reactive({
@@ -3697,8 +4079,10 @@ server <- function(input, output, session) {
     if (identical(cmp, "survival_vs_zero")) {
       return(tibble(message = "The survival comparison needs the Paired survival plot mode."))
     }
-    if (identical(input$stats_method, "emmeans")) {
-      run_contrast(filtered_data(), cmp, input$p_adjust, input$control_concentration)
+    if (is_emmeans_method(input$stats_method)) {
+      run_contrast(filtered_data(), cmp, input$p_adjust, input$control_concentration,
+                   adjustment_scope = input$p_adjust_scope,
+                   emm_adjust = emmeans_adjust())
     } else {
       run_groupwise_t_tests(
         dat = filtered_data(),
@@ -3711,8 +4095,10 @@ server <- function(input, output, session) {
     }
   })
 
+  emmeans_adjust <- reactive(emmeans_adjust_for(input$stats_method))
+
   current_anova <- reactive({
-    run_anova(plot_data())
+    run_anova(plot_data(), input$stats_method)
   })
 
   current_annotation <- reactive({
@@ -3916,6 +4302,15 @@ server <- function(input, output, session) {
     datatable(current_stats(), options = list(pageLength = 15, scrollX = TRUE))
   })
 
+  output$omnibus_relationship <- renderUI({
+    tagList(
+      tags$strong("How this table relates to the Statistics tab: "),
+      pairwise_family_note(input$stats_method),
+      tags$br(),
+      sprintf("Unit of replication: %s.", replication_unit_label(plot_data()))
+    )
+  })
+
   output$anova_table <- renderDT({
     datatable(current_anova(), options = list(pageLength = 12, scrollX = TRUE))
   })
@@ -4024,6 +4419,20 @@ server <- function(input, output, session) {
       column_mapping = column_mapping(),
       plot_mode = input$plot_mode,
       active_comparison = active_comparison(),
+      # CPS-1/CPS-2: a bundle has to say what n counted and what scale the
+      # figure summarised on, or the numbers in it cannot be interpreted.
+      replication = list(
+        unit = replication_unit_label(filtered_data()),
+        biological_replicate_column = column_mapping()$bio_replicate %||% NA_character_,
+        rows_before_aggregation = nrow(filtered_data()),
+        units_after_aggregation = nrow(aggregate_biological_replicates(filtered_data()))
+      ),
+      summary_scale = list(
+        y_mode = input$y_mode,
+        centre_statistic = unique(as.character(current_summary()$centre_statistic %||% NA)),
+        scale = unique(as.character(current_summary()$summary_scale %||% NA)),
+        statistics_scale = if (is_survival_frame(plot_data())) "log10 survival ratio" else "log10(CFU)"
+      ),
       settings = c(collect_plot_settings(input), list(bar_palette = as.list(bar_palette() %||% NULL))),
       visible_data = list(
         rows = nrow(plot_data()),

@@ -1,5 +1,8 @@
 # CFU Plot Studio
 
+**Version 0.2.0.** Statistics from 0.1.x are *not* comparable with this release — see
+`CHANGELOG.md` and `AUDIT-2026-09.md` before re-using an older number.
+
 CFU Plot Studio is an R Shiny app for turning replicate-level colony forming unit data into publication-focused bar plots, summary tables, QC checks, and statistics.
 
 The app is designed for microbiology lab workflows where data are usually collected as rows of replicate measurements across samples, treatments, timepoints, and CFU counts.
@@ -11,7 +14,9 @@ The app is designed for microbiology lab workflows where data are usually collec
 - Plots CFU summaries as bar plots or point plots with SD, SEM, 95% CI, IQR, or min-max variation intervals.
 - Shows individual replicate points on top of bars.
 - Draws the figure preview at the exact export geometry, so the font sizes on screen are the font sizes in the exported file.
-- Runs replicate-level statistics on `log10(CFU)`, reporting the confidence interval, fold-change interval, and Hedges' g alongside each p value.
+- Runs statistics on `log10(CFU)` at the level of the **biological** replicate, reporting the confidence interval, fold-change interval, and Hedges' g alongside each p value.
+- Reports advisory spread and normality diagnostics on the same units the tests use.
+- Censors counts at or below zero at a limit of detection, or excludes them, and records which.
 - Supports sample/vector comparisons, timepoint comparisons, treatment versus control, and all treatment-pair comparisons.
 - Exports cleaned data, summary tables, QC tables, statistics, and ANOVA tables.
 - Exports figures as high-resolution PNG, PDF, SVG, animated GIF, and PowerPoint.
@@ -35,6 +40,28 @@ Required information:
 | CFU | `1200000` |
 
 The included `dummy_cfu_example.csv` is synthetic example data and can be downloaded from the app as a template.
+
+### Biological versus technical replicates
+
+This is the single most consequential thing the app cannot work out from your file, so
+it asks. **Biological replicate column** in the sidebar says which column identifies
+*independent cultures*. Rows that share a value in that column are technical repeats —
+the same culture plated more than once — and are averaged on the log10 scale (the
+geometric mean of the plates) before any test runs. `n` then counts cultures, not plates.
+
+By default the app uses the Replicate column for both, which is right when one row is
+one culture. If your file has a separate plate or well column, point the biological
+replicate selector at the culture column instead. If the file genuinely has no
+independent replication, choose *None in this file* — the app will not invent one. It
+labels the banner, the figure caption, the QC table and a `unit_of_replication` column
+on every result **"technical replicates only"**, and those numbers must not be reported
+as replicate-level statistics.
+
+Before version 0.2.0 every unpaired test counted every row, so three cultures plated
+four times each entered a t-test as `n = 12`. See `AUDIT-2026-09.md`.
+
+Decimal-comma files (`1,5E+08` with `;` separators) and tab-separated files are read
+too; the **CSV dialect** control sniffs the delimiter by default.
 
 ## Running The App
 
@@ -133,6 +160,8 @@ defend or rebuild it:
 | `summary.csv` | Exactly what the Summary tab shows |
 | `statistics.csv` | Every comparison with intervals, effect sizes and adjusted q values |
 | `anova.csv` | The ANOVA table, naming its sum-of-squares type |
+| `assumption_diagnostics.csv` | Per-cell spread and normality checks on the tested units (advisory) |
+| `lod_wells.csv` | Present only when wells were censored: every affected well and what was done with it |
 | `qc_replicates.csv`, `figure_qa.csv` | Source checks, replicate structure, publication checklist |
 | `recreate_figure.R` | Standalone script that rebuilds the figure from embedded data |
 | `plot_preset.json` | Every setting, reloadable from the sidebar |
@@ -141,6 +170,20 @@ defend or rebuild it:
 
 Each item is attempted independently, so a missing optional package costs that one file
 rather than the whole archive, and the README says which are absent and why.
+
+**The bundle names the code that produced it.** `analysis_manifest.json`, `README.txt` and
+the header of `recreate_figure.R` all carry the app version, plus the short git SHA when
+the app is run from a checkout. A bundle that cannot identify its own version is not
+reproducible, whatever else it contains.
+
+**A figure file is verified after it is written.** `ggsave` reports a graphics device that
+failed to open as a *warning*, not an error, so a download could previously hand back an
+empty file and the bundle could lose `figure.pdf` in silence — `capabilities("cairo")`
+returns `TRUE` on exactly the machines where this happens (macOS without XQuartz). Every
+export now checks that the file exists, is non-empty, and begins with the magic bytes of
+the format requested, and falls back from `cairo_pdf` to the base `pdf` device with a
+visible note about font embedding. A format that cannot be written at all is reported as
+missing rather than shipped as a zero-byte file.
 
 ## Keeping The Data Area Fixed
 
@@ -288,7 +331,9 @@ The app includes controls for:
 - A custom Y-axis quantity (`CFU/mL`, `CFU/plate`, `CFU/OD600`), wrapped in log10 automatically.
 - A replicate-n row under the axis when n differs between groups, or a single n statement in the methods caption when it does not.
 - A jitter seed, so replicate points land in the same place on every re-export.
-- Log10 CFU or raw CFU on a log axis.
+- Log10 CFU, or raw CFU on a log axis. Both summarise on the log10 scale — the scale
+  every test uses — so the raw-axis bar is the **geometric mean** with a multiplicative
+  error interval, and the caption says so.
 - Manual y-axis minimum and maximum.
 - Major and minor y-axis tick spacing.
 - Major and minor y-axis guide lines.
@@ -300,18 +345,39 @@ The app includes controls for:
 - Custom colors for samples, timepoints, bars, outlines, axes, grids, and statistic labels.
 - Treatment units, time units, and optional unit suffixes.
 
-## Data That Cannot Be Plotted
+## Data That Cannot Be Plotted, And The Limit Of Detection
 
-`log10` is undefined at or below zero, so rows with a non-positive or non-numeric CFU
-value are excluded from the figure, the summary, and every test. Background-subtracted
-counts can legitimately land below zero, so this is common. The app states how many
-rows were dropped and why in a banner above the figure, and the plotted `n` is always
-the surviving `n` — not the number of wells plated.
+A non-numeric or blank CFU value cannot be plotted or tested and is excluded from the
+figure, the summary, and every test. The app states how many rows were dropped and why in
+a banner above the figure, and the plotted `n` is always the surviving `n` — not the
+number of wells plated.
+
+A count of **zero** is different: `log10` is undefined there, but the reading is a real
+measurement — below the limit of detection — and it happens exactly where a treatment
+worked. Excluding those wells biases a log-reduction *towards the null*. On a control at
+1e8 against a treated arm of 1e2, 1e2 and 0, dropping the zero reports a 6.0-log reduction
+where censoring it at 1 CFU/mL gives 6.67. Background-subtracted counts can legitimately
+land below zero as well, and are treated the same way.
+
+**Counts at or below zero** in the sidebar offers the two defensible treatments:
+
+- *Exclude the well* — the default, and what every version before 0.2.0 did.
+- *Substitute at the limit of detection* — set your LOD (default 1 CFU/mL, the smallest
+  countable titre on a neat plate) and substitute at the LOD or at LOD/2.
+
+Whichever you choose, the rule, the count and **every affected well** are written into
+the figure caption, the Figure QA tab, `analysis_manifest.json`, and `lod_wells.csv`
+inside the export bundle. The choice does not survive only as a banner on screen.
 
 ## Statistics
 
 The default statistics use Welch t-tests on `log10(CFU)` values. The app also supports
-Student t-tests, Wilcoxon rank-sum tests, and model-based marginal means through `emmeans`.
+Student t-tests, Wilcoxon rank-sum tests, and model-based marginal means through
+`emmeans`, with optional Tukey HSD or Dunnett-versus-control post-hoc procedures.
+
+**Every test runs on one value per biological replicate.** Technical repeats are
+collapsed first, on the log10 scale, and each result row names its
+`unit_of_replication` and the `n_a` / `n_b` it actually compared.
 
 Each comparison reports the log10 difference with its confidence interval, the same
 interval back-transformed to a fold-change range, and Hedges' g (Cohen's d with the
@@ -331,6 +397,49 @@ The ANOVA uses Type II sums of squares via `car::Anova` when `car` is installed,
 the `CFU > 0` filter usually leaves the design unbalanced and Type I sequential SS would
 make each main effect depend on the order the terms appear in the formula. The table
 names the type it used.
+
+### How the ANOVA relates to the pairwise table
+
+It depends on which test you picked, so the ANOVA tab states it in words rather than
+leaving the layout to imply it:
+
+- **Welch or Student t-tests** — the pairwise table is an *independent family*, not a
+  post-hoc of the ANOVA. Its correction is applied across that family alone, and a
+  non-significant omnibus does not gate it. This is a legitimate standalone procedure,
+  but it is not protected post-hoc testing and should not be described as such.
+- **emmeans with Tukey or Dunnett** — the pairwise table *is* a protected post-hoc
+  family on the model the ANOVA reports. Those procedures control the family-wise error
+  themselves, so the app's own correction setting is disabled and the table records
+  `p_adjust_method = none` rather than correcting twice.
+- **Wilcoxon** — the omnibus becomes a Kruskal-Wallis rank-sum test, so the two tables
+  describe the same kind of procedure. (Dunn's post-hoc is not implemented; the pairwise
+  family remains Wilcoxon tests with the chosen correction.)
+
+### Assumption diagnostics
+
+The QC tab reports per-cell `n`, mean and SD on `log10(CFU)`, a Shapiro-Wilk p where one
+is defined, and each cell's variance as a ratio to the narrowest cell — all computed on
+the same aggregated units the tests use. A note appears when you have selected Student,
+or a pooled-variance `emmeans` model, and the widest cell has more than 4x the variance
+of the narrowest.
+
+These are **advisory**. Nothing switches a test and nothing is gated on a p-value: at
+n = 3 Shapiro-Wilk has almost no power, so a passing p is not evidence of normality.
+
+### Which mean the summary table reports
+
+`summary.csv` and the Summary tab report both centres, named so they cannot be confused:
+
+- `geometric_mean_cfu` with `geometric_sd_factor` — the quantity the figure draws and the
+  tests analyse. The interval is *multiplicative*: geometric mean ×/÷ the factor, given as
+  `geometric_mean_low` and `geometric_mean_high`.
+- `arithmetic_mean_cfu`, `arithmetic_sd_cfu`, `arithmetic_sem_cfu` — kept because some
+  readers want them, but they are not what was tested. On three wells at 1e6, 1e7 and 1e8
+  the arithmetic mean is 3.7e7 against a geometric mean of 1e7.
+
+Before 0.2.0 these were `mean_cfu` / `sd_cfu` / `sem_cfu` sitting beside
+`geometric_mean_cfu`, with nothing but the word to tell them apart and no dispersion at
+all on the geometric side.
 
 ## Testing
 
@@ -358,6 +467,13 @@ Multiple-comparison correction options include:
 - Bonferroni
 - None
 
+The **scope** of that correction — across every comparison in the figure, or within each
+panel or group — is honoured by all of the t-test, rank-test and `emmeans` paths, and the
+scope actually used is recorded in the `adjustment_scope` column of `statistics.csv`.
+(Before 0.2.0 the `emmeans` path silently corrected globally whatever the control said.)
+Tukey and Dunnett are the exception, and say so: they control the family-wise error
+themselves, so the app's correction is disabled rather than applied on top.
+
 Statistic labels can be shown as significance stars or exact adjusted values.
 
 ## Notes For Manuscripts
@@ -378,8 +494,10 @@ For manuscript figures, a good starting workflow is:
 - `app.R`: main Shiny application.
 - `Run CFU Plot Studio.bat`: double-click launcher for Windows.
 - `run_app.R`: cross-platform launcher (dependency check, free-port selection, browser).
-- `tests/test_column_matching.R`: regression test for CSV header auto-detection.
+- `tests/test_column_matching.R`: regression tests for CSV header auto-detection and CSV dialects.
 - `dummy_cfu_example.csv`: synthetic example/template data.
+- `CHANGELOG.md`: release history, including which versions produce comparable statistics.
+- `AUDIT-2026-09.md`: the September 2026 statistical audit and what was done about each finding.
 - `outputs/`: local validation outputs and screenshots.
 
 ## License

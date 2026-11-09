@@ -6,7 +6,7 @@
 # paper_style.json applied at startup. Drives the real server with
 # shiny::testServer, writes files through the real download handlers, and runs
 # the bundled recreate_figure.R in a separate R process. Test 1 renders the
-# default figure with the 0.3.0 code (claude/legend-key) and with this code, in
+# default figure with the 0.3.0 code (commit 0762ca1) and with this code, in
 # separate R processes, and compares the SVG files byte for byte.
 # Exits non-zero on failure.
 
@@ -109,9 +109,19 @@ render_with <- function(app_path, out_dir) {
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
 
 base_app <- file.path(work, "app_base.R")
-git <- suppressWarnings(system2("git", c("show", "claude/legend-key:app.R"), stdout = base_app, stderr = FALSE))
+# The baseline is pinned to the 0.3.0 commit, not a branch name, so it survives
+# the branch being merged and deleted. A clone without that history (a shallow
+# clone, a release archive) cannot run this comparison and says so, as
+# test_survival.R does for its private dataset, rather than failing.
+BASE_COMMIT <- "0762ca1"
+git <- tryCatch(suppressWarnings(system2("git", c("show", paste0(BASE_COMMIT, ":app.R")), stdout = base_app, stderr = FALSE)),
+                error = function(e) 1L)
 have_base <- identical(as.integer(git), 0L) && file.exists(base_app) && file.size(base_app) > 0
-ok("the 0.3.0 app.R is available from claude/legend-key", have_base)
+if (have_base) {
+  ok("the 0.3.0 app.R is available from commit 0762ca1", TRUE)
+} else {
+  cat("  PASS  (skipped) commit 0762ca1 is not in this clone, so the byte-identical comparison with 0.3.0 cannot run here\n")
+}
 
 if (have_base) {
   old_dir <- file.path(work, "old"); new_dir <- file.path(work, "new"); new2_dir <- file.path(work, "new2")

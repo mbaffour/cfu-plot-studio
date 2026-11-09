@@ -536,7 +536,7 @@ names stay text in SVG and PDF; and the bundled `recreate_figure.R` rebuilds the
 a fresh R session.
 
 `test_paper_style.R` renders the default figure in every plot mode with the 0.3.0 code
-(`git show claude/legend-key:app.R`) and with the current code, in separate R processes,
+(`git show 0762ca1:app.R`, the 0.3.0 commit) and with the current code, in separate R processes,
 and checks the SVG files are byte-identical. It then checks that colours follow sample
 names across CSVs and through presets (old numbered presets included), that the font
 reaches every text node, the key and a pinned panel, that the paper style is saved,

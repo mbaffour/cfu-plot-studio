@@ -6,6 +6,61 @@ Entries marked **STATISTICS CHANGE** alter numbers this app has previously produ
 Figures and p-values from a version before such a change are not comparable with figures
 and p-values from a version after it.
 
+## 0.3.0 — 2026-11-08 (unreleased)
+
+The legend key. No statistic, summary or plotted value changes: figures with the new
+switch off render byte-identically to 0.2.0 (checked on SVG output in every plot mode).
+
+### Added
+
+- **Legend key for every figure.** Under the figure's PNG / PDF / SVG buttons: **Key
+  PNG / Key PDF / Key SVG**, a read-only **Legend text starter** with a **Copy** button,
+  and a **Place key on figure** switch.
+  - The standalone key is the figure's own legend, cut out of the figure built with the
+    key switched on (`legend_key_grob()`), so its glyphs, exact colours, outline, names
+    and font are the ones drawn on the figure. Names are live text in SVG and PDF. It is
+    written through `ggsave_checked()`, so a failed write raises rather than shipping an
+    empty file.
+  - **Place key on figure** draws that same legend on the figure at the chosen legend
+    position (the right margin when the position is *none*). It is how the one-sample
+    figure and per-bar colouring, which normally show no legend, get a key.
+  - The text starter reads `NAME (colour, marker); ...` plus the outline colour. Colour
+    words are the nearest entry of a fixed 27-name table by CIE Lab distance, with
+    "light" / "dark" added only when two groups in one figure would share a word.
+  - The switch is saved in plot presets, the manifest and `recreate_figure.R`.
+- **One colour mapping per figure.** `figure_key_mapping()` is now the single place a
+  figure's groups get their fill colours; `make_cfu_plot()` passes its values to
+  `scale_fill_manual()` in every mode, and the key and text starter are read from it.
+- `tests/test_legend_key.R`: from the files the handlers write, on a three-sample fixture.
+
+Figures the app makes, and how each gets its key:
+
+| Figure | Encodes groups by | Key |
+| --- | --- | --- |
+| Main figure, *combined* mode (PNG / PDF / SVG / preview) | fill per sample | standalone key + switch |
+| Main figure, *survival* mode | fill per sample | standalone key + switch |
+| Main figure, *sample_both* mode | fill per timepoint | standalone key + switch |
+| Main figure, *sample_time* mode | one sample, one colour | standalone key (one entry) + switch |
+| Any mode with per-bar colouring | fill per bar | standalone key (one entry per bar) + switch |
+| PowerPoint slide | same figure | embedded via the switch |
+| Reveal slides (PPT), one per step | same figure, groups revealed so far | embedded via the switch |
+| Animated GIF | same figure | embedded via the switch (not panel-pinned, as before) |
+| Download everything (.zip) | — | `legend_key.png/.pdf/.svg` + `legend_text.txt` |
+| `recreate_figure.R` | — | rebuilds `legend_key_recreated.png` + `legend_text_recreated.txt` |
+
+The app has no other figures: the QC, assumption-diagnostics, statistics and ANOVA tabs
+are tables. There is no per-group marker shape or line type to key — every group is a
+bar or a shape-21 circle with the same outline — so the key varies by fill only.
+
+### Fixed
+
+- **`recreate_figure.R` now runs in a fresh R session.** It called `stats_caption()`,
+  which since 0.2.0 needs `is_emmeans_method()` and `emmeans_adjust_for()`, without
+  carrying them, so any figure with statistics failed; a figure with no statistic labels
+  failed on `read.csv()` of the empty annotation table. `test_bundle.R` did not see
+  either because it runs the script inside a session that already holds the app's
+  helpers; `test_legend_key.R` runs it in a separate `Rscript` process.
+
 ## 0.2.0 — 2026-09-14
 
 The 2026-09 statistical audit and its fixes. Every finding and its disposition is in

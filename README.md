@@ -1,6 +1,6 @@
 # CFU Plot Studio
 
-**Version 0.2.0.** Statistics from 0.1.x are *not* comparable with this release — see
+**Version 0.3.0.** Statistics from 0.1.x are *not* comparable with 0.2.0 and later — see
 `CHANGELOG.md` and `AUDIT-2026-09.md` before re-using an older number.
 
 CFU Plot Studio is an R Shiny app for turning replicate-level colony forming unit data into publication-focused bar plots, summary tables, QC checks, and statistics.
@@ -154,6 +154,8 @@ defend or rebuild it:
 | File | What it is |
 | --- | --- |
 | `figure.png` / `.pdf` / `.svg` / `.pptx` | The figure in every static format |
+| `legend_key.png` / `.pdf` / `.svg` | The figure's legend key on its own (see [Legend key](#legend-key)) |
+| `legend_text.txt` | The legend text starter: each group with its colour and marker in words |
 | `figure_reveal.gif` | Optional, off by default because it is slow |
 | `data_cleaned.csv` | Every row that survived import |
 | `data_plotted.csv` | The rows actually plotted — in survival mode the paired ratios, each with both source counts |
@@ -184,6 +186,36 @@ export now checks that the file exists, is non-empty, and begins with the magic 
 the format requested, and falls back from `cairo_pdf` to the base `pdf` device with a
 visible note about font embedding. A format that cannot be written at all is reported as
 missing rather than shipped as a zero-byte file.
+
+## Legend Key
+
+Every figure comes with a **legend key**: a small image listing each plotted sample or
+group with its exact colour, marker and outline, next to its name, in the figure's font.
+It sits in the **Legend key** box directly under the PNG / PDF / SVG buttons:
+
+- **Key PNG / Key PDF / Key SVG** download the key in the same formats as the figure. In
+  PDF and SVG the names stay editable text.
+- **Legend text starter** is a read-only box with a sentence ready to paste into the figure
+  legend, and a **Copy** button. Its format is
+  `NAME (colour, marker); NAME (colour, marker); ...`, followed by the outline colour, e.g.
+
+  ```
+  MG1655 (black, filled circles); MG1655 + WT (orange, filled circles). Circles are outlined in black.
+  ```
+
+  Colour words are the nearest plain name (by CIE Lab distance); two groups that would get
+  the same word are told apart with "light" / "dark". Bar figures say `bars`, or
+  `bars, replicates as filled circles` when replicate points are shown.
+- **Place key on figure** draws the same key on the figure itself, at the **Legend
+  position** you chose (the right-hand margin if that is *none*). It also gives the
+  one-sample figure and per-bar colouring a key, which they otherwise do not show.
+
+The key is the figure's own legend cut out of the figure, and the text is read from the
+same colour mapping the figure is drawn from, so both always follow the current sample
+names, colours and selection, and the key on the figure and the downloaded key are the
+same. It covers every plot mode, the PowerPoint and reveal slides and the GIF (through
+**Place key on figure**), **Download everything** (`legend_key.*` and `legend_text.txt`)
+and `recreate_figure.R`, which rebuilds the key and the text alongside the figure.
 
 ## Keeping The Data Area Fixed
 
@@ -236,8 +268,8 @@ lays Okabe-Ito across them and one that returns to the group colours.
 
 A caveat the app enforces rather than hides: when bars are dodged by sample or
 timepoint, colouring them individually means colour no longer identifies the group. The
-fill legend is hidden in that case (it would just list every bar), and Figure QA raises
-it. Per-bar colour is unambiguous in the one-sample-one-timepoint mode, and elsewhere it
+fill legend is hidden in that case (it would just list every bar) unless **Place key on
+figure** is on, and Figure QA raises it. Per-bar colour is unambiguous in the one-sample-one-timepoint mode, and elsewhere it
 is best used to highlight rather than to classify.
 
 ## Moving Things On The Canvas
@@ -450,6 +482,7 @@ Rscript tests/test_survival.R
 Rscript tests/test_statistics.R
 Rscript tests/test_column_matching.R
 Rscript tests/test_end_to_end.R            # optionally: ... path/to/your.csv
+Rscript tests/test_legend_key.R
 ```
 
 `test_end_to_end.R` drives the real Shiny server with a real uploaded CSV, so it covers
@@ -459,6 +492,13 @@ whole pipeline against your data.
 `test_statistics.R` re-derives each expected value from first principles or a hand-worked
 example rather than from the app's own helpers, so a bug that is self-consistent across
 the app still fails the test. Both scripts exit non-zero on failure.
+
+`test_legend_key.R` checks the legend key from the files the app writes: every group in
+the figure's colour mapping appears in the key with the same colour, marker and name;
+renaming, recolouring and deselecting a sample are followed; the text starter names
+every group with a colour word; the key placed on the figure matches the downloaded one;
+names stay text in SVG and PDF; and the bundled `recreate_figure.R` rebuilds the key in
+a fresh R session.
 
 Multiple-comparison correction options include:
 

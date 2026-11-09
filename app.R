@@ -15,7 +15,7 @@ demo_file <- "dummy_cfu_example.csv"
 # code that produced it is not reproducible, so this constant is the single
 # source of truth for the UI footer, the manifest, the bundle README and
 # CITATION.cff -- bump all of them together.
-APP_VERSION <- "0.2.0"
+APP_VERSION <- "0.3.0"
 
 # Git SHA of the working tree, when the app is run from a checkout. Absent in a
 # plain download, which is why it is optional rather than part of APP_VERSION.

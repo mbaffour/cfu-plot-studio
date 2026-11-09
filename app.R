@@ -1975,7 +1975,67 @@ bar_keys <- function(dat, plot_mode) {
 # sample or treatment label the user's CSV happens to contain.
 bar_color_input_id <- function(key) paste0("barcol_", make.names(key))
 
-make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input, bar_palette = NULL) {
+# ---------------------------------------------------------------------------
+# The figure's colour mapping
+# ---------------------------------------------------------------------------
+# THE one place a figure's groups get their colours. make_cfu_plot() hands
+# `values` straight to scale_fill_manual(), and the legend key and its text
+# starter are read off the same object, so the figure, the key and the words
+# cannot disagree. Returns:
+#   variable  the column the fill is mapped to (sample, time_min, bar_key, or
+#             key_group, a constant column for the one-colour figure)
+#   values    named fill vector, exactly as passed to the scale
+#   entries   one row per group the figure actually draws, in legend order:
+#             name, fill, outline, glyph ("bar" or "point"), shape (pch)
+#   per_bar   TRUE when bars are coloured one by one
+figure_key_mapping <- function(dat, sumdat, plot_mode, input, bar_palette = NULL) {
+  bar_palette <- bar_palette %||% input$bar_palette
+  per_bar <- identical(input$bar_color_mode %||% "group", "manual") && length(bar_palette) > 0
+  sample_seeds <- c(input$sample_color_1, input$sample_color_2)
+  if (per_bar) {
+    present <- unique(bar_keys(sumdat, plot_mode))
+    # Any bar the palette does not name falls back to a neutral grey rather than
+    # to NA, which ggplot would drop from the plot entirely.
+    values <- setNames(rep("#BBBBBB", length(present)), present)
+    known <- intersect(present, names(bar_palette))
+    values[known] <- unlist(bar_palette[known])
+    variable <- "bar_key"
+  } else if (identical(plot_mode, "survival")) {
+    values <- named_palette(levels(droplevels(sumdat$sample)), sample_seeds)
+    variable <- "sample"
+  } else if (identical(plot_mode, "combined")) {
+    values <- named_palette(levels(dat$sample), sample_seeds)
+    variable <- "sample"
+  } else if (identical(plot_mode, "sample_both")) {
+    values <- named_palette(levels(dat$time_min), c(input$time_color_1, input$time_color_2))
+    variable <- "time_min"
+  } else {
+    # One sample at one timepoint, one colour. Its name is the sample shown.
+    nm <- if ("sample" %in% names(dat)) unique(as.character(dat$sample)) else character(0)
+    nm <- if (length(nm) == 1 && !is.na(nm)) nm else "All bars"
+    values <- setNames(input$single_color %||% "grey35", nm)
+    variable <- "key_group"
+  }
+
+  drawn <- if (identical(variable, "key_group")) names(values) else {
+    unique(c(as.character(sumdat[[variable]] %||% character(0)),
+             if (!identical(variable, "bar_key")) as.character(dat[[variable]] %||% character(0))))
+  }
+  shown <- names(values)[names(values) %in% drawn]
+  draw_bars <- identical(input$chart_geom %||% "bar", "bar")
+  entries <- data.frame(
+    name = shown,
+    fill = unname(as.character(values[shown])),
+    outline = rep(input$bar_outline_color %||% "grey20", length(shown)),
+    glyph = rep(if (draw_bars) "bar" else "point", length(shown)),
+    shape = rep(if (draw_bars) NA_integer_ else 21L, length(shown)),
+    stringsAsFactors = FALSE
+  )
+  list(variable = variable, values = values, entries = entries, per_bar = per_bar)
+}
+
+make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input, bar_palette = NULL,
+                          key_on_figure = NULL) {
   # Style settings, defaulted individually. The app always supplies these from
   # its UI, but the exported script hands over a plain list a user may edit by
   # hand, and a missing numeric reaches theme_classic(base_size = NULL) and
@@ -2043,23 +2103,28 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   # Per-bar colours. The server resolves them from the dynamic pickers; the
   # exported script carries them in settings. Either way they arrive as a named
   # character vector keyed by bar_keys().
-  bar_palette <- bar_palette %||% input$bar_palette
-  per_bar_color <- identical(input$bar_color_mode %||% "group", "manual") &&
-    length(bar_palette) > 0
+  # Every fill colour on the figure comes from this one object; the legend key
+  # and its text starter are read off the same object (figure_key_mapping).
+  key_map <- figure_key_mapping(dat, sumdat, plot_mode, input, bar_palette)
+  fill_values <- key_map$values
+  per_bar_color <- key_map$per_bar
   if (per_bar_color) {
-    sumdat$bar_key <- bar_keys(sumdat, plot_mode)
-    dat$bar_key <- bar_keys(dat, plot_mode)
-    present <- unique(sumdat$bar_key)
-    # Any bar the palette does not name falls back to a neutral grey rather than
-    # to NA, which ggplot would drop from the plot entirely.
-    resolved <- setNames(rep("#BBBBBB", length(present)), present)
-    known <- intersect(present, names(bar_palette))
-    resolved[known] <- unlist(bar_palette[known])
-    bar_palette <- resolved
-    key_levels <- present
-    sumdat$bar_key <- factor(sumdat$bar_key, levels = key_levels)
-    dat$bar_key <- factor(dat$bar_key, levels = key_levels)
+    key_levels <- names(fill_values)
+    sumdat$bar_key <- factor(bar_keys(sumdat, plot_mode), levels = key_levels)
+    dat$bar_key <- factor(bar_keys(dat, plot_mode), levels = key_levels)
   }
+  # The one-colour figure has no grouping column, so give it a constant one: the
+  # bars look exactly as before, and the key has an entry to draw.
+  if (identical(key_map$variable, "key_group")) {
+    sumdat$key_group <- factor(rep(names(fill_values), nrow(sumdat)), levels = names(fill_values))
+    dat$key_group <- factor(rep(names(fill_values), nrow(dat)), levels = names(fill_values))
+  }
+  # "Place key on figure": the figure's own fill legend IS the key -- drawn by
+  # ggplot from the same layers, so the embedded key and the standalone one
+  # (legend_key_grob) are the same grob. Off, the figure keeps its usual
+  # legend: one per group, none for per-bar or one-colour figures.
+  key_on_figure <- isTRUE(key_on_figure %||% input$legend_key_on_figure)
+  fill_guide <- if (key_on_figure) "legend" else if (per_bar_color || identical(key_map$variable, "key_group")) "none" else "legend"
 
   # When every group has the same n, one phrase in the caption says it better
   # than a label under every bar. Per-bar labels are only worth their clutter
@@ -2199,6 +2264,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     ggplot2::guide_axis()
   }
   legend_pos <- input$legend_position %||% "top"
+  # A key the user asked to place cannot be hidden by "none": it goes in the
+  # right-hand margin, outside the data.
+  if (key_on_figure && identical(legend_pos, "none")) legend_pos <- "right"
   legend_theme <- if (identical(legend_pos, "inside")) {
     theme(
       legend.position = "inside",
@@ -2360,8 +2428,6 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   }
 
   if (plot_mode == "survival") {
-    sample_colors <- named_palette(levels(droplevels(sumdat$sample)),
-                                   c(input$sample_color_1, input$sample_color_2))
     dodge_pos <- position_dodge(width = dodge_width)
     p <- if (per_bar_color) {
       ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = sample))
@@ -2389,12 +2455,10 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- add_n_labels(p, dodge_pos, "sample")
     p <- p +
       scale_x_discrete(drop = FALSE) +
-      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
-       else scale_fill_manual(values = sample_colors)) +
+      scale_fill_manual(values = fill_values, guide = fill_guide) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title,
            title = input$plot_title, subtitle = subtitle_text)
   } else if (plot_mode == "combined") {
-    sample_colors <- named_palette(levels(dat$sample), c(input$sample_color_1, input$sample_color_2))
     dodge_pos <- position_dodge(width = dodge_width)
     # group stays on the sample even when fill moves to bar_key: position_dodge
     # allocates one slot per group, so dodging by a key that also varies with x
@@ -2423,11 +2487,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- p +
       facet_wrap(~ time_min, nrow = 1) +
       scale_x_discrete(drop = FALSE) +
-      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
-       else scale_fill_manual(values = sample_colors)) +
+      scale_fill_manual(values = fill_values, guide = fill_guide) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   } else if (plot_mode == "sample_both") {
-    time_colors <- named_palette(levels(dat$time_min), c(input$time_color_1, input$time_color_2))
     dodge_pos <- position_dodge(width = dodge_width)
     p <- if (per_bar_color) {
       ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = time_min))
@@ -2452,40 +2514,28 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- add_n_labels(p, dodge_pos, "time_min")
     p <- p +
       scale_x_discrete(drop = FALSE) +
-      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
-       else scale_fill_manual(values = time_colors)) +
+      scale_fill_manual(values = fill_values, guide = fill_guide) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   } else {
-    p <- if (per_bar_color) {
-      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key))
-    } else {
-      ggplot(sumdat, aes(x = concentration_label, y = mean_y))
-    }
-    p <- add_mean_layer(p, position_identity(),
-                        fixed_fill = if (per_bar_color) NULL else input$single_color)
+    # One colour, or one per bar: either way the fill is mapped (to key_group or
+    # bar_key) so it comes from fill_values like every other mode.
+    fill_var <- key_map$variable
+    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = .data[[fill_var]]))
+    p <- add_mean_layer(p, position_identity())
     p <- add_interval_layer(p, position_identity(), width = 0.2)
     if (isTRUE(input$show_points)) {
-      if (per_bar_color) {
-        p <- p + geom_point(
-          data = dat,
-          aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = bar_key),
-          position = position_jitter(width = jitter_width, height = 0, seed = jitter_seed),
-          shape = 21, size = point_size, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
-        )
-      } else {
-        p <- p + geom_point(
-          data = dat,
-          aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu),
-          position = position_jitter(width = jitter_width, height = 0, seed = jitter_seed),
-          shape = 21, size = point_size, fill = input$single_color, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
-        )
-      }
+      p <- p + geom_point(
+        data = dat,
+        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = .data[[fill_var]]),
+        position = position_jitter(width = jitter_width, height = 0, seed = jitter_seed),
+        shape = 21, size = point_size, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
+      )
     }
     p <- add_n_labels(p, position_identity())
     p <- p +
       scale_x_discrete(drop = FALSE) +
-      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none") else NULL) +
-      labs(x = input$x_label, y = y_lab, title = input$plot_title, subtitle = subtitle_text)
+      scale_fill_manual(values = fill_values, guide = fill_guide) +
+      labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   }
 
   if (nrow(ann) > 0) {
@@ -4809,6 +4859,7 @@ server <- function(input, output, session) {
       exported_function_source("apply_annotation_offsets"),
       exported_function_source("bar_key_columns"),
       exported_function_source("bar_keys"),
+      exported_function_source("figure_key_mapping"),
       exported_function_source("error_type_caption"),
       exported_function_source("stats_caption"),
       exported_function_source("make_cfu_plot"),

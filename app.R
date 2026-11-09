@@ -293,7 +293,7 @@ plot_setting_ids <- c(
   "bar_width", "dodge_width", "point_size", "point_alpha", "jitter_width", "jitter_seed",
   "font_size", "title_size", "subtitle_size", "stat_size", "x_angle",
   "title_hjust", "subtitle_hjust", "caption_hjust", "x_title_hjust", "y_title_hjust",
-  "legend_position", "legend_x", "legend_y", "legend_just_x", "legend_just_y",
+  "legend_position", "legend_x", "legend_y", "legend_just_x", "legend_just_y", "legend_key_on_figure",
   "size_mode", "size_units", "download_width", "download_height", "download_dpi", "animation_fps", "animation_duration",
   "animation_dpi", "ppt_editable"
 )
@@ -314,7 +314,7 @@ checkbox_setting_ids <- c(
   "show_ns", "show_points", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption",
   "surv_match_replicates", "append_treatment_unit",
   "append_time_unit", "show_n_labels", "plot_box", "show_y_ticks", "show_minor_y_ticks", "show_y_grid",
-  "show_minor_y_grid", "ppt_editable"
+  "show_minor_y_grid", "ppt_editable", "legend_key_on_figure"
 )
 
 text_setting_ids <- c("plot_title", "plot_subtitle", "x_label", "y_label", "treatment_unit", "time_unit", "legend_title")
@@ -2029,6 +2029,9 @@ figure_key_mapping <- function(dat, sumdat, plot_mode, input, bar_palette = NULL
     outline = rep(input$bar_outline_color %||% "grey20", length(shown)),
     glyph = rep(if (draw_bars) "bar" else "point", length(shown)),
     shape = rep(if (draw_bars) NA_integer_ else 21L, length(shown)),
+    replicates = rep(isTRUE(input$show_points), length(shown)),
+    # Bars use the bar outline width; mean and replicate circles a fixed stroke.
+    outline_width = rep(if (draw_bars) (input$bar_outline_width %||% 0.25) else 0.45, length(shown)),
     stringsAsFactors = FALSE
   )
   list(variable = variable, values = values, entries = entries, per_bar = per_bar)
@@ -2649,6 +2652,97 @@ make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, i
   list(plot = p, steps = total_steps)
 }
 
+# ---------------------------------------------------------------------------
+# Legend key
+# ---------------------------------------------------------------------------
+# The standalone key is the figure's own legend, cut out of the figure. The
+# figure is built with the key switched on (make_cfu_plot(key_on_figure =
+# TRUE)), so the grob below is the very grob "Place key on figure" draws: same
+# glyphs, same colours, same names, same font. Nothing is redrawn by hand.
+# Returns NULL when the figure has no legend to cut out.
+legend_key_grob <- function(p, dpi = 300, pad_pt = 4) {
+  with_measure_device({
+    g <- ggplot2::ggplotGrob(p)
+    boxes <- g$grobs[grepl("^guide-box", g$layout$name)]
+    boxes <- Filter(function(b) inherits(b, "gtable") && "guides" %in% b$layout$name, boxes)
+    if (length(boxes) == 0) return(NULL)
+    box <- boxes[[1]]
+    guides <- box$grobs[[which(box$layout$name == "guides")[1]]]
+    w <- sum(grid::convertWidth(guides$widths, "in", valueOnly = TRUE))
+    h <- sum(grid::convertHeight(guides$heights, "in", valueOnly = TRUE))
+    # The figure's own background, so the key sits on the same white.
+    bg_grob <- g$grobs[[which(g$layout$name == "background")[1]]]
+    bg <- tryCatch(bg_grob$gp$fill, error = function(e) NULL) %||% "white"
+    pad <- pad_pt / 72
+    out <- gtable::gtable(widths = grid::unit(c(pad, w, pad), "in"),
+                          heights = grid::unit(c(pad, h, pad), "in"))
+    out <- gtable::gtable_add_grob(out, grid::rectGrob(gp = grid::gpar(fill = bg, col = NA)),
+                                   t = 1, l = 1, b = 3, r = 3, name = "background")
+    out <- gtable::gtable_add_grob(out, guides, t = 2, l = 2, name = "key")
+    list(grob = out, width = w + 2 * pad, height = h + 2 * pad)
+  }, dpi = dpi)
+}
+
+# Plain colour words for the text starter: nearest entry by CIE Lab distance.
+legend_colour_table <- c(
+  "black" = "#000000", "dark grey" = "#595959", "grey" = "#808080", "light grey" = "#BFBFBF",
+  "white" = "#FFFFFF", "red" = "#E41A1C", "dark red" = "#8B0000", "orange" = "#FF7F00",
+  "yellow" = "#FFD700", "green" = "#4DAF4A", "dark green" = "#006400", "teal" = "#008080",
+  "cyan" = "#00BFFF", "blue" = "#377EB8", "dark blue" = "#00008B", "navy" = "#000080",
+  "purple" = "#984EA3", "magenta" = "#FF00FF", "pink" = "#F781BF", "brown" = "#A65628",
+  "olive" = "#808000", "gold" = "#DAA520", "sky blue" = "#56B4E9", "vermillion" = "#D55E00",
+  "bluish green" = "#009E73", "reddish purple" = "#CC79A7", "yellow-green" = "#9ACD32"
+)
+
+colour_to_lab <- function(cols) {
+  grDevices::convertColor(t(grDevices::col2rgb(cols)) / 255, from = "sRGB", to = "Lab")
+}
+
+# Two different colours that land on the same word get "light"/"dark" so the
+# reader can still tell them apart; identical colours keep the same word.
+colour_words <- function(cols) {
+  if (length(cols) == 0) return(character(0))
+  lab <- colour_to_lab(cols)
+  ref <- colour_to_lab(unname(legend_colour_table))
+  idx <- apply(lab, 1, function(v) which.min(colSums((t(ref) - v)^2)))
+  words <- names(legend_colour_table)[idx]
+  hex <- toupper(grDevices::rgb(t(grDevices::col2rgb(cols)), maxColorValue = 255))
+  out <- words
+  for (w in unique(words[duplicated(words)])) {
+    ii <- which(words == w)
+    if (length(unique(hex[ii])) < 2) next
+    L <- lab[ii, 1]
+    already <- grepl("^(dark|light) ", w)
+    lightest <- ii[which.max(L)]
+    darkest <- ii[which.min(L)]
+    out[lightest] <- paste(if (already) "lighter" else "light", w)
+    out[darkest] <- paste(if (already) "darker" else "dark", w)
+  }
+  out
+}
+
+# "NAME (colour, marker); NAME (...)." -- read off figure_key_mapping(), the
+# same object the figure's fill scale is drawn from.
+legend_text_starter <- function(key_map) {
+  e <- key_map$entries
+  if (is.null(e) || nrow(e) == 0) return("")
+  words <- colour_words(e$fill)
+  glyph <- ifelse(e$glyph == "bar", "bars", "filled circles")
+  glyph <- ifelse(e$glyph == "bar" & e$replicates, "bars, replicates as filled circles", glyph)
+  parts <- paste0(e$name, " (", words, ", ", glyph, ")")
+  out <- paste0(paste(parts, collapse = "; "), ".")
+  outline <- unique(e$outline)
+  bars_outlined <- any(e$glyph == "bar" & e$outline_width > 0)
+  circles_outlined <- any(e$glyph == "point" | e$replicates)
+  what <- c(if (bars_outlined) "bars", if (circles_outlined) "circles")
+  if (length(outline) == 1 && length(what) > 0) {
+    what <- paste(what, collapse = " and ")
+    substr(what, 1, 1) <- toupper(substr(what, 1, 1))
+    out <- paste0(out, " ", what, " are outlined in ", colour_words(outline), ".")
+  }
+  out
+}
+
 ui <- fluidPage(
   tags$head(tags$style(HTML("
     body {
@@ -3099,6 +3193,13 @@ ui <- fluidPage(
       background: #f6f9f9;
     }
     .bundle-row .form-group { margin-bottom: 0; }
+    .legend-key-box {
+      margin-top: 12px; padding: 10px 12px; border: 1px solid #d5dedf; border-radius: 6px;
+      background: #f6f9f9;
+    }
+    .legend-key-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .legend-key-row .form-group { margin-bottom: 0; }
+    .legend-key-box textarea { width: 100%; font-size: 13px; resize: vertical; background: #fff; }
     .bundle-hint { color: #536b6f; font-size: 12px; flex: 1 1 280px; }
     .size-readout {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -3123,6 +3224,20 @@ ui <- fluidPage(
     }
   ")),
   tags$script(HTML("
+    document.addEventListener('click', async function(event) {
+      const button = event.target.closest('#copy_legend_text');
+      if (!button) return;
+      const box = document.getElementById('legend_text_starter');
+      const status = document.getElementById('copy_legend_text_status');
+      if (!box) return;
+      try {
+        await navigator.clipboard.writeText(box.value);
+        if (status) status.textContent = 'Copied.';
+      } catch (err) {
+        box.select();
+        if (status) status.textContent = 'Press Ctrl/Cmd+C to copy the selected text.';
+      }
+    });
     document.addEventListener('click', async function(event) {
       const button = event.target.closest('#copy_plot');
       if (!button) return;
@@ -3480,6 +3595,23 @@ ui <- fluidPage(
             column(4, downloadButton("download_png", "PNG")),
             column(4, downloadButton("download_pdf", "PDF")),
             column(4, downloadButton("download_svg", "SVG"))
+          ),
+          # Legend key: the figure's own legend as a standalone image, in the
+          # figure's formats, plus a sentence to paste into the figure legend.
+          div(
+            class = "legend-key-box",
+            div(
+              class = "legend-key-row",
+              tags$strong("Legend key"),
+              downloadButton("download_key_png", "Key PNG"),
+              downloadButton("download_key_pdf", "Key PDF"),
+              downloadButton("download_key_svg", "Key SVG"),
+              checkboxInput("legend_key_on_figure", "Place key on figure", value = FALSE)
+            ),
+            tags$label(`for` = "legend_text_starter", "Legend text starter"),
+            uiOutput("legend_text_ui"),
+            tags$button(id = "copy_legend_text", type = "button", class = "btn btn-default btn-sm", "Copy"),
+            span(id = "copy_legend_text_status", class = "copy-status")
           ),
           br(),
           fluidRow(
@@ -3865,11 +3997,11 @@ server <- function(input, output, session) {
   output$canvas_hint <- renderText({
     switch(
       input$canvas_mode %||% "off",
-      legend = if (identical(input$bar_color_mode %||% "group", "manual")) {
+      legend = if (identical(input$bar_color_mode %||% "group", "manual") && !isTRUE(input$legend_key_on_figure)) {
         # Per-bar colouring hides the fill legend, so there is nothing to place
         # and a click would look like it did nothing.
         "This figure has no legend to place: per-bar colouring hides it. Switch Bar colouring back to 'By group' first."
-      } else if (identical(input$legend_position %||% "top", "none")) {
+      } else if (identical(input$legend_position %||% "top", "none") && !isTRUE(input$legend_key_on_figure)) {
         "The legend is set to 'none'. Choose another legend position first."
       } else {
         "Click anywhere on the figure to put the legend there."
@@ -4583,6 +4715,55 @@ server <- function(input, output, session) {
     res = PREVIEW_PPI
   )
 
+  # --- Legend key ------------------------------------------------------------
+  # The colour mapping the figure is drawn from, from the same function and the
+  # same inputs current_plot() passes to make_cfu_plot().
+  key_mapping <- reactive({
+    validate(need(nrow(filtered_data()) > 0, "No rows remain after filtering."))
+    figure_key_mapping(plot_data(), current_summary(), input$plot_mode, input, bar_palette())
+  })
+
+  # The figure with its key switched on. When the key is already on the figure
+  # this IS current_plot(), so the standalone key is cut from the very figure
+  # being exported.
+  key_plot <- reactive({
+    if (isTRUE(input$legend_key_on_figure)) return(current_plot())
+    validate(need(nrow(filtered_data()) > 0, "No rows remain after filtering."))
+    make_cfu_plot(
+      dat = plot_data(), sumdat = current_summary(), ann = current_annotation(),
+      plot_mode = input$plot_mode, y_mode = input$y_mode, error_type = input$error_type,
+      input = input, bar_palette = bar_palette(), key_on_figure = TRUE
+    )
+  })
+
+  legend_key <- reactive({
+    k <- legend_key_grob(key_plot(), dpi = export_dpi())
+    validate(need(!is.null(k), "This figure has no groups to put in a key."))
+    k
+  })
+
+  legend_text <- reactive(legend_text_starter(key_mapping()))
+
+  output$legend_text_ui <- renderUI({
+    txt <- tryCatch(legend_text(), error = function(e) "")
+    tags$textarea(id = "legend_text_starter", class = "form-control", rows = 3,
+                  readonly = NA, txt)
+  })
+
+  # Same post-condition as the figure: a key that could not be written raises
+  # rather than handing the browser an empty file.
+  save_key_file <- function(file, kind, notify = TRUE) {
+    k <- legend_key()
+    res <- ggsave_checked(filename = file, plot = k$grob, kind = kind,
+                          width = k$width, height = k$height, units = "in", dpi = export_dpi())
+    if (!isTRUE(res$ok)) stop(res$message, call. = FALSE)
+    if (isTRUE(res$fallback) && isTRUE(notify)) {
+      tryCatch(showNotification(res$message, type = "warning", duration = 10),
+               error = function(e) NULL)
+    }
+    invisible(res)
+  }
+
   output$cleaned_table <- renderDT({
     datatable(cfu_data(), options = list(pageLength = 12, scrollX = TRUE))
   })
@@ -4867,6 +5048,11 @@ server <- function(input, output, session) {
       exported_function_source("emmeans_adjust_for"),
       exported_function_source("stats_caption"),
       exported_function_source("make_cfu_plot"),
+      exported_function_source("legend_key_grob"),
+      exported_function_source("legend_colour_table"),
+      exported_function_source("colour_to_lab"),
+      exported_function_source("colour_words"),
+      exported_function_source("legend_text_starter"),
       "",
       "if (!'y' %in% names(ann)) ann$y <- numeric(0)",
       "p <- make_cfu_plot(",
@@ -4895,7 +5081,20 @@ server <- function(input, output, session) {
       "  'cfu_plot_recreated.png', obj,",
       "  width = w_in, height = h_in,",
       "  units = 'in', dpi = settings$download_dpi %||% 600",
-      ")"
+      ")",
+      "",
+      "# Legend key: the figure's own legend, cut out of the figure built with the",
+      "# key switched on, and the legend text starter from the same colour mapping.",
+      "key <- legend_key_grob(",
+      "  make_cfu_plot(dat = dat, sumdat = sumdat, ann = ann, plot_mode = plot_mode, y_mode = y_mode,",
+      "                error_type = settings$error_type %||% 'SD', input = settings, key_on_figure = TRUE),",
+      "  dpi = settings$download_dpi %||% 600",
+      ")",
+      "if (!is.null(key)) {",
+      "  ggsave('legend_key_recreated.png', key$grob, width = key$width, height = key$height,",
+      "         units = 'in', dpi = settings$download_dpi %||% 600)",
+      "}",
+      "writeLines(legend_text_starter(figure_key_mapping(dat, sumdat, plot_mode, settings)), 'legend_text_recreated.txt')"
     ), collapse = "\n")
   })
 
@@ -4912,6 +5111,21 @@ server <- function(input, output, session) {
   output$download_svg <- downloadHandler(
     filename = function() "cfu_plot.svg",
     content = function(file) save_plot_file(file, "svg")
+  )
+
+  output$download_key_png <- downloadHandler(
+    filename = function() "cfu_plot_legend_key.png",
+    content = function(file) save_key_file(file, "png")
+  )
+
+  output$download_key_pdf <- downloadHandler(
+    filename = function() "cfu_plot_legend_key.pdf",
+    content = function(file) save_key_file(file, "pdf")
+  )
+
+  output$download_key_svg <- downloadHandler(
+    filename = function() "cfu_plot_legend_key.svg",
+    content = function(file) save_key_file(file, "svg")
   )
 
   output$download_gif <- downloadHandler(
@@ -5051,7 +5265,7 @@ server <- function(input, output, session) {
         }
       }
 
-      steps <- 12 + as.integer(isTRUE(input$bundle_gif))
+      steps <- 13 + as.integer(isTRUE(input$bundle_gif))
       withProgress(message = "Building the archive", value = 0, {
         bump <- function(msg) incProgress(1 / steps, detail = msg)
 
@@ -5059,6 +5273,13 @@ server <- function(input, output, session) {
         add("figure.png", "Raster figure at the export DPI.", function(f) save_plot_file(f, "png"))
         add("figure.pdf", "Vector figure for a manuscript.", function(f) save_plot_file(f, "pdf"))
         add("figure.svg", "Vector figure for editing in Illustrator or Inkscape.", function(f) save_plot_file(f, "svg"))
+
+        bump("legend key")
+        add("legend_key.png", "The figure's legend key on its own, raster.", function(f) save_key_file(f, "png"))
+        add("legend_key.pdf", "The figure's legend key on its own, vector.", function(f) save_key_file(f, "pdf"))
+        add("legend_key.svg", "The figure's legend key on its own, editable text.", function(f) save_key_file(f, "svg"))
+        add("legend_text.txt", "Legend text starter: each group with its colour and marker in words.",
+            function(f) writeLines(legend_text(), f))
 
         bump("PowerPoint")
         add("figure.pptx", "PowerPoint slide, editable vector art when rvg is installed.",

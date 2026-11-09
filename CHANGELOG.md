@@ -6,6 +6,74 @@ Entries marked **STATISTICS CHANGE** alter numbers this app has previously produ
 Figures and p-values from a version before such a change are not comparable with figures
 and p-values from a version after it.
 
+## 0.4.0 — 2026-11-09 (unreleased)
+
+One style for the whole paper. No statistic, summary or plotted value changes, and
+figures with every setting at its default render byte-identically to 0.3.0
+(`tests/test_paper_style.R` renders the demo data in all four plot modes with the 0.3.0
+code and this code, in separate R processes, and compares the SVG files and legend keys
+byte for byte).
+
+### Added
+
+- **Colours by sample and timepoint NAME.** The two numbered sample pickers and the two
+  timepoint pickers ("0 min color", "120 min color") are replaced by one picker per
+  sample and one per timepoint in the loaded data, labelled with the name. Colours live
+  in a per-session colour registry keyed by name (`extend_colour_registry()`,
+  `registry_colours()`): loading another CSV keeps every name's colour and gives a new
+  name the first default no other name uses. `figure_key_mapping()` reads the registry,
+  so the figure, the legend key and the text starter follow it; per-bar colours seed
+  from it. **Apply Okabe-Ito** assigns Okabe-Ito in level order to the names loaded.
+  Presets, the manifest and `recreate_figure.R` carry `sample_palette` and
+  `time_palette` (name -> hex); loading a preset merges them by name and keeps names the
+  current CSV lacks.
+- **Font family.** A **Font** menu (Default sans, Arial, Helvetica, Times New Roman,
+  Serif, Custom…) above **Base font size**, threaded through both themes, every
+  `element_text()` and both `geom_text()` layers (statistic labels and the n row), so
+  the legend key, PowerPoint, reveal slides and GIF follow. `resolve_font_family()`
+  checks a named font with systemfonts (optional) and falls back to sans when the
+  machine does not have it; the app says so once, and Figure QA has a **Font** row
+  (requested / used). Saved in presets, the manifest (requested and used) and
+  `recreate_figure.R`.
+- **Paper style.** **Save as paper style** writes the current settings and colour
+  registry to `paper_style.json` beside `app.R` (`CFU_PAPER_STYLE` overrides the path),
+  in the shape of a preset with `"kind": "paper_style"`. It is applied at every start
+  through the same code as a preset upload (`apply_preset_settings()`), except the
+  settings that belong to one figure (`figure_specific_setting_ids`: plot title, plot
+  mode, y minimum, y maximum, survival baseline, survival readout, statistics shown).
+  **Forget paper style** deletes the file after a confirmation. `paper_style.json` is
+  git-ignored.
+- `tests/test_paper_style.R`.
+
+### Changed
+
+- **A figure with three or more samples or timepoints** now colours the third and later
+  groups with Okabe-Ito (bluish green, reddish purple, orange, ...) instead of
+  `hcl.colors("Dark 3")`. One- and two-group figures are unchanged. "Dark 3" is used only
+  past eight samples (ten timepoints).
+- Deselecting a sample no longer shifts the others' colours: colour follows the name.
+
+### Compatibility
+
+- A preset saved before 0.4.0 still loads. Its `sample_color_1` / `sample_color_2` go to
+  the first and second sample loaded at the time, `time_color_1` / `time_color_2` to the
+  first and second timepoint, and a notification says so. A preset that carries
+  `sample_palette` / `time_palette` uses those instead.
+
+### Fixed
+
+- **Colour settings in presets were never restored.** The axis, guide-line, outline,
+  single-bar and statistic-label colours fell into the slider residual of
+  `slider_setting_ids` and were sent through `updateSliderInput(as.numeric("#262626"))`.
+  They now have their own list, `colour_setting_ids`, and `updateColourInput()`.
+- **A preset in millimetres no longer has its size converted twice.** Applying
+  `size_units` with the width and height made the unit converter treat the preset's
+  numbers as inches; the converter is now told the preset's units are in force.
+- **`recreate_figure.R` no longer draws on Rscript's default `pdf()` device**, which
+  cannot draw a system font such as Times New Roman (it stopped with "failed to find or
+  load PDF CID font" on the log10 axis title). It draws to the screen only in an
+  interactive session; the PNG files it writes are unchanged.
+
 ## 0.3.0 — 2026-11-08 (unreleased)
 
 The legend key. No statistic, summary or plotted value changes: figures with the new

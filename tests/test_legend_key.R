@@ -8,6 +8,8 @@
 # Exits non-zero on failure.
 
 suppressPackageStartupMessages({library(shiny); library(ggplot2); library(dplyr); library(tidyr)})
+# Never pick up a paper style saved beside app.R: it would restyle the fixture.
+Sys.setenv(CFU_PAPER_STYLE = file.path(tempdir(), "no_paper_style.json"))
 
 fails <- 0
 ok <- function(label, cond, detail = "") {
@@ -133,11 +135,14 @@ base_inputs <- list(
   append_treatment_unit = FALSE, append_time_unit = TRUE,
   size_mode = "total", size_units = "in", download_width = 7, download_height = 4.4,
   download_dpi = 150, jitter_seed = 1, canvas_mode = "off", comparison = "none",
-  ppt_editable = TRUE, bundle_gif = FALSE, font_size = 11,
-  sample_color_1 = "#000000", sample_color_2 = "#FF7F00",
-  time_color_1 = "#7AA6C2", time_color_2 = "#2F5D8C", single_color = "#7AA6C2",
+  ppt_editable = TRUE, bundle_gif = FALSE, font_size = 11, single_color = "#7AA6C2",
   bar_outline_color = "#262626", bar_outline_width = 0.25, legend_key_on_figure = FALSE
 )
+# Colours are picked per sample NAME (0.4.0): black and orange for the first two.
+colour_inputs <- setNames(list("#000000", "#FF7F00", "#7AA6C2", "#2F5D8C"),
+                          c(sample_colour_input_id(names1[1]), sample_colour_input_id(names1[2]),
+                            time_colour_input_id("Early"), time_colour_input_id("Late")))
+base_inputs <- c(base_inputs, colour_inputs)
 
 zipfile <- tempfile(fileext = ".zip")
 starter_in_app <- NULL
@@ -190,7 +195,7 @@ shiny::testServer(app, {
   session$setInputs(chart_geom = "bar")
   bv <- svg_parts(output$download_key_svg)
   ok("bar figures key with filled rectangles of the bar colour",
-     identical(row_fill(bv, names1[2]), norm_hex(base_inputs$sample_color_2)), row_fill(bv, names1[2]))
+     identical(row_fill(bv, names1[2]), norm_hex(colour_inputs[[2]])), row_fill(bv, names1[2]))
   ok("bar text starter says bars", grepl("MG1655 + WT (orange, bars", legend_text(), fixed = TRUE),
      legend_text())
   session$setInputs(chart_geom = "point")
@@ -199,8 +204,11 @@ shiny::testServer(app, {
   cat("\n-- 2. renames, recolours and selection are followed --\n")
   load_csv(csv2)
   d2 <- cfu_data()
-  session$setInputs(samples = levels(d2$sample), times = levels(d2$time_min),
-                    sample_color_1 = "#377EB8")   # recolour MG1655 black -> blue
+  # The renamed sample is a new name, so it is given orange the way its old
+  # name was; then MG1655 is recoloured black -> blue.
+  do.call(session$setInputs, setNames(list(levels(d2$sample), levels(d2$time_min), "#FF7F00", "#377EB8"),
+                                      c("samples", "times", sample_colour_input_id(names2[2]),
+                                        sample_colour_input_id("MG1655"))))
   sv2 <- svg_parts(output$download_key_svg)
   ok("the renamed sample is in the key", "MG1655 + WT (complemented)" %in% sv2$text)
   ok("the old name is gone from the key", !("MG1655 + WT" %in% sv2$text))

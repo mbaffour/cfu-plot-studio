@@ -1,6 +1,6 @@
 # CFU Plot Studio
 
-**Version 0.3.0.** Statistics from 0.1.x are *not* comparable with 0.2.0 and later — see
+**Version 0.4.0.** Statistics from 0.1.x are *not* comparable with 0.2.0 and later — see
 `CHANGELOG.md` and `AUDIT-2026-09.md` before re-using an older number.
 
 CFU Plot Studio is an R Shiny app for turning replicate-level colony forming unit data into publication-focused bar plots, summary tables, QC checks, and statistics.
@@ -22,6 +22,8 @@ The app is designed for microbiology lab workflows where data are usually collec
 - Exports figures as high-resolution PNG, PDF, SVG, animated GIF, and PowerPoint.
 - Can create editable PowerPoint vector figures when the `rvg` package is installed.
 - Saves and reloads plot-style presets as JSON.
+- Keeps one style for a whole paper: colours belong to sample and timepoint names, one font
+  family for every text, and a paper style that is applied every time the app starts.
 - Exports an analysis manifest and a reproducible R script for the current figure.
 - Includes a Figure QA checklist for publication-readiness checks.
 
@@ -216,6 +218,38 @@ names, colours and selection, and the key on the figure and the downloaded key a
 same. It covers every plot mode, the PowerPoint and reveal slides and the GIF (through
 **Place key on figure**), **Download everything** (`legend_key.*` and `legend_text.txt`)
 and `recreate_figure.R`, which rebuilds the key and the text alongside the figure.
+
+## One Style For The Whole Paper
+
+A paper's figures come from several CSVs and several sessions; they should still look
+like one set.
+
+- **Colours belong to names.** Under **Apply Okabe-Ito colorblind palette** there is one
+  colour picker per sample and one per timepoint in the loaded data, labelled with its
+  name. The colour is stored against the NAME, not the position: load another CSV and
+  every name the app has seen keeps its colour, wherever it falls in the level order,
+  and a new name takes the first default colour no other name is using. Samples default
+  to Okabe-Ito in order (blue, vermillion, bluish green, ...); timepoints to the two
+  blues the app has always used, then Okabe-Ito. Presets, the manifest and
+  `recreate_figure.R` carry the colours as `sample_palette` / `time_palette` (name ->
+  hex). Loading a preset merges them by name, keeping names the current CSV lacks, so
+  one preset can name every strain of the paper. A preset saved before 0.4.0, which
+  numbered its colours (`sample_color_1`, `sample_color_2`, `time_color_1`,
+  `time_color_2`), gives them to the first and second name loaded, and says so.
+- **Font.** **Font** (above **Base font size**) sets the family of every text on the
+  figure: titles, axes, legend, caption, statistic labels, the n row, the legend key and
+  every export. *Custom…* takes any installed family by name. A family this machine does
+  not have is drawn in the default sans; the app says so once, and Figure QA carries a
+  **Font** row with the font requested and the font used. The manifest records both.
+- **Paper style.** In **Reproducibility**, **Save as paper style** writes today's
+  settings and colours to `paper_style.json` beside `app.R` (or wherever the
+  `CFU_PAPER_STYLE` environment variable points), and the app applies that file every
+  time it starts; the line under the buttons names the file and when it was saved.
+  A style is a style, so it leaves the settings that belong to one figure alone: the
+  plot title, plot mode, y minimum, y maximum, survival baseline, survival readout and
+  the statistics shown. **Forget paper style** deletes the file after asking; nothing
+  else changes. The file has the shape of a plot preset, so it can also be loaded
+  through **Load plot preset JSON**, which, as for any preset, applies everything.
 
 ## Keeping The Data Area Fixed
 
@@ -483,6 +517,7 @@ Rscript tests/test_statistics.R
 Rscript tests/test_column_matching.R
 Rscript tests/test_end_to_end.R            # optionally: ... path/to/your.csv
 Rscript tests/test_legend_key.R
+Rscript tests/test_paper_style.R
 ```
 
 `test_end_to_end.R` drives the real Shiny server with a real uploaded CSV, so it covers
@@ -499,6 +534,14 @@ renaming, recolouring and deselecting a sample are followed; the text starter na
 every group with a colour word; the key placed on the figure matches the downloaded one;
 names stay text in SVG and PDF; and the bundled `recreate_figure.R` rebuilds the key in
 a fresh R session.
+
+`test_paper_style.R` renders the default figure in every plot mode with the 0.3.0 code
+(`git show claude/legend-key:app.R`) and with the current code, in separate R processes,
+and checks the SVG files are byte-identical. It then checks that colours follow sample
+names across CSVs and through presets (old numbered presets included), that the font
+reaches every text node, the key and a pinned panel, that the paper style is saved,
+auto-loaded without its figure-specific settings and forgotten, and that the bundled
+`recreate_figure.R` reproduces the palette and the font in a fresh R session.
 
 Multiple-comparison correction options include:
 

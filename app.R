@@ -15,7 +15,7 @@ demo_file <- "dummy_cfu_example.csv"
 # code that produced it is not reproducible, so this constant is the single
 # source of truth for the UI footer, the manifest, the bundle README and
 # CITATION.cff -- bump all of them together.
-APP_VERSION <- "0.3.0"
+APP_VERSION <- "0.4.0"
 
 # Git SHA of the working tree, when the app is run from a checkout. Absent in a
 # plain download, which is why it is optional rather than part of APP_VERSION.
@@ -289,9 +289,9 @@ plot_setting_ids <- c(
   "show_minor_y_ticks", "show_y_grid", "show_minor_y_grid", "y_major_step", "y_minor_step",
   "y_tick_length", "minor_y_tick_length", "axis_line_width", "box_line_width",
   "axis_color", "grid_color", "bar_outline_color", "bar_outline_width", "errorbar_width",
-  "sample_color_1", "sample_color_2", "time_color_1", "time_color_2", "single_color", "stat_color",
+  "single_color", "stat_color",
   "bar_width", "dodge_width", "point_size", "point_alpha", "jitter_width", "jitter_seed",
-  "font_size", "title_size", "subtitle_size", "stat_size", "x_angle",
+  "font_family", "font_family_custom", "font_size", "title_size", "subtitle_size", "stat_size", "x_angle",
   "title_hjust", "subtitle_hjust", "caption_hjust", "x_title_hjust", "y_title_hjust",
   "legend_position", "legend_x", "legend_y", "legend_just_x", "legend_just_y", "legend_key_on_figure",
   "size_mode", "size_units", "download_width", "download_height", "download_dpi", "animation_fps", "animation_duration",
@@ -305,7 +305,7 @@ select_setting_ids <- c(
   # slider_setting_ids is a setdiff residual, so a select id missing from this
   # list gets updateSliderInput called against it: no error, no effect, and the
   # preset silently fails to restore.
-  "surv_baseline", "surv_readout", "surv_scale", "size_mode"
+  "surv_baseline", "surv_readout", "surv_scale", "size_mode", "font_family"
 )
 
 radio_setting_ids <- c("label_kind")
@@ -317,16 +317,23 @@ checkbox_setting_ids <- c(
   "show_minor_y_grid", "ppt_editable", "legend_key_on_figure"
 )
 
-text_setting_ids <- c("plot_title", "plot_subtitle", "x_label", "y_label", "treatment_unit", "time_unit", "legend_title")
+text_setting_ids <- c("plot_title", "plot_subtitle", "x_label", "y_label", "treatment_unit", "time_unit", "legend_title",
+                      "font_family_custom")
 
 numeric_setting_ids <- c(
   "y_min", "y_max", "y_major_step", "y_minor_step", "download_width", "download_height",
   "download_dpi", "animation_dpi", "jitter_seed"
 )
 
+# Colour pickers. Left in the slider residual they were sent through
+# updateSliderInput(as.numeric("#262626")) -- NA -- and never restored, which a
+# paper style that is meant to keep the axis and outline colours cannot afford.
+colour_setting_ids <- c("axis_color", "grid_color", "bar_outline_color", "single_color", "stat_color")
+
 slider_setting_ids <- setdiff(
   plot_setting_ids,
-  c(select_setting_ids, radio_setting_ids, checkbox_setting_ids, text_setting_ids, numeric_setting_ids)
+  c(select_setting_ids, radio_setting_ids, checkbox_setting_ids, text_setting_ids, numeric_setting_ids,
+    colour_setting_ids)
 )
 
 collect_plot_settings <- function(input) {
@@ -335,13 +342,37 @@ collect_plot_settings <- function(input) {
   Filter(function(x) !is.null(x) && length(x) > 0, out)
 }
 
-plot_settings_payload <- function(input) {
+# A paper style is a STYLE: on load it leaves alone the settings that belong
+# to one figure, so the title, the plot mode, the axis range and the comparison
+# of the figure in front of the user survive. Named by what the user sees; the
+# help text in the sidebar is built from these names.
+figure_specific_setting_ids <- c(
+  "plot title" = "plot_title", "plot mode" = "plot_mode", "y minimum" = "y_min",
+  "y maximum" = "y_max", "survival baseline" = "surv_baseline",
+  "survival readout" = "surv_readout", "statistics shown" = "comparison"
+)
+
+# Sample and timepoint colours are keyed by NAME (see the colour registry), so a
+# preset carries them as name -> hex maps rather than as numbered pickers.
+plot_settings_payload <- function(input, sample_palette = NULL, time_palette = NULL) {
+  settings <- collect_plot_settings(input)
+  if (!is.null(sample_palette)) settings$sample_palette <- as.list(unlist(sample_palette))
+  if (!is.null(time_palette)) settings$time_palette <- as.list(unlist(time_palette))
   list(
     app = "CFU Plot Studio",
     preset_version = 1,
     created_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
-    settings = collect_plot_settings(input)
+    settings = settings
   )
+}
+
+# Where the paper style lives: paper_style.json beside app.R (shiny::runApp and
+# run_app.R both run the app with the app folder as the working directory), or
+# wherever CFU_PAPER_STYLE points. Read at call time so the variable can be set
+# after the app is sourced.
+paper_style_path <- function() {
+  env <- Sys.getenv("CFU_PAPER_STYLE", "")
+  if (nzchar(env)) path.expand(env) else file.path(getwd(), "paper_style.json")
 }
 
 significance_label <- function(p) {
@@ -441,15 +472,75 @@ stats_caption <- function(stats_method, p_adjust) {
   paste0(test_txt, "; ", corr_txt, " correction")
 }
 
-named_palette <- function(levels_vec, seed_colors) {
-  levels_vec <- as.character(levels_vec)
-  seed_colors <- unname(seed_colors)
-  if (length(levels_vec) <= length(seed_colors)) {
-    setNames(seed_colors[seq_along(levels_vec)], levels_vec)
-  } else {
-    extra <- grDevices::hcl.colors(length(levels_vec) - length(seed_colors), palette = "Dark 3")
-    setNames(c(seed_colors, extra), levels_vec)
+# ---------------------------------------------------------------------------
+# Colour registry: one colour per sample NAME and per timepoint NAME
+# ---------------------------------------------------------------------------
+# A strain keeps its colour in every figure of a paper, whichever CSV it comes
+# from and wherever it falls in the level order. The registry is a named
+# character vector (name -> hex) per kind; a name it has not seen gets the
+# first default colour no other name in that registry already uses.
+# Samples default to Okabe-Ito in order (its first two, blue and vermillion,
+# are the app's long-standing sample colours); timepoints to the two blues the
+# app has always used, then Okabe-Ito. "Dark 3" only past the fixed pool.
+colour_registry_defaults <- function(kind = "samples", n = 0) {
+  pool <- if (identical(kind, "times")) c("#7AA6C2", "#2F5D8C", okabe_ito) else okabe_ito
+  if (n > length(pool)) pool <- c(pool, grDevices::hcl.colors(n - length(pool), palette = "Dark 3"))
+  pool
+}
+
+# The registry with every name in `names` present, existing names untouched.
+# Accepts a named list (as a preset's JSON reads back) or a named vector.
+extend_colour_registry <- function(registry, names, kind = "samples") {
+  reg <- unlist(registry)
+  if (is.null(reg) || is.null(names(reg))) reg <- setNames(character(0), character(0))
+  reg <- setNames(as.character(reg), names(reg))
+  for (nm in unique(as.character(names))) {
+    if (is.na(nm) || nm %in% names(reg)) next
+    pool <- colour_registry_defaults(kind, length(reg) + 1)
+    taken <- toupper(reg)
+    reg[[nm]] <- pool[!toupper(pool) %in% taken][1]
   }
+  reg
+}
+
+# Colours for the given levels, in level order, from the registry by name.
+registry_colours <- function(registry, levels_vec, kind = "samples") {
+  levels_vec <- as.character(levels_vec)
+  reg <- extend_colour_registry(registry, levels_vec, kind)
+  setNames(unname(reg[levels_vec]), levels_vec)
+}
+
+# ---------------------------------------------------------------------------
+# Font family
+# ---------------------------------------------------------------------------
+# The family the figure asks for: the menu choice, or the typed name when the
+# menu says Custom (blank custom falls back to the default sans).
+font_family_request <- function(choice, custom = "") {
+  choice <- as.character(choice %||% "sans")[1]
+  if (identical(choice, "custom")) {
+    custom <- trimws(as.character(custom %||% "")[1])
+    if (nzchar(custom)) custom else "sans"
+  } else if (nzchar(choice)) choice else "sans"
+}
+
+# Whether this machine can draw the requested family. R's generic families are
+# always there; a named font is looked up with systemfonts, which silently
+# substitutes another family when the name is unknown -- so the match only
+# counts when it comes back with the family that was asked for. Without
+# systemfonts every named font is treated as unavailable.
+resolve_font_family <- function(requested) {
+  requested <- as.character(requested %||% "sans")[1]
+  if (is.na(requested) || !nzchar(trimws(requested))) requested <- "sans"
+  if (tolower(requested) %in% c("sans", "serif", "mono")) {
+    return(list(family = tolower(requested), available = TRUE, requested = requested))
+  }
+  matched <- if (requireNamespace("systemfonts", quietly = TRUE)) {
+    tryCatch(as.character(systemfonts::font_info(family = requested)$family[1]),
+             error = function(e) NA_character_)
+  } else NA_character_
+  ok <- length(matched) == 1 && !is.na(matched) && identical(tolower(matched), tolower(requested))
+  if (ok) list(family = requested, available = TRUE, requested = requested)
+  else list(family = "sans", available = FALSE, requested = requested)
 }
 
 format_p <- function(p) {
@@ -1975,6 +2066,13 @@ bar_keys <- function(dat, plot_mode) {
 # sample or treatment label the user's CSV happens to contain.
 bar_color_input_id <- function(key) paste0("barcol_", make.names(key))
 
+# Input ids of the per-name sample and timepoint colour pickers.
+sample_colour_input_id <- function(name) paste0("samplecol_", make.names(name))
+time_colour_input_id <- function(name) paste0("timecol_", make.names(name))
+colour_input_id <- function(kind, name) {
+  if (identical(kind, "times")) time_colour_input_id(name) else sample_colour_input_id(name)
+}
+
 # ---------------------------------------------------------------------------
 # The figure's colour mapping
 # ---------------------------------------------------------------------------
@@ -1988,10 +2086,16 @@ bar_color_input_id <- function(key) paste0("barcol_", make.names(key))
 #   entries   one row per group the figure actually draws, in legend order:
 #             name, fill, outline, glyph ("bar" or "point"), shape (pch)
 #   per_bar   TRUE when bars are coloured one by one
-figure_key_mapping <- function(dat, sumdat, plot_mode, input, bar_palette = NULL) {
+# Sample and timepoint colours come from the colour registry BY NAME
+# (sample_palette / time_palette: name -> hex). The app passes its registry;
+# the exported script carries the same maps in settings. A level the registry
+# does not name gets the next unused default rather than failing.
+figure_key_mapping <- function(dat, sumdat, plot_mode, input, bar_palette = NULL,
+                               sample_palette = NULL, time_palette = NULL) {
   bar_palette <- bar_palette %||% input$bar_palette
+  sample_palette <- sample_palette %||% input$sample_palette
+  time_palette <- time_palette %||% input$time_palette
   per_bar <- identical(input$bar_color_mode %||% "group", "manual") && length(bar_palette) > 0
-  sample_seeds <- c(input$sample_color_1, input$sample_color_2)
   if (per_bar) {
     present <- unique(bar_keys(sumdat, plot_mode))
     # Any bar the palette does not name falls back to a neutral grey rather than
@@ -2001,13 +2105,13 @@ figure_key_mapping <- function(dat, sumdat, plot_mode, input, bar_palette = NULL
     values[known] <- unlist(bar_palette[known])
     variable <- "bar_key"
   } else if (identical(plot_mode, "survival")) {
-    values <- named_palette(levels(droplevels(sumdat$sample)), sample_seeds)
+    values <- registry_colours(sample_palette, levels(droplevels(sumdat$sample)), "samples")
     variable <- "sample"
   } else if (identical(plot_mode, "combined")) {
-    values <- named_palette(levels(dat$sample), sample_seeds)
+    values <- registry_colours(sample_palette, levels(dat$sample), "samples")
     variable <- "sample"
   } else if (identical(plot_mode, "sample_both")) {
-    values <- named_palette(levels(dat$time_min), c(input$time_color_1, input$time_color_2))
+    values <- registry_colours(time_palette, levels(dat$time_min), "times")
     variable <- "time_min"
   } else {
     # One sample at one timepoint, one colour. Its name is the sample shown.
@@ -2038,7 +2142,7 @@ figure_key_mapping <- function(dat, sumdat, plot_mode, input, bar_palette = NULL
 }
 
 make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input, bar_palette = NULL,
-                          key_on_figure = NULL) {
+                          key_on_figure = NULL, sample_palette = NULL, time_palette = NULL) {
   # Style settings, defaulted individually. The app always supplies these from
   # its UI, but the exported script hands over a plain list a user may edit by
   # hand, and a missing numeric reaches theme_classic(base_size = NULL) and
@@ -2059,6 +2163,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   axis_line_width <- input$axis_line_width %||% 0.6
   box_line_width <- input$box_line_width %||% 0.6
   y_tick_length <- input$y_tick_length %||% 4
+  # One family for every piece of text the figure draws: themes, titles, axis
+  # text, statistic and n labels. A font this machine lacks falls back to sans.
+  font_fam <- resolve_font_family(font_family_request(input$font_family, input$font_family_custom))$family
 
   is_survival <- identical(plot_mode, "survival")
   # The plotted quantity is already a log10 ratio. Sending it through the
@@ -2108,7 +2215,8 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   # character vector keyed by bar_keys().
   # Every fill colour on the figure comes from this one object; the legend key
   # and its text starter are read off the same object (figure_key_mapping).
-  key_map <- figure_key_mapping(dat, sumdat, plot_mode, input, bar_palette)
+  key_map <- figure_key_mapping(dat, sumdat, plot_mode, input, bar_palette,
+                                sample_palette = sample_palette, time_palette = time_palette)
   fill_values <- key_map$values
   per_bar_color <- key_map$per_bar
   if (per_bar_color) {
@@ -2281,13 +2389,13 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     theme(legend.position = legend_pos)
   }
 
-  base_theme <- theme_classic(base_size = font_size) +
+  base_theme <- theme_classic(base_size = font_size, base_family = font_fam) +
     theme(
-      plot.title = element_text(face = "bold", size = title_size),
-      plot.subtitle = element_text(size = subtitle_size, color = "grey30"),
-      axis.text.x = element_text(angle = x_angle, hjust = 1),
+      plot.title = element_text(face = "bold", size = title_size, family = font_fam),
+      plot.subtitle = element_text(size = subtitle_size, color = "grey30", family = font_fam),
+      axis.text.x = element_text(angle = x_angle, hjust = 1, family = font_fam),
       strip.background = element_rect(fill = "grey92", color = NA),
-      strip.text = element_text(face = "bold"),
+      strip.text = element_text(face = "bold", family = font_fam),
       axis.ticks.y = if (isTRUE(input$show_y_ticks)) element_line(color = axis_col, linewidth = axis_line_width) else element_blank(),
       axis.minor.ticks.y.left = if (use_minor_ticks) element_line(color = axis_col, linewidth = axis_line_width * 0.75) else element_blank(),
       axis.ticks.length.y = grid::unit(y_tick_length, "pt"),
@@ -2300,13 +2408,13 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     legend_theme
 
   if (identical(plot_theme, "minimal_grid")) {
-    base_theme <- theme_minimal(base_size = font_size) +
+    base_theme <- theme_minimal(base_size = font_size, base_family = font_fam) +
       theme(
-        plot.title = element_text(face = "bold", size = title_size),
-        plot.subtitle = element_text(size = subtitle_size, color = "grey30"),
-        axis.text.x = element_text(angle = x_angle, hjust = 1),
+        plot.title = element_text(face = "bold", size = title_size, family = font_fam),
+        plot.subtitle = element_text(size = subtitle_size, color = "grey30", family = font_fam),
+        axis.text.x = element_text(angle = x_angle, hjust = 1, family = font_fam),
         strip.background = element_rect(fill = "grey95", color = NA),
-        strip.text = element_text(face = "bold"),
+        strip.text = element_text(face = "bold", family = font_fam),
         panel.grid.major.x = element_blank(),
         panel.grid.minor.x = element_blank(),
         panel.grid.major.y = element_line(color = grid_col, linewidth = 0.3),
@@ -2426,7 +2534,8 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       # point offset into that unit.
       vjust = 1 + n_row_offset_pt / n_label_pt,
       size = n_label_pt * 0.3528,
-      color = stat_col
+      color = stat_col,
+      family = font_fam
     )
   }
 
@@ -2550,7 +2659,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       aes(x = x, y = y, label = label)
     }
     p <- p + geom_text(data = ann, ann_aes, inherit.aes = FALSE,
-                       size = stat_size, color = stat_col)
+                       size = stat_size, color = stat_col, family = font_fam)
   }
 
   if (!is.null(caption_text)) {
@@ -2559,14 +2668,16 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
 
   p <- p + base_theme +
     theme(
-      plot.title = element_text(face = "bold", size = title_size, hjust = input$title_hjust %||% 0),
-      plot.subtitle = element_text(size = subtitle_size, color = "grey30", hjust = input$subtitle_hjust %||% 0),
+      plot.title = element_text(face = "bold", size = title_size, hjust = input$title_hjust %||% 0,
+                                family = font_fam),
+      plot.subtitle = element_text(size = subtitle_size, color = "grey30", hjust = input$subtitle_hjust %||% 0,
+                                   family = font_fam),
       plot.caption = element_text(
         size = (subtitle_size %||% 10) * 0.92, color = "grey35",
-        hjust = input$caption_hjust %||% 0
+        hjust = input$caption_hjust %||% 0, family = font_fam
       ),
-      axis.title.x = element_text(hjust = input$x_title_hjust %||% 0.5),
-      axis.title.y = element_text(hjust = input$y_title_hjust %||% 0.5)
+      axis.title.x = element_text(hjust = input$x_title_hjust %||% 0.5, family = font_fam),
+      axis.title.y = element_text(hjust = input$y_title_hjust %||% 0.5, family = font_fam)
     )
 
   # The n row sits outside the panel between the tick labels and the axis title,
@@ -2576,7 +2687,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     # needs the extra height the n row adds -- not the tick extent again.
     p <- p + theme(
       axis.title.x = element_text(margin = margin(t = n_label_pt + 7, unit = "pt"),
-                                  hjust = input$x_title_hjust %||% 0.5),
+                                  hjust = input$x_title_hjust %||% 0.5, family = font_fam),
       plot.margin = margin(5.5, 5.5, 8, 5.5, "pt")
     )
   }
@@ -2605,7 +2716,8 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   p
 }
 
-make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, step = NULL, bar_palette = NULL) {
+make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, step = NULL, bar_palette = NULL,
+                             sample_palette = NULL, time_palette = NULL) {
   reveal <- reveal_data(dat, sumdat, plot_mode)
   if (!is.null(step)) {
     step <- max(1, min(step, nrow(reveal$groups)))
@@ -2621,11 +2733,14 @@ make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, 
     y_mode = y_mode,
     error_type = error_type,
     input = input,
-    bar_palette = bar_palette
+    bar_palette = bar_palette,
+    sample_palette = sample_palette,
+    time_palette = time_palette
   )
 }
 
-make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, bar_palette = NULL) {
+make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, bar_palette = NULL,
+                                   sample_palette = NULL, time_palette = NULL) {
   validate(need(requireNamespace("gganimate", quietly = TRUE), "Package gganimate is required for GIF export."))
   validate(need(requireNamespace("gifski", quietly = TRUE), "Package gifski is required for GIF export."))
 
@@ -2644,7 +2759,9 @@ make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, i
     y_mode = y_mode,
     error_type = error_type,
     input = input,
-    bar_palette = bar_palette
+    bar_palette = bar_palette,
+    sample_palette = sample_palette,
+    time_palette = time_palette
   ) +
     gganimate::transition_manual(frame) +
     labs(caption = "Reveal step {current_frame}")
@@ -3503,10 +3620,9 @@ ui <- fluidPage(
       sliderInput("errorbar_width", "Error bar line width", min = 0.2, max = 2, value = 0.55),
       actionButton("apply_okabe_ito", "Apply Okabe-Ito colorblind palette"),
       helpText("Okabe-Ito is a colorblind-safe qualitative palette (Wong 2011). Applies to sample, time, and single-bar colors."),
-      colourInput("sample_color_1", "Sample color 1", value = "#0072B2"),
-      colourInput("sample_color_2", "Sample color 2", value = "#D55E00"),
-      colourInput("time_color_1", "0 min color", value = "#7AA6C2"),
-      colourInput("time_color_2", "120 min color", value = "#2F5D8C"),
+      helpText("Colours belong to sample and timepoint NAMES, so a strain keeps its colour in every figure and every CSV of the session. A name seen for the first time takes the next unused colour."),
+      uiOutput("sample_colour_ui"),
+      uiOutput("time_colour_ui"),
       colourInput("single_color", "Single-bar color", value = "#7AA6C2"),
       selectInput("bar_color_mode", "Bar colouring", choices = c(
         "By group (sample or timepoint)" = "group",
@@ -3521,6 +3637,15 @@ ui <- fluidPage(
       sliderInput("jitter_width", "Point jitter", min = 0, max = 0.25, value = 0.08),
       numericInput("jitter_seed", "Jitter seed", value = 1, min = 1, max = 99999, step = 1),
       helpText("The seed fixes where the jittered replicate points land, so re-exporting the same figure -- or running the exported R script -- puts every point back in the same place. Change it only to reshuffle overlapping points."),
+      selectInput("font_family", "Font", choices = c(
+        "Default sans" = "sans", "Arial", "Helvetica", "Times New Roman",
+        "Serif" = "serif", "Custom…" = "custom"
+      ), selected = "sans"),
+      conditionalPanel(
+        "input.font_family == 'custom'",
+        textInput("font_family_custom", "Custom font name", "")
+      ),
+      helpText("Every piece of text on the figure, the key and the exports is drawn in this font. A font this machine does not have is drawn in the default sans, and Figure QA says so."),
       sliderInput("font_size", "Base font size", min = 8, max = 18, value = 11),
       sliderInput("title_size", "Title font size", min = 9, max = 24, value = 14),
       sliderInput("subtitle_size", "Subtitle font size", min = 7, max = 16, value = 10),
@@ -3547,6 +3672,21 @@ ui <- fluidPage(
       checkboxInput("ppt_editable", "PowerPoint figure is editable vector art", value = TRUE),
       tags$hr(),
       h4("Reproducibility"),
+      div(
+        class = "paper-style-box",
+        tags$strong("Paper style"),
+        fluidRow(
+          column(6, actionButton("paper_style_save", "Save as paper style")),
+          column(6, actionButton("paper_style_forget", "Forget paper style"))
+        ),
+        div(class = "size-readout", textOutput("paper_style_status", inline = TRUE)),
+        helpText(paste0(
+          "A paper style keeps today's look -- font, sizes, colours by sample and timepoint name, ",
+          "axes, legend, export size -- and applies it every time the app starts, so every figure ",
+          "of the paper matches. It leaves the settings that belong to one figure alone: ",
+          paste(names(figure_specific_setting_ids), collapse = ", "), "."
+        ))
+      ),
       fileInput("preset_file", "Load plot preset JSON", accept = ".json"),
       downloadButton("download_preset", "Save plot preset"),
       downloadButton("download_manifest", "Analysis manifest"),
@@ -3825,10 +3965,19 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$apply_okabe_ito, {
-    updateColourInput(session, "sample_color_1", value = okabe_ito[1])
-    updateColourInput(session, "sample_color_2", value = okabe_ito[2])
-    updateColourInput(session, "time_color_1", value = okabe_ito[1])
-    updateColourInput(session, "time_color_2", value = okabe_ito[2])
+    # Okabe-Ito in level order to the samples and timepoints loaded now. Names
+    # not in this CSV keep whatever colour the registry holds for them.
+    lv <- current_levels()
+    reg <- colour_registry()
+    for (kind in c("samples", "times")) {
+      for (i in seq_along(lv[[kind]])) {
+        nm <- lv[[kind]][i]
+        col <- okabe_ito[((i - 1) %% length(okabe_ito)) + 1]
+        reg[[kind]][[nm]] <- col
+        updateColourInput(session, colour_input_id(kind, nm), value = col)
+      }
+    }
+    colour_registry(reg)
     updateColourInput(session, "single_color", value = okabe_ito[1])
     showNotification("Applied Okabe-Ito colorblind-safe palette.", type = "message")
   })
@@ -3922,6 +4071,88 @@ server <- function(input, output, session) {
     set_figure_size(4.5, 4.5, 600)
   })
 
+  # One path for every way settings arrive: an uploaded preset, the paper style
+  # at startup, the paper style just saved. `skip` names settings to leave
+  # alone (a paper style skips figure_specific_setting_ids). Returns the
+  # settings it sent to the inputs, id -> value.
+  apply_preset_settings <- function(settings, session, skip = character(0)) {
+    applied <- list()
+    for (id in setdiff(intersect(names(settings), plot_setting_ids), skip)) {
+      value <- settings[[id]]
+      if (id %in% select_setting_ids) {
+        updateSelectInput(session, id, selected = value)
+      } else if (id %in% radio_setting_ids) {
+        updateRadioButtons(session, id, selected = value)
+      } else if (id %in% checkbox_setting_ids) {
+        updateCheckboxInput(session, id, value = isTRUE(value))
+      } else if (id %in% text_setting_ids) {
+        updateTextInput(session, id, value = as.character(value %||% ""))
+      } else if (id %in% numeric_setting_ids) {
+        updateNumericInput(session, id, value = suppressWarnings(as.numeric(value)))
+      } else if (id %in% colour_setting_ids) {
+        updateColourInput(session, id, value = as.character(value))
+      } else if (id %in% slider_setting_ids) {
+        updateSliderInput(session, id, value = suppressWarnings(as.numeric(value)))
+      }
+      applied[[id]] <- value
+    }
+    if (!is.null(settings$bar_palette) && length(settings$bar_palette) > 0) {
+      pal <- unlist(settings$bar_palette)
+      for (key in names(pal)) {
+        updateColourInput(session, bar_color_input_id(key), value = unname(pal[[key]]))
+      }
+    }
+    # Sample and timepoint colours merge into the registry BY NAME. Names the
+    # current CSV lacks are kept, so a paper-wide palette can name every strain.
+    lv <- isolate(current_levels())
+    reg <- isolate(colour_registry())
+    legacy_note <- character(0)
+    for (kind in c("samples", "times")) {
+      pal <- unlist(settings[[if (identical(kind, "samples")) "sample_palette" else "time_palette"]])
+      if (length(pal) > 0 && !is.null(names(pal))) {
+        for (nm in names(pal)) {
+          reg[[kind]][[nm]] <- as.character(pal[[nm]])
+          if (nm %in% lv[[kind]]) updateColourInput(session, colour_input_id(kind, nm), value = as.character(pal[[nm]]))
+        }
+        applied[[if (identical(kind, "samples")) "sample_palette" else "time_palette"]] <- as.list(pal)
+        next
+      }
+      # Presets from before 0.4.0 numbered their two colours. They go to the
+      # first and second level loaded now, which is what they coloured then.
+      old_ids <- if (identical(kind, "samples")) c("sample_color_1", "sample_color_2")
+                 else c("time_color_1", "time_color_2")
+      old <- lapply(old_ids, function(id) settings[[id]])
+      if (all(vapply(old, is.null, logical(1)))) next
+      targets <- character(0)
+      for (k in seq_along(old)) {
+        if (is.null(old[[k]]) || length(lv[[kind]]) < k) next
+        nm <- lv[[kind]][k]
+        reg[[kind]][[nm]] <- as.character(old[[k]])[1]
+        updateColourInput(session, colour_input_id(kind, nm), value = as.character(old[[k]])[1])
+        targets <- c(targets, nm)
+      }
+      legacy_note <- c(legacy_note, paste0(
+        if (identical(kind, "samples")) "sample" else "timepoint", " colours went to ",
+        if (length(targets) > 0) paste(targets, collapse = " and ") else "nothing (no data loaded)"
+      ))
+    }
+    colour_registry(reg)
+    # The width and height arrive in the preset's units. Tell the unit
+    # converter those units are already in force, or switching the selector
+    # would "convert" the preset's numbers a second time.
+    if (!is.null(applied$size_units)) size_units_previous(as.character(applied$size_units))
+    if (length(legacy_note) > 0) {
+      tryCatch(showNotification(paste0(
+        "This preset is from before 0.4.0 and numbers its colours; they were given to the first ",
+        "and second names loaded now: ", paste(legacy_note, collapse = "; "), "."
+      ), type = "warning", duration = 10, session = session), error = function(e) NULL)
+    }
+    invisible(applied)
+  }
+
+  # What the last preset or paper style actually set, for the record and tests.
+  last_applied_settings <- reactiveVal(NULL)
+
   observeEvent(input$preset_file, {
     req(input$preset_file)
     validate(need(requireNamespace("jsonlite", quietly = TRUE), "Package jsonlite is required to load plot presets."))
@@ -3934,29 +4165,93 @@ server <- function(input, output, session) {
     )
     if (is.null(preset)) return()
     settings <- preset$settings %||% preset
-    for (id in intersect(names(settings), plot_setting_ids)) {
-      value <- settings[[id]]
-      if (id %in% select_setting_ids) {
-        updateSelectInput(session, id, selected = value)
-      } else if (id %in% radio_setting_ids) {
-        updateRadioButtons(session, id, selected = value)
-      } else if (id %in% checkbox_setting_ids) {
-        updateCheckboxInput(session, id, value = isTRUE(value))
-      } else if (id %in% text_setting_ids) {
-        updateTextInput(session, id, value = as.character(value %||% ""))
-      } else if (id %in% numeric_setting_ids) {
-        updateNumericInput(session, id, value = suppressWarnings(as.numeric(value)))
-      } else if (id %in% slider_setting_ids) {
-        updateSliderInput(session, id, value = suppressWarnings(as.numeric(value)))
-      }
-    }
-    if (!is.null(settings$bar_palette) && length(settings$bar_palette) > 0) {
-      pal <- unlist(settings$bar_palette)
-      for (key in names(pal)) {
-        updateColourInput(session, bar_color_input_id(key), value = unname(pal[[key]]))
-      }
-    }
+    last_applied_settings(apply_preset_settings(settings, session))
     showNotification("Plot preset loaded.", type = "message")
+  })
+
+  # --- Paper style -----------------------------------------------------------
+  # Today's settings saved beside the app and applied at every start, so every
+  # figure of one paper comes out in the same style from any CSV.
+  no_paper_style_text <- "No paper style saved. Save as paper style keeps today's settings for every figure of the paper."
+  paper_style_status <- reactiveVal(
+    if (file.exists(paper_style_path())) paste0("Paper style: ", paper_style_path()) else no_paper_style_text
+  )
+  output$paper_style_status <- renderText(paper_style_status())
+
+  load_paper_style <- function() {
+    path <- paper_style_path()
+    if (!file.exists(path)) {
+      paper_style_status(no_paper_style_text)
+      return(invisible(NULL))
+    }
+    if (!requireNamespace("jsonlite", quietly = TRUE)) {
+      paper_style_status(paste0("Paper style at ", path, " needs the jsonlite package to load."))
+      return(invisible(NULL))
+    }
+    style <- tryCatch(jsonlite::read_json(path, simplifyVector = TRUE), error = function(e) NULL)
+    if (is.null(style)) {
+      paper_style_status(paste0("Paper style at ", path, " could not be read; nothing was applied."))
+      return(invisible(NULL))
+    }
+    settings <- style$settings %||% style
+    applied <- apply_preset_settings(settings, session, skip = unname(figure_specific_setting_ids))
+    last_applied_settings(applied)
+    paper_style_status(paste0("Paper style: ", path, ", saved ", style$created_at %||% "at an unknown time"))
+    invisible(applied)
+  }
+
+  # After the first flush, so the inputs the style updates exist in the page.
+  session$onFlushed(function() isolate(load_paper_style()), once = TRUE)
+
+  observeEvent(input$paper_style_save, {
+    if (!requireNamespace("jsonlite", quietly = TRUE)) {
+      showNotification("Package jsonlite is required to save a paper style.", type = "error")
+      return()
+    }
+    path <- paper_style_path()
+    reg <- colour_registry()
+    payload <- plot_settings_payload(input, reg$samples, reg$times)
+    payload <- c(payload[1], list(kind = "paper_style"), payload[-1])
+    written <- tryCatch({
+      dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+      writeLines(jsonlite::toJSON(payload, pretty = TRUE, auto_unbox = TRUE, null = "null"), path)
+      TRUE
+    }, error = function(e) conditionMessage(e))
+    if (!isTRUE(written)) {
+      showNotification(paste0("The paper style could not be written to ", path, ": ", written), type = "error")
+      return()
+    }
+    load_paper_style()
+    showNotification(paste0("Paper style saved to ", path, ". It is applied every time the app starts."),
+                     type = "message", duration = 8)
+  })
+
+  observeEvent(input$paper_style_forget, {
+    path <- paper_style_path()
+    if (!file.exists(path)) {
+      paper_style_status(no_paper_style_text)
+      showNotification("No paper style is saved.", type = "message")
+      return()
+    }
+    showModal(modalDialog(
+      title = "Forget the paper style?",
+      paste0("This deletes ", path, ". The figure in front of you keeps its settings; ",
+             "the next session starts from the app defaults."),
+      footer = tagList(modalButton("Keep it"), actionButton("paper_style_forget_confirm", "Forget paper style")),
+      easyClose = TRUE
+    ))
+  })
+
+  observeEvent(input$paper_style_forget_confirm, {
+    path <- paper_style_path()
+    gone <- !file.exists(path) || isTRUE(file.remove(path))
+    removeModal()
+    if (gone) {
+      paper_style_status(no_paper_style_text)
+      showNotification(paste0("Paper style forgotten; ", path, " deleted."), type = "message")
+    } else {
+      showNotification(paste0("Could not delete ", path, "."), type = "error")
+    }
   })
 
   output$mapping_ui <- renderUI({
@@ -4089,6 +4384,85 @@ server <- function(input, output, session) {
     showNotification("Legend and statistic labels returned to their automatic positions.", type = "message")
   })
 
+  # --- Colour registry -------------------------------------------------------
+  # Sample and timepoint colours, keyed by NAME. It outlives the CSV: loading
+  # another file keeps every name it has seen and gives new names the next
+  # unused default, so a strain is the same colour in every figure.
+  colour_registry <- reactiveVal(list(
+    samples = setNames(character(0), character(0)),
+    times = setNames(character(0), character(0))
+  ))
+
+  # The sample and timepoint names in the loaded data, in level order; empty
+  # before the columns are mapped.
+  current_levels <- reactive({
+    d <- tryCatch(cfu_data(), error = function(e) NULL)
+    if (is.null(d)) return(list(samples = character(0), times = character(0)))
+    list(samples = levels(droplevels(as.factor(d$sample))),
+         times = levels(droplevels(as.factor(d$time_min))))
+  })
+
+  observeEvent(current_levels(), {
+    lv <- current_levels()
+    reg <- colour_registry()
+    new <- list(samples = extend_colour_registry(reg$samples, lv$samples, "samples"),
+                times = extend_colour_registry(reg$times, lv$times, "times"))
+    if (!identical(new, reg)) colour_registry(new)
+  })
+
+  # Picker -> registry. A picker writes only when its value CHANGES: a picker
+  # for a name that left the data keeps its last value in `input`, and that
+  # stale value must not overwrite a colour a preset set since.
+  picker_seen <- new.env(parent = emptyenv())
+  observe({
+    lv <- current_levels()
+    reg <- isolate(colour_registry())
+    changed <- FALSE
+    for (kind in c("samples", "times")) {
+      for (nm in lv[[kind]]) {
+        id <- colour_input_id(kind, nm)
+        val <- input[[id]]
+        if (is.null(val) || length(val) != 1 || !nzchar(val)) next
+        if (identical(val, picker_seen[[id]])) next
+        assign(id, val, envir = picker_seen)
+        if (!identical(unname(reg[[kind]][nm]), val)) {
+          reg[[kind]][[nm]] <- val
+          changed <- TRUE
+        }
+      }
+    }
+    if (changed) colour_registry(reg)
+  })
+
+  colour_picker_ui <- function(kind) {
+    lv <- current_levels()[[kind]]
+    what <- if (identical(kind, "samples")) "sample" else "timepoint"
+    if (length(lv) == 0) {
+      return(helpText(paste0("Load data to get one colour picker per ", what, ".")))
+    }
+    cols <- registry_colours(isolate(colour_registry())[[kind]], lv, kind)
+    tagList(
+      tags$label(class = "control-label", if (identical(kind, "samples")) "Sample colours" else "Timepoint colours"),
+      lapply(lv, function(nm) colourInput(colour_input_id(kind, nm), nm, value = unname(cols[[nm]])))
+    )
+  }
+  output$sample_colour_ui <- renderUI(colour_picker_ui("samples"))
+  output$time_colour_ui <- renderUI(colour_picker_ui("times"))
+
+  # --- Font ------------------------------------------------------------------
+  font_resolved <- reactive(resolve_font_family(font_family_request(input$font_family, input$font_family_custom)))
+  # Debounced so typing a custom name does not raise a notice per keystroke.
+  font_request_settled <- debounce(reactive(font_family_request(input$font_family, input$font_family_custom)), 1000)
+  observeEvent(font_request_settled(), {
+    f <- resolve_font_family(font_request_settled())
+    if (!isTRUE(f$available)) {
+      tryCatch(showNotification(
+        paste0(f$requested, " is not installed on this machine; drawn with the default sans."),
+        type = "warning", duration = 8
+      ), error = function(e) NULL)
+    }
+  })
+
   # --- Per-bar colours -------------------------------------------------------
   # One picker per drawn bar. The keys come from the filtered data, so they
   # follow the plot mode and any sample/timepoint filtering.
@@ -4108,13 +4482,9 @@ server <- function(input, output, session) {
     # pickers must seed from the sample colours too -- otherwise every bar
     # starts the same colour and the user has to set all of them by hand.
     if (input$plot_mode %in% c("combined", "survival") && grp %in% lv_sample) {
-      c(input$sample_color_1 %||% okabe_ito[1], input$sample_color_2 %||% okabe_ito[2])[
-        match(grp, lv_sample)
-      ] %||% okabe_ito[((idx - 1) %% length(okabe_ito)) + 1]
+      unname(registry_colours(colour_registry()$samples, lv_sample, "samples")[grp])
     } else if (identical(input$plot_mode, "sample_both") && grp %in% lv_time) {
-      c(input$time_color_1 %||% okabe_ito[6], input$time_color_2 %||% okabe_ito[1])[
-        match(grp, lv_time)
-      ] %||% okabe_ito[((idx - 1) %% length(okabe_ito)) + 1]
+      unname(registry_colours(colour_registry()$times, lv_time, "times")[grp])
     } else {
       input$single_color %||% okabe_ito[1]
     }
@@ -4602,6 +4972,16 @@ server <- function(input, output, session) {
         paste0("Export size is ", format_figure_size(export_width(), export_height(), export_dpi()),
                "; below roughly 50 x 40 mm most journals will not hold the text legible.")
       ),
+      {
+        f <- font_resolved()
+        add_check(
+          "Font",
+          f$available,
+          paste0("Requested ", f$requested, "; drawn in ", f$family, "."),
+          paste0("Requested ", f$requested, "; drawn in ", f$family, ", because ", f$requested,
+                 " is not installed on this machine. Install it, or pick another font, before export.")
+        )
+      },
       add_check(
         "Base font size",
         !is.na(input$font_size) && input$font_size >= 9,
@@ -4687,7 +5067,9 @@ server <- function(input, output, session) {
       y_mode = input$y_mode,
       error_type = input$error_type,
       input = input,
-      bar_palette = bar_palette()
+      bar_palette = bar_palette(),
+      sample_palette = colour_registry()$samples,
+      time_palette = colour_registry()$times
     )
   })
 
@@ -4720,7 +5102,8 @@ server <- function(input, output, session) {
   # same inputs current_plot() passes to make_cfu_plot().
   key_mapping <- reactive({
     validate(need(nrow(filtered_data()) > 0, "No rows remain after filtering."))
-    figure_key_mapping(plot_data(), current_summary(), input$plot_mode, input, bar_palette())
+    figure_key_mapping(plot_data(), current_summary(), input$plot_mode, input, bar_palette(),
+                       sample_palette = colour_registry()$samples, time_palette = colour_registry()$times)
   })
 
   # The figure with its key switched on. When the key is already on the figure
@@ -4732,7 +5115,8 @@ server <- function(input, output, session) {
     make_cfu_plot(
       dat = plot_data(), sumdat = current_summary(), ann = current_annotation(),
       plot_mode = input$plot_mode, y_mode = input$y_mode, error_type = input$error_type,
-      input = input, bar_palette = bar_palette(), key_on_figure = TRUE
+      input = input, bar_palette = bar_palette(), key_on_figure = TRUE,
+      sample_palette = colour_registry()$samples, time_palette = colour_registry()$times
     )
   })
 
@@ -4909,7 +5293,9 @@ server <- function(input, output, session) {
         error_type = input$error_type,
         input = input,
         step = step,
-        bar_palette = bar_palette()
+        bar_palette = bar_palette(),
+        sample_palette = colour_registry()$samples,
+        time_palette = colour_registry()$times
       ) +
         labs(caption = paste0("Reveal step ", step, " of ", total_steps))
       doc <- add_plot_slide(doc, step_plot)
@@ -4966,7 +5352,16 @@ server <- function(input, output, session) {
         scale = unique(as.character(current_summary()$summary_scale %||% NA)),
         statistics_scale = if (is_survival_frame(plot_data())) "log10 survival ratio" else "log10(CFU)"
       ),
-      settings = c(collect_plot_settings(input), list(bar_palette = as.list(bar_palette() %||% NULL))),
+      settings = c(collect_plot_settings(input), list(
+        bar_palette = as.list(bar_palette() %||% NULL),
+        sample_palette = as.list(colour_registry()$samples),
+        time_palette = as.list(colour_registry()$times)
+      )),
+      font = list(
+        requested = font_resolved()$requested,
+        used = font_resolved()$family,
+        available = font_resolved()$available
+      ),
       visible_data = list(
         rows = nrow(plot_data()),
         readout = if (is_survival_frame(plot_data())) "paired survival ratio" else "absolute CFU",
@@ -4993,6 +5388,10 @@ server <- function(input, output, session) {
     # The per-bar palette lives in dynamic inputs, so collect_plot_settings
     # cannot see it. Bake it in or the exported script loses the colours.
     settings$bar_palette <- as.list(bar_palette() %||% NULL)
+    # Sample and timepoint colours live in the registry, keyed by name; the
+    # script reads them from settings exactly as the app reads the registry.
+    settings$sample_palette <- as.list(colour_registry()$samples)
+    settings$time_palette <- as.list(colour_registry()$times)
     dat_csv <- csv_literal(plot_data())
     sum_csv <- csv_literal(current_summary())
     ann_csv <- csv_literal(current_annotation())
@@ -5031,7 +5430,12 @@ server <- function(input, output, session) {
       exported_function_source("size_to_inches"),
       exported_function_source("scale_breaks_or_default"),
       exported_function_source("axis_step_breaks"),
-      exported_function_source("named_palette"),
+      exported_function_source("okabe_ito"),
+      exported_function_source("colour_registry_defaults"),
+      exported_function_source("extend_colour_registry"),
+      exported_function_source("registry_colours"),
+      exported_function_source("font_family_request"),
+      exported_function_source("resolve_font_family"),
       exported_function_source("fix_panel_size"),
       exported_function_source("with_measure_device"),
       exported_function_source("gtable_size_in"),
@@ -5076,7 +5480,9 @@ server <- function(input, output, session) {
       "  obj <- p",
       "}",
       "",
-      "grid::grid.newpage(); grid::grid.draw(if (inherits(obj, 'gtable')) obj else ggplotGrob(obj))",
+      "# On screen only when there is a screen: Rscript's default device is pdf(),",
+      "# which cannot draw a system font such as Times New Roman.",
+      "if (interactive()) { grid::grid.newpage(); grid::grid.draw(if (inherits(obj, 'gtable')) obj else ggplotGrob(obj)) }",
       "ggsave(",
       "  'cfu_plot_recreated.png', obj,",
       "  width = w_in, height = h_in,",
@@ -5138,7 +5544,9 @@ server <- function(input, output, session) {
         y_mode = input$y_mode,
         error_type = input$error_type,
         input = input,
-        bar_palette = bar_palette()
+        bar_palette = bar_palette(),
+        sample_palette = colour_registry()$samples,
+        time_palette = colour_registry()$times
       )
       if (panel_mode()) {
         showNotification(
@@ -5180,7 +5588,9 @@ server <- function(input, output, session) {
     filename = function() "cfu_plot_preset.json",
     content = function(file) {
       validate(need(requireNamespace("jsonlite", quietly = TRUE), "Package jsonlite is required for plot preset export."))
-      writeLines(jsonlite::toJSON(plot_settings_payload(input), pretty = TRUE, auto_unbox = TRUE, null = "null"), file)
+      reg <- colour_registry()
+      writeLines(jsonlite::toJSON(plot_settings_payload(input, reg$samples, reg$times),
+                                  pretty = TRUE, auto_unbox = TRUE, null = "null"), file)
     }
   )
 
@@ -5292,7 +5702,8 @@ server <- function(input, output, session) {
                 anim <- make_animated_cfu_plot(
                   dat = plot_data(), sumdat = current_summary(), plot_mode = input$plot_mode,
                   y_mode = input$y_mode, error_type = input$error_type, input = input,
-                  bar_palette = bar_palette())
+                  bar_palette = bar_palette(), sample_palette = colour_registry()$samples,
+                  time_palette = colour_registry()$times)
                 rendered <- gganimate::animate(
                   anim$plot, nframes = max(anim$steps, round(input$animation_duration * input$animation_fps)),
                   fps = input$animation_fps, width = export_width(), height = export_height(),

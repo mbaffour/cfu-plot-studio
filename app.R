@@ -4829,7 +4829,9 @@ server <- function(input, output, session) {
       "",
       paste0("dat <- read.csv(text = ", dat_csv, ", check.names = FALSE)"),
       paste0("sumdat <- read.csv(text = ", sum_csv, ", check.names = FALSE)"),
-      paste0("ann <- read.csv(text = ", ann_csv, ", check.names = FALSE)"),
+      # A figure without statistic labels has an empty annotation table, which
+      # read.csv() refuses outright; that must not stop the figure rebuilding.
+      paste0("ann <- tryCatch(read.csv(text = ", ann_csv, ", check.names = FALSE), error = function(e) data.frame())"),
       "",
       "for (nm in intersect(c('sample', 'concentration_label', 'time_min'), names(dat))) dat[[nm]] <- factor(dat[[nm]], levels = unique(dat[[nm]]))",
       "for (nm in intersect(c('sample', 'concentration_label', 'time_min'), names(sumdat))) sumdat[[nm]] <- factor(sumdat[[nm]], levels = unique(sumdat[[nm]]))",
@@ -4861,6 +4863,8 @@ server <- function(input, output, session) {
       exported_function_source("bar_keys"),
       exported_function_source("figure_key_mapping"),
       exported_function_source("error_type_caption"),
+      exported_function_source("is_emmeans_method"),
+      exported_function_source("emmeans_adjust_for"),
       exported_function_source("stats_caption"),
       exported_function_source("make_cfu_plot"),
       "",

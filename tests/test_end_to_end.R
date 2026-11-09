@@ -6,6 +6,8 @@
 # Exits non-zero on failure.
 
 suppressPackageStartupMessages({library(shiny); library(ggplot2); library(dplyr); library(tidyr)})
+# Never pick up a paper style saved beside app.R: it would restyle the fixture.
+Sys.setenv(CFU_PAPER_STYLE = file.path(tempdir(), "no_paper_style.json"))
 
 args <- commandArgs(trailingOnly = TRUE)
 csv <- if (length(args) > 0 && nzchar(args[1])) args[1] else {

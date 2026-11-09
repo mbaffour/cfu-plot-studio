@@ -22,3 +22,6 @@ Desktop.ini
 
 # Default device R opens when a script draws headlessly
 Rplots.pdf
+
+# The paper style saved by the app (Save as paper style)
+paper_style.json

@@ -21,12 +21,16 @@ ok <- function(label, cond, detail = "") {
 }
 eq <- function(a, b, tol = 1e-8) isTRUE(all.equal(unname(a), unname(b), tolerance = tol))
 
-mk <- function(sample, conc, time, rep, cfu) {
+# `bio` says which column identifies the biological replicate: the Replicate
+# column by default (what the app's own mapping resolves to), or NA for a file
+# whose repeats are technical and unlabelled.
+mk <- function(sample, conc, time, rep, cfu, bio = "Replicate", ...) {
   raw <- tibble::tibble(Sample = sample, inducer_concentration = conc,
                         Time = time, Replicate = rep, CFU = cfu)
   prep_cfu_data(raw, list(sample = "Sample", concentration = "inducer_concentration",
-                          time = "Time", replicate = "Replicate", cfu = "CFU"),
-                "", "min", FALSE, TRUE)
+                          time = "Time", replicate = "Replicate",
+                          bio_replicate = bio, cfu = "CFU"),
+                "", "min", FALSE, TRUE, ...)
 }
 
 cat("\n-- log10 transform and the non-positive filter --\n")
@@ -166,6 +170,296 @@ ok("sample_time keys on treatment only",
 ok("input ids are syntactically valid",
    all(make.names(vapply(k, bar_color_input_id, character(1))) ==
        vapply(k, bar_color_input_id, character(1))))
+
+
+# ---------------------------------------------------------------------------
+# CPS-1: the unit of replication
+# ---------------------------------------------------------------------------
+# The defect: every unpaired test pulled every ROW in a group, so three
+# biological replicates plated four times each entered as n = 12 on 22 df.
+# The expected numbers below are re-derived by hand from the three biological
+# means, never read back out of the app.
+cat("\n-- the unit of replication (CPS-1) --\n")
+bio_lab <- rep(paste0("R", 1:3), each = 4)          # 3 cultures, 4 plates each
+plate_a <- c(7.90, 7.92, 7.88, 7.90,  8.00, 8.02, 7.98, 8.00,  8.10, 8.12, 8.08, 8.10)
+plate_b <- plate_a + 0.4
+dtech <- mk(rep(c("A", "B"), each = 12), rep(0, 24), rep(0, 24),
+            rep(bio_lab, 2), 10^c(plate_a, plate_b))
+
+ok("the biological replicate column is carried through prep",
+   "bio_replicate" %in% names(dtech) && has_biological_replicates(dtech))
+
+agg <- aggregate_biological_replicates(dtech)
+ok("aggregation gives one row per biological replicate per group", nrow(agg) == 6,
+   paste("rows", nrow(agg)))
+ok("it counts the technical measurements it collapsed", all(agg$n_technical == 4))
+# The collapsed value is the GEOMETRIC mean of the plates == arithmetic mean of log10.
+ok("the collapsed value is the geometric mean of the plates",
+   eq(sort(agg$log10_cfu[agg$sample == "A"]),
+      sort(c(mean(plate_a[1:4]), mean(plate_a[5:8]), mean(plate_a[9:12])))))
+ok("cfu is back-transformed consistently", eq(agg$cfu, 10^agg$log10_cfu))
+ok("the biological replicate becomes the replicate label",
+   identical(as.character(agg$replicate), as.character(agg$bio_replicate)))
+
+r <- run_groupwise_t_tests(dtech, "sample", "BH", "global", "0", "welch")
+# THE test the audit asked for: n reported must equal the biological replicates.
+ok("n reported equals the biological replicates, not the wells",
+   r$n_a == 3 && r$n_b == 3, paste("got", r$n_a, "and", r$n_b))
+ok("the table names the unit of replication",
+   identical(r$unit_of_replication[1], "biological replicate"))
+hand <- t.test(c(mean(plate_a[1:4]), mean(plate_a[5:8]), mean(plate_a[9:12])),
+               c(mean(plate_b[1:4]), mean(plate_b[5:8]), mean(plate_b[9:12])))
+ok("p matches a hand Welch test on the three biological means",
+   eq(r$p.value, unname(hand$p.value)))
+ok("df matches too (not the 22 df of the pooled wells)",
+   eq(r$parameter, unname(hand$parameter)))
+ok("the wrong answer is genuinely different",
+   !eq(r$p.value, t.test(plate_a, plate_b)$p.value))
+
+# The ANOVA has to count the same units, or its residual df is inflated too.
+av <- run_anova(dtech, "welch")
+ok("the ANOVA is fitted to the aggregated units", av$n_units[1] == 6, paste(av$n_units[1]))
+ok("the ANOVA names the unit of replication",
+   identical(av$unit_of_replication[1], "biological replicate"))
+
+# No declared biological replicate column: the app must NOT invent one, and must
+# label what it did.
+dnone <- mk(rep(c("A", "B"), each = 12), rep(0, 24), rep(0, 24),
+            rep(bio_lab, 2), 10^c(plate_a, plate_b), bio = NA_character_)
+ok("no biological column means no aggregation", !has_biological_replicates(dnone))
+rn <- run_groupwise_t_tests(dnone, "sample", "BH", "global", "0", "welch")
+ok("and n is the well count", rn$n_a == 12 && rn$n_b == 12)
+ok("but the result is labelled technical replicates only",
+   grepl("technical replicates only", rn$unit_of_replication[1], fixed = TRUE),
+   rn$unit_of_replication[1])
+
+# The summary and the figure caption must quote the same unit the test used.
+sm_bio <- plot_summary(dtech, "combined", "log10", "SD")
+ok("plot_summary counts biological replicates alongside the rows",
+   all(sm_bio$n == 12) && all(sm_bio$n_bio == 3),
+   paste("n:", paste(sm_bio$n, collapse = ","), "n_bio:", paste(sm_bio$n_bio, collapse = ",")))
+ok("and reports NA for n_bio when none was declared",
+   all(is.na(plot_summary(dnone, "combined", "log10", "SD")$n_bio)))
+
+# The paired path already collapsed within a replicate label; the two paths now
+# agree about what a replicate is.
+dpair <- mk(rep(c("A", "B"), each = 12), rep(0, 24), rep(0, 24),
+            rep(bio_lab, 2), 10^c(plate_a, plate_b))
+rp <- run_groupwise_t_tests(dpair, "sample", "BH", "global", "0", "welch", paired = TRUE)
+ok("the paired path matches the same three units", rp$n_matched == 3, paste(rp$n_matched))
+
+# ---------------------------------------------------------------------------
+# CPS-2: the non-default axis summarises on the scale it is drawn on
+# ---------------------------------------------------------------------------
+# The defect: "Raw CFU on log axis" summarised on the RAW scale, so the bar sat
+# 2.35x above the geometric mean the test analysed and mean - SD went negative
+# and was silently clamped to machine epsilon.
+cat("\n-- the raw-CFU-on-log-axis summary (CPS-2) --\n")
+vals <- c(1e6, 1e7, 1e8)                 # geometric mean exactly 1e7
+dg <- mk(rep("A", 3), rep(0, 3), rep(0, 3), 1:3, vals)
+raw <- plot_summary(dg, "sample_time", "raw_log_axis", "SD")
+lgv <- log10(vals)
+ok("the bar is the geometric mean, not the arithmetic mean", eq(raw$mean_y, 1e7))
+ok("and the arithmetic mean really is different", !eq(raw$mean_y, mean(vals)))
+ok("the interval is multiplicative: centre / 10^SD", eq(raw$ymin, 1e7 / 10^sd(lgv)))
+ok("                              centre * 10^SD", eq(raw$ymax, 1e7 * 10^sd(lgv)))
+ok("the lower whisker is strictly positive without clamping", raw$ymin > 1e-3)
+ok("nothing lands on machine epsilon any more", !eq(raw$ymin, .Machine$double.eps))
+ok("the multiplicative factor is reported", eq(raw$err_factor, 10^sd(lgv)))
+ok("the summary says which scale it was taken on",
+   identical(raw$summary_scale, "log10, back-transformed") &&
+     identical(raw$centre_statistic, "geometric mean"))
+# The back-transform must be an exact inverse of the log10 summary.
+lg <- plot_summary(dg, "sample_time", "log10", "SD")
+ok("it is exactly 10^ of the log10 summary",
+   eq(raw$mean_y, 10^lg$mean_y) && eq(raw$ymin, 10^lg$ymin) && eq(raw$ymax, 10^lg$ymax))
+ok("the log10 mode is unchanged", eq(lg$mean_y, mean(lgv)))
+
+raw_ci <- plot_summary(dg, "sample_time", "raw_log_axis", "95% CI")
+ok("a back-transformed 95% CI uses t(0.975, n-1) on the log scale",
+   eq(raw_ci$ymax, 1e7 * 10^(qt(0.975, 2) * sd(lgv) / sqrt(3))))
+raw_iqr <- plot_summary(dg, "sample_time", "raw_log_axis", "IQR")
+# Quantiles are taken on the log scale and back-transformed, which is what makes
+# the interval agree with the analysis; type-7 interpolation is not equivariant,
+# so this is deliberately NOT the quantile of the raw counts.
+ok("a back-transformed IQR is 10^ of the log-scale quantiles",
+   eq(c(raw_iqr$ymin, raw_iqr$ymax), 10^unname(quantile(lgv, c(.25, .75), type = 7))))
+ok("and that differs from the raw-scale quantile, as it must",
+   !eq(raw_iqr$ymin, unname(quantile(vals, .25, type = 7))))
+
+cap_raw <- error_type_caption("SD", "errorbar", "raw_log_axis")
+ok("the caption names the geometric mean on the raw-log axis",
+   grepl("geometric mean", cap_raw, fixed = TRUE), cap_raw)
+ok("and says the spread is a log10 SD", grepl("10^SD of log10(CFU)", cap_raw, fixed = TRUE))
+cap_log <- error_type_caption("SD", "errorbar", "log10")
+ok("the log10 caption names the scale too",
+   grepl("of log10(CFU)", cap_log, fixed = TRUE), cap_log)
+ok("a survival caption is not relabelled",
+   !grepl("log10(CFU)", error_type_caption("SD", "errorbar", "log10", is_survival = TRUE),
+          fixed = TRUE))
+
+# ---------------------------------------------------------------------------
+# CPS-5 / CPS-7: the emmeans path
+# ---------------------------------------------------------------------------
+cat("\n-- the emmeans path (CPS-5, CPS-7) --\n")
+set.seed(11)
+dm <- mk(rep(c("A", "B", "C"), each = 9), rep(rep(c(0, 1, 2), each = 3), 3),
+         rep(0, 27), rep(1:3, 9), 10^rnorm(27, 8, 0.25))
+e_glob <- run_contrast(dm, "sample", "BH", "0", adjustment_scope = "global")
+e_pan <- run_contrast(dm, "sample", "BH", "0", adjustment_scope = "within_panel")
+ok("the emmeans frame now carries a panel column", "panel" %in% names(e_pan))
+ok("one panel per level of the by-variable", n_distinct(e_pan$panel) == 3,
+   paste(unique(e_pan$panel), collapse = " / "))
+ok("the recorded scope is the scope the user asked for",
+   identical(e_pan$adjustment_scope[1], "within_panel"))
+# BH over 3 comparisons per panel is not BH over all 9: the control was inert
+# before, so these two must differ.
+ok("within-panel correction really differs from global",
+   !isTRUE(all.equal(e_pan$q.value, e_glob$q.value)),
+   paste(signif(e_pan$q.value, 3), collapse = ","))
+ok("raw p values are untouched by the scope", eq(e_pan$p.value, e_glob$p.value))
+ok("emmeans is fitted to the aggregated units",
+   identical(e_glob$unit_of_replication[1], "biological replicate"))
+
+e_tuk <- run_contrast(dm, "sample", "BH", "0", emm_adjust = "tukey")
+ok("Tukey is labelled in the test column",
+   grepl("Tukey", e_tuk$test[1], fixed = TRUE), e_tuk$test[1])
+ok("and the app's own correction is disabled so nothing is corrected twice",
+   identical(e_tuk$p_adjust_method[1], "none") && eq(e_tuk$q.value, e_tuk$p.value))
+ok("Tukey p values are family-wise, so larger than the unadjusted ones",
+   all(e_tuk$p.value >= e_glob$p.value - 1e-12))
+e_dun <- run_contrast(dm, "concentration_vs_control", "BH", "0", emm_adjust = "dunnettx")
+ok("Dunnett is available against the control",
+   grepl("Dunnett", e_dun$test[1], fixed = TRUE), e_dun$test[1])
+e_bad <- run_contrast(dm, "sample", "BH", "0", emm_adjust = "dunnettx")
+ok("Dunnett on an all-pairs family degrades rather than mislabelling",
+   identical(e_bad$emmeans_adjust[1], "none") &&
+     grepl("single control", e_bad$message[1], fixed = TRUE))
+
+ok("a rank-based pairwise family gets a rank-based omnibus",
+   grepl("Kruskal-Wallis", run_anova(dm, "wilcoxon")$ss_type[1], fixed = TRUE))
+ok("the parametric omnibus is still Type II",
+   grepl("Type II", run_anova(dm, "welch")$ss_type[1], fixed = TRUE))
+ok("the omnibus table says the t-test family is NOT its post-hoc",
+   grepl("INDEPENDENT", run_anova(dm, "welch")$pairwise_family[1], fixed = TRUE))
+ok("and says Tukey IS its post-hoc",
+   grepl("post-hoc family", run_anova(dm, "emmeans_tukey")$pairwise_family[1], fixed = TRUE))
+
+
+
+# ---------------------------------------------------------------------------
+# CPS-3: limit of detection
+# ---------------------------------------------------------------------------
+# The defect: cfu > 0 dropped sterile wells with no LOD option, no record in the
+# exports, and a `message` column that named an unrelated reason. Dropping them
+# biases a log-reduction TOWARDS the null.
+cat("\n-- limit of detection (CPS-3) --\n")
+# The audit's case: control 1e8 x3, treated 1e2, 1e2, 0.
+lod_cfu <- c(1e8, 1e8, 1e8, 1e2, 1e2, 0)
+lod_args <- list(sample = rep(c("ctrl", "treated"), each = 3), conc = rep(0, 6),
+                 time = rep(0, 6), rep = rep(1:3, 2), cfu = lod_cfu)
+
+d_excl <- do.call(mk, lod_args)
+ok("exclusion is still the default", nrow(d_excl) == 5, paste("rows", nrow(d_excl)))
+ok("the excluded-row flag exists and is all FALSE",
+   "lod_substituted" %in% names(d_excl) && !any(d_excl$lod_substituted))
+
+d_sub <- do.call(mk, c(lod_args, list(lod_mode = "substitute", lod_value = 1, lod_rule = "lod")))
+ok("substitution keeps the sterile well", nrow(d_sub) == 6)
+ok("and marks exactly that well", sum(d_sub$lod_substituted) == 1)
+ok("at the LOD itself", eq(d_sub$cfu[d_sub$lod_substituted], 1))
+ok("log10 of the censored well is log10(LOD)", eq(d_sub$log10_cfu[d_sub$lod_substituted], 0))
+ok("no other well is touched",
+   eq(sort(d_sub$cfu[!d_sub$lod_substituted]), sort(lod_cfu[lod_cfu > 0])))
+
+d_half <- do.call(mk, c(lod_args, list(lod_mode = "substitute", lod_value = 10, lod_rule = "half")))
+ok("the LOD/2 rule halves the LOD", eq(d_half$cfu[d_half$lod_substituted], 5))
+ok("a non-positive LOD falls back to exclusion rather than producing -Inf",
+   nrow(do.call(mk, c(lod_args, list(lod_mode = "substitute", lod_value = 0)))) == 5)
+
+# The number the audit computed by hand: 6.667 log censored vs 6.000 dropped.
+red <- function(d) mean(d$log10_cfu[d$sample == "ctrl"]) - mean(d$log10_cfu[d$sample == "treated"])
+ok("censoring at LOD = 1 gives the 6.667-log reduction", eq(red(d_sub), 8 - 4/3),
+   sprintf("%.4f", red(d_sub)))
+ok("dropping the zero understates it as 6.000", eq(red(d_excl), 6))
+ok("so the two rules genuinely disagree", !eq(red(d_sub), red(d_excl)))
+
+ok("the substituted count reaches the summary",
+   sum(summary_cfu(d_sub)$n_lod_substituted) == 1)
+ok("and the plotted summary", sum(plot_summary(d_sub, "combined", "log10", "SD")$n_lod_substituted) == 1)
+ok("the rule is describable for the manifest and the caption",
+   grepl("LOD/2", lod_rule_label("substitute", 10, "half"), fixed = TRUE) &&
+     grepl("excluded", lod_rule_label("exclude", 1, "lod"), fixed = TRUE),
+   lod_rule_label("substitute", 10, "half"))
+ok("a censored well survives aggregation to its biological replicate",
+   { ag <- aggregate_biological_replicates(d_sub); sum(ag$lod_substituted) == 1 })
+
+# ---------------------------------------------------------------------------
+# CPS-10: arithmetic and geometric summaries cannot be confused
+# ---------------------------------------------------------------------------
+cat("\n-- summary.csv column names (CPS-10) --\n")
+dsum <- mk(rep("A", 3), rep(0, 3), rep(0, 3), 1:3, c(1e6, 1e7, 1e8))
+gs <- summary_cfu(dsum)
+ok("the arithmetic columns say so in their names",
+   all(c("arithmetic_mean_cfu", "arithmetic_sd_cfu", "arithmetic_sem_cfu") %in% names(gs)))
+ok("the bare names that invited the mistake are gone",
+   !any(c("mean_cfu", "sd_cfu", "sem_cfu") %in% names(gs)))
+ok("the geometric side now carries dispersion",
+   eq(gs$geometric_sd_factor, 10^sd(log10(c(1e6, 1e7, 1e8)))))
+ok("and a multiplicative interval around it",
+   eq(gs$geometric_mean_low, gs$geometric_mean_cfu / gs$geometric_sd_factor) &&
+     eq(gs$geometric_mean_high, gs$geometric_mean_cfu * gs$geometric_sd_factor))
+ok("the two means are still the different numbers they always were",
+   eq(gs$geometric_mean_cfu, 1e7) && eq(gs$arithmetic_mean_cfu, mean(c(1e6, 1e7, 1e8))))
+
+
+
+# ---------------------------------------------------------------------------
+# CPS-6: advisory assumption diagnostics
+# ---------------------------------------------------------------------------
+# Advisory by design: these must NOT switch a test, only describe the data.
+cat("\n-- assumption diagnostics (CPS-6) --\n")
+tight <- c(8.00, 8.01, 7.99)                 # sd = 0.01
+wide  <- c(6.0, 8.0, 10.0)                   # sd = 2.0, variance 40000x
+dv <- mk(rep(c("A", "B"), each = 3), rep(0, 6), rep(0, 6), rep(1:3, 2), 10^c(tight, wide))
+diag <- assumption_diagnostics(dv)
+ok("one diagnostic row per cell", nrow(diag) == 2, paste("rows", nrow(diag)))
+ok("the SD is the log10 SD the tests see",
+   eq(sort(diag$sd_log10), sort(c(sd(tight), sd(wide)))))
+ok("the variance ratio is against the narrowest cell",
+   eq(max(diag$variance_ratio_vs_smallest), signif(var(wide) / var(tight), 4)))
+ok("and a 4x-plus difference is flagged",
+   any(grepl("more than 4x", diag$note, fixed = TRUE)))
+ok("max_variance_ratio picks the worst cell",
+   eq(max_variance_ratio(diag), max(diag$variance_ratio_vs_smallest)))
+
+# Diagnostics run on the AGGREGATED units, or they describe plates rather than
+# the thing that was tested.
+dtec <- mk(rep("A", 8), rep(0, 8), rep(0, 8), rep(paste0("R", 1:2), each = 4),
+           10^c(8.00, 8.02, 7.98, 8.00, 9.00, 9.02, 8.98, 9.00))
+ok("diagnostics are computed on the tested units, not the wells",
+   assumption_diagnostics(dtec)$n == 2, paste(assumption_diagnostics(dtec)$n))
+
+# The awkward cells that make shapiro.test() error must not take the table down.
+ok("a constant cell is described, not an error",
+   { cc <- assumption_diagnostics(mk(rep("A", 3), rep(0, 3), rep(0, 3), 1:3, rep(1e8, 3)))
+     is.na(cc$shapiro_p) && grepl("Zero spread", cc$note, fixed = TRUE) })
+ok("an n = 1 cell is described, not an error",
+   { c1 <- assumption_diagnostics(mk("A", 0, 0, 1, 1e8))
+     nrow(c1) == 1 && grepl("n < 2", c1$note, fixed = TRUE) })
+ok("an empty frame gives an empty table",
+   nrow(assumption_diagnostics(mk(character(0), numeric(0), numeric(0),
+                                  character(0), numeric(0)))) == 0)
+ok("Shapiro runs where it is defined",
+   { set.seed(3)
+     sk <- mk(rep("A", 8), rep(0, 8), rep(0, 8), 1:8, 10^rnorm(8, 8, .2))
+     is.finite(assumption_diagnostics(sk)$shapiro_p) })
+
+# Advisory means advisory: the same data, the same test, whatever the spread.
+ok("the diagnostics do not change any p-value",
+   eq(run_groupwise_t_tests(dv, "sample", "none", "global", "0", "welch")$p.value,
+      unname(t.test(tight, wide)$p.value)))
+
 
 cat(sprintf("\n%s\n", strrep("-", 60)))
 if (fails == 0) {

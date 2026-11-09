@@ -11,6 +11,29 @@ suppressPackageStartupMessages({
 
 demo_file <- "dummy_cfu_example.csv"
 
+# One version string for the whole app. A bundle whose manifest cannot name the
+# code that produced it is not reproducible, so this constant is the single
+# source of truth for the UI footer, the manifest, the bundle README and
+# CITATION.cff -- bump all of them together.
+APP_VERSION <- "0.4.0"
+
+# Git SHA of the working tree, when the app is run from a checkout. Absent in a
+# plain download, which is why it is optional rather than part of APP_VERSION.
+app_git_sha <- function() {
+  sha <- tryCatch(
+    suppressWarnings(system2("git", c("rev-parse", "--short", "HEAD"),
+                             stdout = TRUE, stderr = FALSE)),
+    error = function(e) character(0)
+  )
+  if (length(sha) != 1 || !nzchar(sha)) NA_character_ else sha
+}
+
+app_version_line <- function() {
+  sha <- app_git_sha()
+  if (is.na(sha)) paste0("CFU Plot Studio ", APP_VERSION)
+  else paste0("CFU Plot Studio ", APP_VERSION, " (", sha, ")")
+}
+
 `%||%` <- function(x, y) {
   if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x
 }
@@ -102,6 +125,93 @@ gtable_size_in <- function(g, dpi = 300) {
   }, dpi = dpi)
 }
 
+# ---------------------------------------------------------------------------
+# Export post-conditions
+# ---------------------------------------------------------------------------
+# ggsave() reports a dead graphics device as a WARNING, not an error: on macOS
+# without XQuartz, `cairo_pdf` emits "failed to load cairo DLL", writes nothing,
+# and returns cleanly. The download handler then hands the browser an empty
+# file and the bundle silently loses figure.pdf. capabilities("cairo") is TRUE
+# on exactly those machines, so it cannot be used as a guard -- the only
+# reliable test is to look at the bytes that were written.
+file_looks_like <- function(path, kind) {
+  if (is.null(path) || !file.exists(path)) return(FALSE)
+  size <- file.info(path)$size
+  if (!isTRUE(is.finite(size)) || size <= 0) return(FALSE)
+  if (is.null(kind)) return(TRUE)
+  head_bytes <- function(n) {
+    con <- file(path, "rb")
+    on.exit(close(con), add = TRUE)
+    readBin(con, "raw", n)
+  }
+  switch(
+    kind,
+    pdf = identical(rawToChar(head_bytes(4)), "%PDF"),
+    png = identical(as.integer(head_bytes(4)), c(137L, 80L, 78L, 71L)),
+    svg = any(grepl("<svg", readLines(path, n = 8, warn = FALSE), fixed = TRUE)),
+    TRUE
+  )
+}
+
+# Device chain per export format, most preferred first. cairo_pdf embeds fonts
+# and honours alpha; the base pdf device does neither as well, so it is a
+# fallback that has to be announced rather than a silent equivalent.
+plot_device_chain <- function(kind) {
+  switch(
+    kind,
+    png = list(png = "png"),
+    svg = list(svg = "svg"),
+    pdf = list(cairo_pdf = grDevices::cairo_pdf, pdf = grDevices::pdf),
+    stats::setNames(list(kind), kind)
+  )
+}
+
+# Try each device in turn and return the first that actually produced a readable
+# file. Never leaves a zero-byte file behind: a caller that gets ok = FALSE must
+# report the failure rather than ship an empty export.
+ggsave_checked <- function(filename, plot, kind, width, height, units = "in", dpi = 300,
+                           devices = plot_device_chain(kind)) {
+  notes <- character(0)
+  for (i in seq_along(devices)) {
+    dev_name <- names(devices)[i] %||% "device"
+    unlink(filename)
+    err <- tryCatch(
+      withCallingHandlers(
+        {
+          ggplot2::ggsave(filename = filename, plot = plot, width = width, height = height,
+                          units = units, dpi = dpi, device = devices[[i]])
+          NULL
+        },
+        warning = function(w) {
+          notes <<- c(notes, paste0(dev_name, ": ", conditionMessage(w)))
+          invokeRestart("muffleWarning")
+        }
+      ),
+      error = function(e) paste0(dev_name, ": ", conditionMessage(e))
+    )
+    if (!is.null(err)) {
+      notes <- c(notes, err)
+      next
+    }
+    if (file_looks_like(filename, kind)) {
+      return(list(
+        ok = TRUE, device = dev_name, fallback = i > 1L,
+        notes = notes,
+        message = if (i > 1L) paste0(
+          "The ", names(devices)[1], " device is unavailable on this machine, so the ",
+          toupper(kind), " was written with the ", dev_name,
+          " device instead. Fonts are not embedded; check the file before submitting it."
+        ) else NA_character_
+      ))
+    }
+    notes <- c(notes, paste0(dev_name, ": produced no readable ", kind, "."))
+  }
+  unlink(filename)
+  list(ok = FALSE, device = NA_character_, fallback = FALSE, notes = notes,
+       message = paste0("No available graphics device could write a ", kind, ": ",
+                        paste(notes, collapse = " | ")))
+}
+
 format_figure_size <- function(width_in, height_in, dpi) {
   if (!is.finite(width_in) || !is.finite(height_in)) return("Figure size is not set.")
   sprintf(
@@ -179,11 +289,11 @@ plot_setting_ids <- c(
   "show_minor_y_ticks", "show_y_grid", "show_minor_y_grid", "y_major_step", "y_minor_step",
   "y_tick_length", "minor_y_tick_length", "axis_line_width", "box_line_width",
   "axis_color", "grid_color", "bar_outline_color", "bar_outline_width", "errorbar_width",
-  "sample_color_1", "sample_color_2", "time_color_1", "time_color_2", "single_color", "stat_color",
+  "single_color", "stat_color",
   "bar_width", "dodge_width", "point_size", "point_alpha", "jitter_width", "jitter_seed",
-  "font_size", "title_size", "subtitle_size", "stat_size", "x_angle",
+  "font_family", "font_family_custom", "font_size", "title_size", "subtitle_size", "stat_size", "x_angle",
   "title_hjust", "subtitle_hjust", "caption_hjust", "x_title_hjust", "y_title_hjust",
-  "legend_position", "legend_x", "legend_y", "legend_just_x", "legend_just_y",
+  "legend_position", "legend_x", "legend_y", "legend_just_x", "legend_just_y", "legend_key_on_figure",
   "size_mode", "size_units", "download_width", "download_height", "download_dpi", "animation_fps", "animation_duration",
   "animation_dpi", "ppt_editable"
 )
@@ -195,7 +305,7 @@ select_setting_ids <- c(
   # slider_setting_ids is a setdiff residual, so a select id missing from this
   # list gets updateSliderInput called against it: no error, no effect, and the
   # preset silently fails to restore.
-  "surv_baseline", "surv_readout", "surv_scale", "size_mode"
+  "surv_baseline", "surv_readout", "surv_scale", "size_mode", "font_family"
 )
 
 radio_setting_ids <- c("label_kind")
@@ -204,19 +314,26 @@ checkbox_setting_ids <- c(
   "show_ns", "show_points", "show_subtitle", "hide_subtitle_no_stats", "show_method_caption",
   "surv_match_replicates", "append_treatment_unit",
   "append_time_unit", "show_n_labels", "plot_box", "show_y_ticks", "show_minor_y_ticks", "show_y_grid",
-  "show_minor_y_grid", "ppt_editable"
+  "show_minor_y_grid", "ppt_editable", "legend_key_on_figure"
 )
 
-text_setting_ids <- c("plot_title", "plot_subtitle", "x_label", "y_label", "treatment_unit", "time_unit", "legend_title")
+text_setting_ids <- c("plot_title", "plot_subtitle", "x_label", "y_label", "treatment_unit", "time_unit", "legend_title",
+                      "font_family_custom")
 
 numeric_setting_ids <- c(
   "y_min", "y_max", "y_major_step", "y_minor_step", "download_width", "download_height",
   "download_dpi", "animation_dpi", "jitter_seed"
 )
 
+# Colour pickers. Left in the slider residual they were sent through
+# updateSliderInput(as.numeric("#262626")) -- NA -- and never restored, which a
+# paper style that is meant to keep the axis and outline colours cannot afford.
+colour_setting_ids <- c("axis_color", "grid_color", "bar_outline_color", "single_color", "stat_color")
+
 slider_setting_ids <- setdiff(
   plot_setting_ids,
-  c(select_setting_ids, radio_setting_ids, checkbox_setting_ids, text_setting_ids, numeric_setting_ids)
+  c(select_setting_ids, radio_setting_ids, checkbox_setting_ids, text_setting_ids, numeric_setting_ids,
+    colour_setting_ids)
 )
 
 collect_plot_settings <- function(input) {
@@ -225,13 +342,37 @@ collect_plot_settings <- function(input) {
   Filter(function(x) !is.null(x) && length(x) > 0, out)
 }
 
-plot_settings_payload <- function(input) {
+# A paper style is a STYLE: on load it leaves alone the settings that belong
+# to one figure, so the title, the plot mode, the axis range and the comparison
+# of the figure in front of the user survive. Named by what the user sees; the
+# help text in the sidebar is built from these names.
+figure_specific_setting_ids <- c(
+  "plot title" = "plot_title", "plot mode" = "plot_mode", "y minimum" = "y_min",
+  "y maximum" = "y_max", "survival baseline" = "surv_baseline",
+  "survival readout" = "surv_readout", "statistics shown" = "comparison"
+)
+
+# Sample and timepoint colours are keyed by NAME (see the colour registry), so a
+# preset carries them as name -> hex maps rather than as numbered pickers.
+plot_settings_payload <- function(input, sample_palette = NULL, time_palette = NULL) {
+  settings <- collect_plot_settings(input)
+  if (!is.null(sample_palette)) settings$sample_palette <- as.list(unlist(sample_palette))
+  if (!is.null(time_palette)) settings$time_palette <- as.list(unlist(time_palette))
   list(
     app = "CFU Plot Studio",
     preset_version = 1,
     created_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
-    settings = collect_plot_settings(input)
+    settings = settings
   )
+}
+
+# Where the paper style lives: paper_style.json beside app.R (shiny::runApp and
+# run_app.R both run the app with the app folder as the working directory), or
+# wherever CFU_PAPER_STYLE points. Read at call time so the variable can be set
+# after the app is sourced.
+paper_style_path <- function() {
+  env <- Sys.getenv("CFU_PAPER_STYLE", "")
+  if (nzchar(env)) path.expand(env) else file.path(getwd(), "paper_style.json")
 }
 
 significance_label <- function(p) {
@@ -252,18 +393,55 @@ okabe_ito <- c(
 )
 
 # Human-readable label for the variation/error-bar summary, for figure captions.
-error_type_caption <- function(error_type, variation_display = "errorbar") {
+#
+# CPS-2: the caption has to name the SCALE the summary was taken on, not just
+# the statistic. "Mean ± SD" under a log10 analysis is ambiguous between the
+# arithmetic mean of the counts and the geometric mean, and those differ by
+# 2.35x on a perfectly ordinary three-replicate CFU cell -- so the scale is
+# stated wherever the summary is a log-scale one.
+error_type_caption <- function(error_type, variation_display = "errorbar",
+                               y_mode = "log10", is_survival = FALSE) {
   if (identical(variation_display, "none")) return(NULL)
-  descr <- switch(
-    error_type %||% "SD",
-    "SD" = "error bars show mean ± SD",
-    "SEM" = "error bars show mean ± SEM",
-    "95% CI" = "error bars show mean with 95% CI",
+  error_type <- error_type %||% "SD"
+  # A survival figure already plots a log10 ratio and says so on the axis.
+  scale_txt <- if (isTRUE(is_survival)) ""
+               else if (identical(y_mode, "log10")) " of log10(CFU)"
+               else if (identical(y_mode, "raw_log_axis")) " of log10(CFU)"
+               else ""
+  if (identical(y_mode, "raw_log_axis") && !isTRUE(is_survival)) {
+    # The plotted centre is 10^mean(log10), i.e. the geometric mean, and the
+    # interval is multiplicative rather than symmetric.
+    return(switch(
+      error_type,
+      "SD" = "bars show the geometric mean, error bars the geometric mean x/÷ 10^SD of log10(CFU)",
+      "SEM" = "bars show the geometric mean, error bars the geometric mean x/÷ 10^SEM of log10(CFU)",
+      "95% CI" = "bars show the geometric mean with a 95% CI computed on log10(CFU) and back-transformed",
+      "IQR" = "intervals show the median and IQR (Q1-Q3) computed on log10(CFU) and back-transformed",
+      "Range (min-max)" = "intervals show the min-max range of the replicates",
+      paste0("error bars: ", error_type, " computed on log10(CFU) and back-transformed")
+    ))
+  }
+  switch(
+    error_type,
+    "SD" = paste0("error bars show mean ± SD", scale_txt),
+    "SEM" = paste0("error bars show mean ± SEM", scale_txt),
+    "95% CI" = paste0("error bars show mean with 95% CI", scale_txt),
     "IQR" = "intervals show median IQR (Q1-Q3)",
     "Range (min-max)" = "intervals show min-max range",
     paste0("error bars: ", error_type)
   )
-  descr
+}
+
+# The emmeans-based methods, and the family-wise adjustment each one asks
+# emmeans itself to apply. CPS-7: an ANOVA table displayed next to a
+# star-annotated figure reads as protected post-hoc testing, so the app now
+# offers the classical post-hoc procedures instead of only implying them.
+is_emmeans_method <- function(m) {
+  isTRUE((m %||% "") %in% c("emmeans", "emmeans_tukey", "emmeans_dunnett"))
+}
+
+emmeans_adjust_for <- function(m) {
+  switch(m %||% "", "emmeans_tukey" = "tukey", "emmeans_dunnett" = "dunnettx", "none")
 }
 
 # Names the statistical test + multiple-comparison correction for figure captions.
@@ -274,8 +452,15 @@ stats_caption <- function(stats_method, p_adjust) {
     "student" = "Student t-test on log10(CFU)",
     "wilcoxon" = "Wilcoxon rank-sum test on log10(CFU)",
     "emmeans" = "linear model + emmeans on log10(CFU)",
+    "emmeans_tukey" = "linear model + emmeans on log10(CFU), Tukey HSD post-hoc",
+    "emmeans_dunnett" = "linear model + emmeans on log10(CFU), Dunnett post-hoc versus the control",
     "statistical test"
   )
+  # Tukey and Dunnett carry their own family-wise control; reporting a second
+  # correction on top would describe a procedure that did not run.
+  if (is_emmeans_method(stats_method) && !identical(emmeans_adjust_for(stats_method), "none")) {
+    return(paste0(test_txt, "; family-wise error controlled by that procedure"))
+  }
   corr_txt <- switch(
     p_adjust %||% "BH",
     "BH" = "Benjamini-Hochberg FDR",
@@ -287,15 +472,75 @@ stats_caption <- function(stats_method, p_adjust) {
   paste0(test_txt, "; ", corr_txt, " correction")
 }
 
-named_palette <- function(levels_vec, seed_colors) {
-  levels_vec <- as.character(levels_vec)
-  seed_colors <- unname(seed_colors)
-  if (length(levels_vec) <= length(seed_colors)) {
-    setNames(seed_colors[seq_along(levels_vec)], levels_vec)
-  } else {
-    extra <- grDevices::hcl.colors(length(levels_vec) - length(seed_colors), palette = "Dark 3")
-    setNames(c(seed_colors, extra), levels_vec)
+# ---------------------------------------------------------------------------
+# Colour registry: one colour per sample NAME and per timepoint NAME
+# ---------------------------------------------------------------------------
+# A strain keeps its colour in every figure of a paper, whichever CSV it comes
+# from and wherever it falls in the level order. The registry is a named
+# character vector (name -> hex) per kind; a name it has not seen gets the
+# first default colour no other name in that registry already uses.
+# Samples default to Okabe-Ito in order (its first two, blue and vermillion,
+# are the app's long-standing sample colours); timepoints to the two blues the
+# app has always used, then Okabe-Ito. "Dark 3" only past the fixed pool.
+colour_registry_defaults <- function(kind = "samples", n = 0) {
+  pool <- if (identical(kind, "times")) c("#7AA6C2", "#2F5D8C", okabe_ito) else okabe_ito
+  if (n > length(pool)) pool <- c(pool, grDevices::hcl.colors(n - length(pool), palette = "Dark 3"))
+  pool
+}
+
+# The registry with every name in `names` present, existing names untouched.
+# Accepts a named list (as a preset's JSON reads back) or a named vector.
+extend_colour_registry <- function(registry, names, kind = "samples") {
+  reg <- unlist(registry)
+  if (is.null(reg) || is.null(names(reg))) reg <- setNames(character(0), character(0))
+  reg <- setNames(as.character(reg), names(reg))
+  for (nm in unique(as.character(names))) {
+    if (is.na(nm) || nm %in% names(reg)) next
+    pool <- colour_registry_defaults(kind, length(reg) + 1)
+    taken <- toupper(reg)
+    reg[[nm]] <- pool[!toupper(pool) %in% taken][1]
   }
+  reg
+}
+
+# Colours for the given levels, in level order, from the registry by name.
+registry_colours <- function(registry, levels_vec, kind = "samples") {
+  levels_vec <- as.character(levels_vec)
+  reg <- extend_colour_registry(registry, levels_vec, kind)
+  setNames(unname(reg[levels_vec]), levels_vec)
+}
+
+# ---------------------------------------------------------------------------
+# Font family
+# ---------------------------------------------------------------------------
+# The family the figure asks for: the menu choice, or the typed name when the
+# menu says Custom (blank custom falls back to the default sans).
+font_family_request <- function(choice, custom = "") {
+  choice <- as.character(choice %||% "sans")[1]
+  if (identical(choice, "custom")) {
+    custom <- trimws(as.character(custom %||% "")[1])
+    if (nzchar(custom)) custom else "sans"
+  } else if (nzchar(choice)) choice else "sans"
+}
+
+# Whether this machine can draw the requested family. R's generic families are
+# always there; a named font is looked up with systemfonts, which silently
+# substitutes another family when the name is unknown -- so the match only
+# counts when it comes back with the family that was asked for. Without
+# systemfonts every named font is treated as unavailable.
+resolve_font_family <- function(requested) {
+  requested <- as.character(requested %||% "sans")[1]
+  if (is.na(requested) || !nzchar(trimws(requested))) requested <- "sans"
+  if (tolower(requested) %in% c("sans", "serif", "mono")) {
+    return(list(family = tolower(requested), available = TRUE, requested = requested))
+  }
+  matched <- if (requireNamespace("systemfonts", quietly = TRUE)) {
+    tryCatch(as.character(systemfonts::font_info(family = requested)$family[1]),
+             error = function(e) NA_character_)
+  } else NA_character_
+  ok <- length(matched) == 1 && !is.na(matched) && identical(tolower(matched), tolower(requested))
+  if (ok) list(family = requested, available = TRUE, requested = requested)
+  else list(family = "sans", available = FALSE, requested = requested)
 }
 
 format_p <- function(p) {
@@ -306,17 +551,71 @@ format_q <- function(p) {
   ifelse(is.na(p), NA_character_, ifelse(p < 0.001, "q<0.001", paste0("q=", signif(p, 2))))
 }
 
-prep_cfu_data <- function(raw, mapping, treatment_unit = "", time_unit = "min", append_treatment_unit = TRUE, append_time_unit = TRUE) {
+# ---------------------------------------------------------------------------
+# Limit of detection
+# ---------------------------------------------------------------------------
+# A plate with no colonies is a real measurement -- "below the limit of
+# detection" -- not a missing one, and a sterilising treatment is exactly the
+# case where it happens. Dropping those wells biases the effect TOWARDS the
+# null: on control 1e8 x3 versus treated 1e2, 1e2, 0, discarding the zero
+# reports a 6.0-log reduction where censoring it at 1 CFU/mL gives 6.67.
+#
+# The default stays exclusion, because that is what every earlier version did
+# and changing it silently would move published numbers. But the choice is now
+# the user's, it is recorded, and the affected wells are named in the exports.
+LOD_DEFAULT <- 1          # 1 CFU/mL: the smallest countable titre on a neat plate.
+
+lod_substituted_value <- function(lod_value, lod_rule) {
+  v <- suppressWarnings(as.numeric(lod_value))
+  if (length(v) != 1 || !is.finite(v) || v <= 0) return(NA_real_)
+  if (identical(lod_rule, "half")) v / 2 else v
+}
+
+lod_rule_label <- function(lod_mode, lod_value, lod_rule) {
+  if (!identical(lod_mode, "substitute")) {
+    return("non-positive counts excluded (no LOD substitution)")
+  }
+  v <- lod_substituted_value(lod_value, lod_rule)
+  if (is.na(v)) return("LOD substitution requested but the LOD is not a positive number; counts were excluded")
+  paste0("non-positive counts set to ",
+         if (identical(lod_rule, "half")) "LOD/2" else "the LOD",
+         " = ", format(v, scientific = FALSE), " CFU (LOD = ",
+         format(as.numeric(lod_value), scientific = FALSE), ")")
+}
+
+prep_cfu_data <- function(raw, mapping, treatment_unit = "", time_unit = "min", append_treatment_unit = TRUE, append_time_unit = TRUE,
+                          lod_mode = "exclude", lod_value = LOD_DEFAULT, lod_rule = "lod") {
   names(raw) <- clean_names(names(raw))
+
+  # Which column, if any, identifies the BIOLOGICAL replicate -- the independent
+  # unit the statistics are entitled to count. NA means the user declared that
+  # this file has none, in which case every row is a technical measurement and
+  # the app has to say so rather than counting wells as replicates.
+  bio_col <- mapping$bio_replicate
+  bio_col <- if (is.null(bio_col) || length(bio_col) != 1 || is.na(bio_col) ||
+                 !nzchar(bio_col) || !(bio_col %in% names(raw))) NA_character_ else bio_col
 
   out <- tibble(
     sample = as.character(raw[[mapping$sample]]),
     concentration_raw = as.character(raw[[mapping$concentration]]),
     time_raw = as.character(raw[[mapping$time]]),
     replicate = as.character(raw[[mapping$replicate]]),
+    bio_replicate = if (is.na(bio_col)) NA_character_ else as.character(raw[[bio_col]]),
     cfu = suppressWarnings(as.numeric(raw[[mapping$cfu]]))
   ) %>%
-    filter(!is.na(sample), !is.na(concentration_raw), !is.na(time_raw), !is.na(cfu), cfu > 0)
+    filter(!is.na(sample), !is.na(concentration_raw), !is.na(time_raw), !is.na(cfu))
+
+  # Censor at the LOD, or drop, according to the declared rule. Either way the
+  # row is marked, so the flag reaches the plotted frame, the summary and the
+  # exports rather than living only in a banner on screen.
+  sub_value <- lod_substituted_value(lod_value, lod_rule)
+  censor <- identical(lod_mode, "substitute") && !is.na(sub_value)
+  out <- out %>%
+    mutate(
+      lod_substituted = censor & (cfu <= 0),
+      cfu = ifelse(lod_substituted, sub_value, cfu)
+    ) %>%
+    filter(cfu > 0)
 
   conc_info <- format_label(out$concentration_raw, treatment_unit, append_treatment_unit)
   time_info <- format_label(out$time_raw, time_unit, append_time_unit)
@@ -337,42 +636,145 @@ prep_cfu_data <- function(raw, mapping, treatment_unit = "", time_unit = "min", 
         labels = time_info$labels
       ),
       replicate = factor(replicate),
+      # Blank cells in a declared biological-replicate column are missing, not a
+      # group of their own: a well that does not say which biological replicate
+      # it belongs to cannot be counted as one.
+      bio_replicate = ifelse(is.na(bio_replicate) | !nzchar(trimws(bio_replicate)),
+                             NA_character_, trimws(bio_replicate)),
       log10_cfu = log10(cfu)
     )
 }
 
+# ---------------------------------------------------------------------------
+# The unit of replication
+# ---------------------------------------------------------------------------
+# A CFU experiment produces two kinds of repeat measurement and they are not
+# interchangeable. Plating the same culture four times measures the plating;
+# growing four cultures measures the biology. Only the second is an independent
+# replicate, and only the second may be counted as n.
+#
+# Before this was enforced, every unpaired test pulled EVERY ROW in a group, so
+# three biological replicates plated four times each entered a t-test as n = 12
+# on 22 df. On a 0.4-log difference that is p = 9e-11 where the honest test on
+# the three biological means gives p = 0.008 -- seven orders of magnitude of
+# false confidence, from a design the app itself flags in the QC tab as
+# "duplicate replicate labels".
+#
+# The paired survival path always collapsed within a replicate label first, so
+# the two paths disagreed by construction about what a replicate was. They no
+# longer do.
+has_biological_replicates <- function(dat) {
+  is.data.frame(dat) && "bio_replicate" %in% names(dat) &&
+    nrow(dat) > 0 && any(!is.na(dat$bio_replicate))
+}
+
+replication_unit_label <- function(dat) {
+  if (has_biological_replicates(dat)) "biological replicate"
+  else "technical replicates only (no biological replicate column identified)"
+}
+
+# Collapse technical measurements to one value per biological replicate, on the
+# log10 scale -- the geometric mean of the plates, which is the quantity every
+# test in this app analyses. A survival frame arrives already collapsed (its own
+# pairing step does it), and a frame with no declared biological replicate
+# column is returned untouched so the caller can label the result honestly
+# rather than silently inventing a unit of replication.
+aggregate_biological_replicates <- function(dat) {
+  if (!is.data.frame(dat) || nrow(dat) == 0) return(dat)
+  if (is_survival_frame(dat)) return(dat)
+  if (!has_biological_replicates(dat)) {
+    if (!"n_technical" %in% names(dat)) dat$n_technical <- 1L
+    return(dat)
+  }
+  keep_first <- intersect(c("concentration_raw", "time_raw", "concentration_value",
+                            "time_value"), names(dat))
+  has_lod <- "lod_substituted" %in% names(dat)
+  dat %>%
+    filter(!is.na(bio_replicate)) %>%
+    group_by(sample, concentration_label, time_min, bio_replicate) %>%
+    summarize(
+      n_technical = dplyr::n(),
+      log10_cfu = mean(log10_cfu),
+      # A biological replicate is censored if ANY of its plates was, so the flag
+      # cannot be carried by first().
+      lod_substituted = if (has_lod) any(lod_substituted, na.rm = TRUE) else FALSE,
+      across(all_of(keep_first), ~ dplyr::first(.x)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      cfu = 10^log10_cfu,
+      # The biological replicate IS the replicate from here on, so anything that
+      # pairs or joins on `replicate` pairs on the right unit.
+      replicate = factor(bio_replicate)
+    )
+}
+
 summary_cfu <- function(dat) {
+  # CPS-10: the arithmetic columns are kept -- some readers genuinely want them
+  # -- but renamed so a column picked out of summary.csv cannot be mistaken for
+  # the quantity the figure draws and the tests analyse. On three wells at 1e6,
+  # 1e7 and 1e8 the arithmetic mean is 3.7e7 against a geometric mean of 1e7,
+  # and the old `mean_cfu` sat next to `geometric_mean_cfu` with nothing to
+  # distinguish them but the word. The geometric side now carries its own
+  # dispersion, as a multiplicative FACTOR: the interval is
+  # geometric_mean x/÷ geometric_sd_factor.
+  has_lod <- "lod_substituted" %in% names(dat)
+  has_bio <- "bio_replicate" %in% names(dat) && any(!is.na(dat$bio_replicate))
   dat %>%
     group_by(sample, concentration_label, time_min) %>%
     summarize(
       n = n(),
-      mean_cfu = mean(cfu),
-      sd_cfu = sd(cfu),
-      sem_cfu = sd_cfu / sqrt(n),
+      n_biological_replicates = if (has_bio) dplyr::n_distinct(bio_replicate[!is.na(bio_replicate)]) else NA_integer_,
+      n_lod_substituted = if (has_lod) sum(lod_substituted, na.rm = TRUE) else 0L,
       mean_log10_cfu = mean(log10_cfu),
       sd_log10_cfu = sd(log10_cfu),
       sem_log10_cfu = sd_log10_cfu / sqrt(n),
       geometric_mean_cfu = 10^mean_log10_cfu,
+      geometric_sd_factor = 10^sd_log10_cfu,
+      geometric_mean_low = geometric_mean_cfu / geometric_sd_factor,
+      geometric_mean_high = geometric_mean_cfu * geometric_sd_factor,
+      arithmetic_mean_cfu = mean(cfu),
+      arithmetic_sd_cfu = sd(cfu),
+      arithmetic_sem_cfu = arithmetic_sd_cfu / sqrt(n),
       .groups = "drop"
     )
 }
 
 qc_summary <- function(dat) {
-  dat %>%
+  # Repeated replicate labels used to be flagged only as suspicious ("duplicate
+  # replicate labels") while every test went on counting them as independent.
+  # Now they are the documented way to enter technical repeats, so this table
+  # reports how many of each unit a cell holds and what n the tests will use.
+  has_bio <- "bio_replicate" %in% names(dat) && any(!is.na(dat$bio_replicate))
+  out <- dat %>%
     group_by(sample, concentration_label, time_min) %>%
     summarize(
+      biological_replicates = if (has_bio) dplyr::n_distinct(bio_replicate[!is.na(bio_replicate)]) else NA_integer_,
       replicates = n_distinct(replicate),
       rows = n(),
       min_cfu = min(cfu, na.rm = TRUE),
       max_cfu = max(cfu, na.rm = TRUE),
       mean_log10_cfu = mean(log10_cfu, na.rm = TRUE),
       sd_log10_cfu = sd(log10_cfu, na.rm = TRUE),
-      flag = case_when(
-        replicates < 2 ~ "Check: fewer than 2 replicates",
-        rows != replicates ~ "Check: duplicate replicate labels",
-        TRUE ~ "OK"
-      ),
       .groups = "drop"
+    )
+  # has_bio is a scalar, so this is an if/else and not a case_when branch --
+  # dplyr 1.2 deprecated scalar-LHS case_when for exactly this.
+  if (!has_bio) {
+    out$unit_of_replication <- "technical only"
+    out$flag <- "No biological replicate column identified: these rows are measurements, not replicates"
+    return(out)
+  }
+  out %>%
+    mutate(
+      unit_of_replication = "biological replicate",
+      flag = case_when(
+        biological_replicates < 2 ~ "Check: fewer than 2 biological replicates",
+        rows > biological_replicates ~ paste0(
+          rows, " technical measurements collapsed to ", biological_replicates,
+          " biological replicates before testing"),
+        TRUE ~ "OK"
+      )
     )
 }
 
@@ -390,6 +792,102 @@ raw_qc_summary <- function(raw, mapping) {
   )
 }
 
+# ---------------------------------------------------------------------------
+# Assumption diagnostics (advisory)
+# ---------------------------------------------------------------------------
+# CPS-6. The app offers a Student t-test (var.equal = TRUE) with no equal-
+# variance check, and the emmeans/ANOVA path pools ONE residual variance across
+# every cell -- routinely violated when a sterilised group sits beside a growing
+# one. These numbers do not gate anything and no test is auto-switched: at n = 3
+# a formal normality test has almost no power, so using one as a gate would be
+# worse than useless. They are here so the user can see the shape of the data
+# before choosing.
+#
+# Computed on the AGGREGATED frame, because that is what the tests see.
+assumption_diagnostics <- function(dat) {
+  dat <- aggregate_biological_replicates(dat)
+  if (!is.data.frame(dat) || nrow(dat) == 0) return(tibble())
+  out <- dat %>%
+    group_by(sample, concentration_label, time_min) %>%
+    summarize(
+      n = dplyr::n(),
+      mean_log10 = mean(log10_cfu),
+      sd_log10 = sd(log10_cfu),
+      # shapiro.test() errors below n = 3 and above n = 5000, and on constant
+      # input; all three are ordinary in a CFU cell.
+      shapiro_p = if (dplyr::n() >= 3 && dplyr::n() <= 5000 &&
+                      isTRUE(sd(log10_cfu) > 0)) {
+        suppressWarnings(tryCatch(stats::shapiro.test(log10_cfu)$p.value,
+                                  error = function(e) NA_real_))
+      } else NA_real_,
+      .groups = "drop"
+    )
+  spreads <- out$sd_log10[is.finite(out$sd_log10) & out$sd_log10 > 0]
+  smallest_var <- if (length(spreads) > 0) min(spreads)^2 else NA_real_
+  out %>%
+    mutate(
+      variance_ratio_vs_smallest = if (is.na(smallest_var)) NA_real_
+                                   else signif(sd_log10^2 / smallest_var, 4),
+      note = case_when(
+        n < 2 ~ "n < 2: no spread to check.",
+        !is.finite(sd_log10) | sd_log10 == 0 ~ "Zero spread: variance-based tests are undefined for this cell.",
+        !is.na(variance_ratio_vs_smallest) & variance_ratio_vs_smallest > 4 ~
+          "Variance is more than 4x the smallest cell. Welch (the default) handles this; Student and the pooled-variance emmeans model do not.",
+        !is.na(shapiro_p) & shapiro_p < 0.05 ~
+          "Shapiro-Wilk p < 0.05 on log10(CFU). Advisory only -- consider the rank test, and note that Shapiro has little power at n = 3.",
+        TRUE ~ "OK"
+      )
+    )
+}
+
+# The single number worth putting in front of someone who picked Student.
+max_variance_ratio <- function(diag) {
+  if (!is.data.frame(diag) || nrow(diag) == 0) return(NA_real_)
+  v <- diag$variance_ratio_vs_smallest
+  v <- v[is.finite(v)]
+  if (length(v) == 0) NA_real_ else max(v)
+}
+
+# ---------------------------------------------------------------------------
+# CSV dialects
+# ---------------------------------------------------------------------------
+# CPS-9. A European plate-reader or Excel export writes `1,5E+08` with `;`
+# separators. read_csv()'s default locale parses that to a character column,
+# then to NA, and the !is.na(cfu) filter drops the lot. The drop banner does
+# report it, so it failed loudly rather than silently -- but there was no way to
+# load the file at all.
+detect_csv_format <- function(path) {
+  lines <- tryCatch(readLines(path, n = 5, warn = FALSE), error = function(e) character(0))
+  if (length(lines) == 0) return("comma")
+  count_char <- function(ch) sum(vapply(lines, function(l) {
+    m <- gregexpr(ch, l, fixed = TRUE)[[1]]
+    if (length(m) == 1 && m[1] == -1L) 0L else length(m)
+  }, integer(1)))
+  n_semi <- count_char(";")
+  n_tab <- count_char("\t")
+  n_comma <- count_char(",")
+  if (n_semi > n_comma && n_semi >= n_tab) "semicolon"
+  else if (n_tab > n_comma && n_tab > n_semi) "tab"
+  else "comma"
+}
+
+read_cfu_csv <- function(path, csv_format = "auto") {
+  fmt <- if (identical(csv_format, "auto") || is.null(csv_format)) detect_csv_format(path) else csv_format
+  raw <- switch(
+    fmt,
+    # A semicolon-separated file is a decimal-comma file in practice: that is
+    # the whole reason the separator was changed.
+    "semicolon" = readr::read_delim(
+      path, delim = ";", show_col_types = FALSE, trim_ws = TRUE,
+      locale = readr::locale(decimal_mark = ",", grouping_mark = ".")
+    ),
+    "tab" = readr::read_delim(path, delim = "\t", show_col_types = FALSE, trim_ws = TRUE),
+    readr::read_csv(path, show_col_types = FALSE, trim_ws = TRUE)
+  )
+  attr(raw, "csv_format") <- fmt
+  raw
+}
+
 model_formula <- function(dat) {
   terms <- c("sample", "concentration_label", "time_min")
   usable <- terms[vapply(terms, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
@@ -400,8 +898,52 @@ model_formula <- function(dat) {
   }
 }
 
-run_anova <- function(dat) {
+# What the pairwise table beside the omnibus table actually is. CPS-7: BH across
+# a set of two-sample t-tests is a legitimate standalone procedure, but a reader
+# who sees an ANOVA next to a star-annotated figure will assume protected
+# post-hoc testing unless told otherwise. So the table says which it is.
+pairwise_family_note <- function(stats_method) {
+  switch(
+    stats_method %||% "welch",
+    "emmeans_tukey" = "The Statistics tab reports Tukey HSD contrasts from THIS model: a protected post-hoc family.",
+    "emmeans_dunnett" = "The Statistics tab reports Dunnett contrasts against the control from THIS model: a protected post-hoc family.",
+    "emmeans" = "The Statistics tab reports unadjusted emmeans contrasts from THIS model, corrected by the app's own multiple-comparison setting.",
+    "wilcoxon" = "The Statistics tab reports pairwise Wilcoxon rank-sum tests, corrected across that family. They are the nonparametric partner of this omnibus test, not a Dunn post-hoc.",
+    "The Statistics tab is an INDEPENDENT family of two-sample t-tests, not a post-hoc of this table. Its correction is applied across that family alone, and a non-significant omnibus does not gate it."
+  )
+}
+
+run_anova <- function(dat, stats_method = "welch") {
+  # CPS-1: the omnibus model gets the same unit of replication as everything
+  # else, or its residual df counts plates and its F is as inflated as the
+  # pairwise tests used to be.
+  unit <- replication_unit_label(dat)
+  dat <- aggregate_biological_replicates(dat)
   if (nrow(dat) < 3 || n_distinct(dat$log10_cfu) < 2) return(tibble())
+
+  # CPS-7: a rank-based pairwise family gets a rank-based omnibus. An F test
+  # printed above a table of Wilcoxon tests describes a different procedure from
+  # the one that produced the stars.
+  if (identical(stats_method, "wilcoxon")) {
+    terms <- c("sample", "concentration_label", "time_min")
+    usable <- terms[vapply(terms, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
+    if (length(usable) == 0) return(tibble())
+    grp <- interaction(dat[usable], drop = TRUE)
+    if (nlevels(grp) < 2) return(tibble())
+    kw <- tryCatch(stats::kruskal.test(dat$log10_cfu, grp), error = function(e) NULL)
+    if (is.null(kw)) return(tibble())
+    return(tibble(
+      term = paste(usable, collapse = " x "),
+      statistic = signif(unname(kw$statistic), 4),
+      df = unname(kw$parameter),
+      p.value = signif(unname(kw$p.value), 4),
+      ss_type = "Kruskal-Wallis rank sum test on log10(CFU)",
+      unit_of_replication = unit,
+      n_units = nrow(dat),
+      pairwise_family = pairwise_family_note(stats_method)
+    ))
+  }
+
   fit <- lm(model_formula(dat), data = dat)
   # CFU designs are routinely unbalanced by the time they reach the ANOVA: the
   # cfu > 0 filter removes whole replicates from some cells. Type I sequential
@@ -419,7 +961,10 @@ run_anova <- function(dat) {
   out %>%
     mutate(
       across(where(is.numeric), ~ signif(.x, 4)),
-      ss_type = ss_type
+      ss_type = ss_type,
+      unit_of_replication = unit,
+      n_units = nrow(dat),
+      pairwise_family = pairwise_family_note(stats_method)
     )
 }
 
@@ -482,6 +1027,7 @@ empty_two_group_result <- function(a, b, note, paired = FALSE, n_matched = NA_in
   est <- mean(a, na.rm = TRUE) - mean(b, na.rm = TRUE)
   if (!is.finite(est)) est <- NA_real_
   tibble(
+    n_a = length(a), n_b = length(b),
     p.value = NA_real_, statistic = NA_real_, parameter = NA_real_,
     estimate = est,
     conf.low = NA_real_, conf.high = NA_real_,
@@ -543,6 +1089,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal,
                                     paired = TRUE, n_matched = mp$n_matched))
     }
     return(tibble(
+      n_a = length(a), n_b = length(b),
       p.value = unname(tt$p.value),
       statistic = unname(tt$statistic),
       parameter = unname(tt$parameter),
@@ -581,6 +1128,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal,
       notes <- c(notes, "Ties present, so the normal approximation replaced the exact test.")
     }
     return(tibble(
+      n_a = length(a), n_b = length(b),
       p.value = unname(test$p.value),
       statistic = unname(test$statistic),
       parameter = NA_real_,
@@ -606,6 +1154,7 @@ run_two_group_test <- function(dat, group_col, level_a, level_b, var_equal,
   }
 
   tibble(
+    n_a = length(a), n_b = length(b),
     p.value = unname(test$p.value),
     statistic = unname(test$statistic),
     parameter = unname(test$parameter),
@@ -628,6 +1177,11 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
   # NOTE the distinct name: `paired` is also a column in the result, and inside
   # mutate() the data mask would shadow the argument.
   use_paired <- isTRUE(paired) && !identical(test_family, "wilcoxon")
+
+  # CPS-1: one value per biological replicate BEFORE anything is compared.
+  # A survival frame is already at that unit and passes through untouched.
+  unit <- replication_unit_label(dat)
+  dat <- aggregate_biological_replicates(dat)
 
   if (comparison == "sample") {
     if (n_distinct(dat$sample) < 2) return(tibble(message = "Sample comparison requires at least two samples."))
@@ -739,6 +1293,8 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
              else if (use_paired) "Paired t-test on log10(CFU), matched by replicate"
              else if (var_equal) "Student t-test on log10(CFU)"
              else "Welch t-test on log10(CFU)",
+      # What n counts. Read this column before quoting an n in a manuscript.
+      unit_of_replication = unit,
       estimate_log10_difference = estimate,
       # The test runs on log10, so the CI transforms straight into a fold-change
       # interval -- the scale the result is actually reported on.
@@ -748,6 +1304,7 @@ run_groupwise_t_tests <- function(dat, comparison, p_adjust, adjustment_scope, c
     ) %>%
     select(
       comparison_family, test, contrast, sample, concentration_label, time_min,
+      unit_of_replication, n_a, n_b,
       estimate_log10_difference, conf.low, conf.high, fold_change, fold_change_low, fold_change_high,
       hedges_g, d_z, paired, n_matched, statistic, parameter, p.value, q.value,
       significance, p_adjust_method, adjustment_scope, message, everything()
@@ -866,7 +1423,24 @@ run_survival_stats <- function(surv, comparison, p_adjust, adjustment_scope,
     )
 }
 
-run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
+run_contrast <- function(dat, comparison, p_adjust, control_concentration,
+                         adjustment_scope = "global", emm_adjust = "none") {
+  # CPS-1: the linear model is fitted to one row per biological replicate, not
+  # one row per plate, so its residual df is the df the design really has.
+  unit <- replication_unit_label(dat)
+  dat <- aggregate_biological_replicates(dat)
+  # Dunnett's procedure is defined for a set of treatment-versus-one-control
+  # contrasts. Asking for it on an all-pairs family would label the output with
+  # a procedure that did not run, so it degrades to no family-wise adjustment
+  # and says so on every row.
+  dunnett_note <- NA_character_
+  if (identical(emm_adjust, "dunnettx") && !identical(comparison, "concentration_vs_control")) {
+    emm_adjust <- "none"
+    dunnett_note <- paste(
+      "Dunnett is defined only against a single control, so it was not applied to this",
+      "all-pairs family; the app's own multiple-comparison correction was used instead."
+    )
+  }
   if (nrow(dat) < 3 || n_distinct(dat$log10_cfu) < 2) return(tibble())
   if (comparison == "sample" && n_distinct(dat$sample) < 2) return(tibble(message = "Sample comparison requires at least two samples."))
   if (comparison == "time" && n_distinct(dat$time_min) < 2) return(tibble(message = "Timepoint comparison requires at least two timepoints."))
@@ -875,6 +1449,21 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
   }
 
   fit <- lm(model_formula(dat), data = dat)
+
+  # CPS-5: which variables emmeans conditions on. Without them the result frame
+  # carries no `panel` column, so adjust_stats()' within_panel branch could not
+  # fire even when the user asked for it -- the sidebar control was inert for
+  # this method and the correction was silently global.
+  # Derived here rather than read back out of the branches below: those run
+  # inside tryCatch(), where `<<-` would write past this frame.
+  by_candidates <- switch(
+    comparison,
+    sample = c("concentration_label", "time_min"),
+    time = c("sample", "concentration_label"),
+    c("sample", "time_min")
+  )
+  used_by_vars <- by_candidates[vapply(by_candidates,
+                                       function(z) n_distinct(dat[[z]]) > 1, logical(1))]
 
   result <- tryCatch({
     if (comparison == "sample") {
@@ -885,7 +1474,7 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
       } else {
         ~ sample
       }
-      pairs(emmeans(fit, spec), adjust = "none")
+      pairs(emmeans(fit, spec), adjust = emm_adjust)
     } else if (comparison == "time") {
       by_vars <- c("sample", "concentration_label")
       by_vars <- by_vars[vapply(by_vars, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
@@ -894,7 +1483,7 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
       } else {
         ~ time_min
       }
-      pairs(emmeans(fit, spec), adjust = "none")
+      pairs(emmeans(fit, spec), adjust = emm_adjust)
     } else if (comparison == "concentration_vs_control") {
       by_vars <- c("sample", "time_min")
       by_vars <- by_vars[vapply(by_vars, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
@@ -909,7 +1498,7 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
       if (is.na(control_idx)) {
         stop("The selected control treatment is not present in the data.", call. = FALSE)
       }
-      contrast(emm, method = "trt.vs.ctrl", ref = control_idx, adjust = "none")
+      contrast(emm, method = "trt.vs.ctrl", ref = control_idx, adjust = emm_adjust)
     } else {
       by_vars <- c("sample", "time_min")
       by_vars <- by_vars[vapply(by_vars, function(z) n_distinct(dat[[z]]) > 1, logical(1))]
@@ -918,7 +1507,7 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
       } else {
         ~ concentration_label
       }
-      pairs(emmeans(fit, spec), adjust = "none")
+      pairs(emmeans(fit, spec), adjust = emm_adjust)
     }
   }, error = function(e) {
     tibble(message = conditionMessage(e))
@@ -928,11 +1517,38 @@ run_contrast <- function(dat, comparison, p_adjust, control_concentration) {
   if (nrow(out) == 0) return(out)
   if (!"p.value" %in% names(out)) return(out)
 
-  adjust_stats(out, p_adjust, "global") %>%
+  # The `by` variables ARE the panels: one comparison family per combination.
+  panel_vars <- intersect(used_by_vars, names(out))
+  if (length(panel_vars) > 0) {
+    out$panel <- do.call(paste, c(lapply(panel_vars, function(v) as.character(out[[v]])),
+                                  list(sep = " | ")))
+  } else {
+    # A single family. "Within each panel" and "across the table" are then the
+    # same thing, and saying so is better than silently relabelling the scope.
+    out$panel <- "all comparisons"
+  }
+
+  # CPS-7: when emmeans applied a family-wise adjustment of its own (Tukey,
+  # Dunnett), its p.value column is ALREADY adjusted. Running the app's
+  # correction over it again would be a double correction, so the second pass is
+  # disabled and the table records which procedure actually ran.
+  emm_adjusted <- !identical(emm_adjust, "none")
+  scope_used <- if (emm_adjusted) "emmeans family" else adjustment_scope
+
+  adjust_stats(out, if (emm_adjusted) "none" else p_adjust, scope_used) %>%
     mutate(
-      test = "Linear model + emmeans on log10(CFU)",
+      test = paste0(
+        "Linear model + emmeans on log10(CFU)",
+        switch(emm_adjust,
+               "tukey" = ", Tukey HSD across all pairs within each panel",
+               "dunnettx" = ", Dunnett versus the control within each panel",
+               "")
+      ),
+      unit_of_replication = unit,
+      emmeans_adjust = emm_adjust,
       estimate_log10_difference = estimate,
-      fold_change = 10^estimate
+      fold_change = 10^estimate,
+      message = if (is.na(dunnett_note)) NA_character_ else dunnett_note
     )
 }
 
@@ -1152,11 +1768,32 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type, clamp_zero = TRUE) 
     c("concentration_label", "sample", "time_min")
   )
 
-  dat %>%
-    mutate(plot_y = if (y_mode == "log10") log10_cfu else cfu) %>%
+  # CPS-2. Both y-axis modes plot the SAME quantity on the SAME log spacing and
+  # every test in this app runs on log10(CFU) -- so the summary is computed on
+  # log10 in both, and `raw_log_axis` merely back-transforms the result for
+  # display. Summarising on the raw scale instead (what this used to do) put the
+  # bar at the ARITHMETIC mean while the caption claimed a log10 analysis: on
+  # 1e6/1e7/1e8 that draws the bar at 2.35x the geometric mean the test
+  # analysed, and mean - SD came out NEGATIVE and was silently clamped to
+  # machine epsilon, drawing a whisker from the floor of the axis across
+  # twenty-odd decades. Back-transforming a log-scale interval instead gives a
+  # multiplicative interval, which is strictly positive by construction and is
+  # the interval the statistics correspond to.
+  on_log <- y_mode %in% c("log10", "raw_log_axis")
+  back_transform <- identical(y_mode, "raw_log_axis")
+  # Whether n can be quoted as independent replicates -- see CPS-1. A survival
+  # frame has no bio_replicate column because pairing already reduced it to one
+  # row per replicate, and there `n` counts complete pairs.
+  has_bio <- "bio_replicate" %in% names(dat) && any(!is.na(dat$bio_replicate))
+  has_lod <- "lod_substituted" %in% names(dat)
+
+  out <- dat %>%
+    mutate(plot_y = if (on_log) log10_cfu else cfu) %>%
     group_by(across(all_of(group_cols))) %>%
     summarize(
       n = n(),
+      n_bio = if (has_bio) dplyr::n_distinct(bio_replicate[!is.na(bio_replicate)]) else NA_integer_,
+      n_lod_substituted = if (has_lod) sum(lod_substituted, na.rm = TRUE) else 0L,
       mean_y = mean(plot_y, na.rm = TRUE),
       median_y = median(plot_y, na.rm = TRUE),
       sd_y = sd(plot_y, na.rm = TRUE),
@@ -1178,17 +1815,37 @@ plot_summary <- function(dat, plot_mode, y_mode, error_type, clamp_zero = TRUE) 
              else mean_y - err_y,
       ymax = if (error_type == "IQR") q3_y
              else if (error_type == "Range (min-max)") max_y
-             else mean_y + err_y,
-      # A log10 CFU count cannot go below 0, so clamping the lower whisker there
-      # is right for absolute counts. A log10 SURVIVAL RATIO is signed -- 0 is
-      # "no change", not a floor -- and clamping it would draw a group that lost
-      # a log as though its error bar reached no-change. Hence clamp_zero.
-      # The raw-log-axis floor is unconditional: that axis is log-transformed
-      # and cannot take zero whatever the quantity means.
-      ymin = if (y_mode == "raw_log_axis") pmax(ymin, .Machine$double.eps)
-             else if (isTRUE(clamp_zero)) pmax(ymin, 0)
-             else ymin
+             else mean_y + err_y
     )
+
+  if (back_transform) {
+    # 10^ of a log-scale summary: the centre is the geometric mean and the
+    # interval is multiplicative (centre x/÷ 10^err). Every value is > 0, so
+    # nothing needs clamping and nothing is silently moved.
+    out <- out %>%
+      mutate(
+        across(c(mean_y, median_y, q1_y, q3_y, min_y, max_y, ymin, ymax), ~ 10^.x),
+        # Kept in log10 units, which is the only scale on which they are
+        # defined; the multiplicative equivalent is the factor below.
+        err_factor = 10^err_y,
+        summary_scale = "log10, back-transformed",
+        centre_statistic = "geometric mean"
+      )
+  } else {
+    out <- out %>%
+      mutate(
+        # A log10 CFU count cannot go below 0, so clamping the lower whisker
+        # there is right for absolute counts. A log10 SURVIVAL RATIO is signed
+        # -- 0 is "no change", not a floor -- and clamping it would draw a group
+        # that lost a log as though its error bar reached no-change. Hence
+        # clamp_zero.
+        ymin = if (isTRUE(clamp_zero)) pmax(ymin, 0) else ymin,
+        err_factor = NA_real_,
+        summary_scale = if (on_log) "log10" else "raw",
+        centre_statistic = if (on_log) "mean of log10" else "arithmetic mean"
+      )
+  }
+  out
 }
 
 # Stable identity for one statistic label, so a nudge the user applies by
@@ -1409,7 +2066,83 @@ bar_keys <- function(dat, plot_mode) {
 # sample or treatment label the user's CSV happens to contain.
 bar_color_input_id <- function(key) paste0("barcol_", make.names(key))
 
-make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input, bar_palette = NULL) {
+# Input ids of the per-name sample and timepoint colour pickers.
+sample_colour_input_id <- function(name) paste0("samplecol_", make.names(name))
+time_colour_input_id <- function(name) paste0("timecol_", make.names(name))
+colour_input_id <- function(kind, name) {
+  if (identical(kind, "times")) time_colour_input_id(name) else sample_colour_input_id(name)
+}
+
+# ---------------------------------------------------------------------------
+# The figure's colour mapping
+# ---------------------------------------------------------------------------
+# THE one place a figure's groups get their colours. make_cfu_plot() hands
+# `values` straight to scale_fill_manual(), and the legend key and its text
+# starter are read off the same object, so the figure, the key and the words
+# cannot disagree. Returns:
+#   variable  the column the fill is mapped to (sample, time_min, bar_key, or
+#             key_group, a constant column for the one-colour figure)
+#   values    named fill vector, exactly as passed to the scale
+#   entries   one row per group the figure actually draws, in legend order:
+#             name, fill, outline, glyph ("bar" or "point"), shape (pch)
+#   per_bar   TRUE when bars are coloured one by one
+# Sample and timepoint colours come from the colour registry BY NAME
+# (sample_palette / time_palette: name -> hex). The app passes its registry;
+# the exported script carries the same maps in settings. A level the registry
+# does not name gets the next unused default rather than failing.
+figure_key_mapping <- function(dat, sumdat, plot_mode, input, bar_palette = NULL,
+                               sample_palette = NULL, time_palette = NULL) {
+  bar_palette <- bar_palette %||% input$bar_palette
+  sample_palette <- sample_palette %||% input$sample_palette
+  time_palette <- time_palette %||% input$time_palette
+  per_bar <- identical(input$bar_color_mode %||% "group", "manual") && length(bar_palette) > 0
+  if (per_bar) {
+    present <- unique(bar_keys(sumdat, plot_mode))
+    # Any bar the palette does not name falls back to a neutral grey rather than
+    # to NA, which ggplot would drop from the plot entirely.
+    values <- setNames(rep("#BBBBBB", length(present)), present)
+    known <- intersect(present, names(bar_palette))
+    values[known] <- unlist(bar_palette[known])
+    variable <- "bar_key"
+  } else if (identical(plot_mode, "survival")) {
+    values <- registry_colours(sample_palette, levels(droplevels(sumdat$sample)), "samples")
+    variable <- "sample"
+  } else if (identical(plot_mode, "combined")) {
+    values <- registry_colours(sample_palette, levels(dat$sample), "samples")
+    variable <- "sample"
+  } else if (identical(plot_mode, "sample_both")) {
+    values <- registry_colours(time_palette, levels(dat$time_min), "times")
+    variable <- "time_min"
+  } else {
+    # One sample at one timepoint, one colour. Its name is the sample shown.
+    nm <- if ("sample" %in% names(dat)) unique(as.character(dat$sample)) else character(0)
+    nm <- if (length(nm) == 1 && !is.na(nm)) nm else "All bars"
+    values <- setNames(input$single_color %||% "grey35", nm)
+    variable <- "key_group"
+  }
+
+  drawn <- if (identical(variable, "key_group")) names(values) else {
+    unique(c(as.character(sumdat[[variable]] %||% character(0)),
+             if (!identical(variable, "bar_key")) as.character(dat[[variable]] %||% character(0))))
+  }
+  shown <- names(values)[names(values) %in% drawn]
+  draw_bars <- identical(input$chart_geom %||% "bar", "bar")
+  entries <- data.frame(
+    name = shown,
+    fill = unname(as.character(values[shown])),
+    outline = rep(input$bar_outline_color %||% "grey20", length(shown)),
+    glyph = rep(if (draw_bars) "bar" else "point", length(shown)),
+    shape = rep(if (draw_bars) NA_integer_ else 21L, length(shown)),
+    replicates = rep(isTRUE(input$show_points), length(shown)),
+    # Bars use the bar outline width; mean and replicate circles a fixed stroke.
+    outline_width = rep(if (draw_bars) (input$bar_outline_width %||% 0.25) else 0.45, length(shown)),
+    stringsAsFactors = FALSE
+  )
+  list(variable = variable, values = values, entries = entries, per_bar = per_bar)
+}
+
+make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input, bar_palette = NULL,
+                          key_on_figure = NULL, sample_palette = NULL, time_palette = NULL) {
   # Style settings, defaulted individually. The app always supplies these from
   # its UI, but the exported script hands over a plain list a user may edit by
   # hand, and a missing numeric reaches theme_classic(base_size = NULL) and
@@ -1430,6 +2163,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   axis_line_width <- input$axis_line_width %||% 0.6
   box_line_width <- input$box_line_width %||% 0.6
   y_tick_length <- input$y_tick_length %||% 4
+  # One family for every piece of text the figure draws: themes, titles, axis
+  # text, statistic and n labels. A font this machine lacks falls back to sans.
+  font_fam <- resolve_font_family(font_family_request(input$font_family, input$font_family_custom))$family
 
   is_survival <- identical(plot_mode, "survival")
   # The plotted quantity is already a log10 ratio. Sending it through the
@@ -1477,29 +2213,44 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   # Per-bar colours. The server resolves them from the dynamic pickers; the
   # exported script carries them in settings. Either way they arrive as a named
   # character vector keyed by bar_keys().
-  bar_palette <- bar_palette %||% input$bar_palette
-  per_bar_color <- identical(input$bar_color_mode %||% "group", "manual") &&
-    length(bar_palette) > 0
+  # Every fill colour on the figure comes from this one object; the legend key
+  # and its text starter are read off the same object (figure_key_mapping).
+  key_map <- figure_key_mapping(dat, sumdat, plot_mode, input, bar_palette,
+                                sample_palette = sample_palette, time_palette = time_palette)
+  fill_values <- key_map$values
+  per_bar_color <- key_map$per_bar
   if (per_bar_color) {
-    sumdat$bar_key <- bar_keys(sumdat, plot_mode)
-    dat$bar_key <- bar_keys(dat, plot_mode)
-    present <- unique(sumdat$bar_key)
-    # Any bar the palette does not name falls back to a neutral grey rather than
-    # to NA, which ggplot would drop from the plot entirely.
-    resolved <- setNames(rep("#BBBBBB", length(present)), present)
-    known <- intersect(present, names(bar_palette))
-    resolved[known] <- unlist(bar_palette[known])
-    bar_palette <- resolved
-    key_levels <- present
-    sumdat$bar_key <- factor(sumdat$bar_key, levels = key_levels)
-    dat$bar_key <- factor(dat$bar_key, levels = key_levels)
+    key_levels <- names(fill_values)
+    sumdat$bar_key <- factor(bar_keys(sumdat, plot_mode), levels = key_levels)
+    dat$bar_key <- factor(bar_keys(dat, plot_mode), levels = key_levels)
   }
+  # The one-colour figure has no grouping column, so give it a constant one: the
+  # bars look exactly as before, and the key has an entry to draw.
+  if (identical(key_map$variable, "key_group")) {
+    sumdat$key_group <- factor(rep(names(fill_values), nrow(sumdat)), levels = names(fill_values))
+    dat$key_group <- factor(rep(names(fill_values), nrow(dat)), levels = names(fill_values))
+  }
+  # "Place key on figure": the figure's own fill legend IS the key -- drawn by
+  # ggplot from the same layers, so the embedded key and the standalone one
+  # (legend_key_grob) are the same grob. Off, the figure keeps its usual
+  # legend: one per group, none for per-bar or one-colour figures.
+  key_on_figure <- isTRUE(key_on_figure %||% input$legend_key_on_figure)
+  fill_guide <- if (key_on_figure) "legend" else if (per_bar_color || identical(key_map$variable, "key_group")) "none" else "legend"
 
   # When every group has the same n, one phrase in the caption says it better
   # than a label under every bar. Per-bar labels are only worth their clutter
   # when n actually varies -- which, after the CFU<=0 filter, it often does.
-  group_ns <- sumdat$n[is.finite(sumdat$n)]
+  # CPS-1: the caption quotes the unit the STATISTICS count. When technical
+  # plates were collapsed, n_bio is smaller than the row count and n_bio is the
+  # honest number; when no biological replicate column was identified, the
+  # caption has to say that the wells are technical and n is not a replicate n.
+  bio_ns <- if ("n_bio" %in% names(sumdat)) sumdat$n_bio else rep(NA_integer_, nrow(sumdat))
+  have_bio <- length(bio_ns) > 0 && any(!is.na(bio_ns))
+  group_ns <- if (have_bio) bio_ns[is.finite(bio_ns)] else sumdat$n[is.finite(sumdat$n)]
+  wells_per_group <- sumdat$n[is.finite(sumdat$n)]
   n_is_constant <- length(group_ns) > 0 && length(unique(group_ns)) == 1
+  # The n row under the axis must show the same unit the caption quotes.
+  sumdat$n_label <- if (have_bio) sumdat$n_bio else sumdat$n
   draw_n_labels <- isTRUE(input$show_n_labels) && length(group_ns) > 0 && !n_is_constant
 
   # The n row is drawn outside the panel, so it has to be placed past whatever
@@ -1516,7 +2267,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   n_row_offset_pt <- 5 + tick_extent_pt + 4
   # On a survival figure n counts PAIRS, not wells: a well whose partner was
   # lost contributes nothing, so calling these "replicates" would overstate it.
-  n_unit <- if (is_survival) "complete pairs" else "replicates"
+  n_unit <- if (is_survival) "complete pairs"
+            else if (have_bio) "biological replicates"
+            else "technical replicates only - no biological replicate column was identified, so this n is not a replicate n"
   n_caption <- if (length(group_ns) == 0) {
     ""
   } else if (n_is_constant) {
@@ -1525,6 +2278,18 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     paste0("n = ", min(group_ns), "-", max(group_ns), " ", n_unit, " per group (n row under the axis)")
   } else {
     paste0("n = ", min(group_ns), "-", max(group_ns), " ", n_unit, " per group")
+  }
+  # Say how many plates went into each of those replicates, when it is more
+  # than one -- otherwise a reader counting points on the figure and the n in
+  # the caption gets two different numbers with no explanation.
+  if (have_bio && length(wells_per_group) == length(group_ns) &&
+      length(wells_per_group) > 0 && any(wells_per_group > group_ns)) {
+    n_caption <- paste0(
+      n_caption, " (",
+      if (length(unique(wells_per_group)) == 1) wells_per_group[1]
+      else paste0(min(wells_per_group), "-", max(wells_per_group)),
+      " technical measurements, averaged on the log10 scale before testing)"
+    )
   }
 
   # Auto methods caption: names error-bar type, replicate n, and (when stats are
@@ -1536,8 +2301,14 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
              input$surv_baseline %||% "baseline",
              ", paired within each replicate; the reference line is no change")
     } else NULL
-    caption_parts <- c(error_type_caption(error_type, variation_display),
-                       survival_caption, n_caption)
+    # CPS-3: a censored well changes what the bar means, so the figure says so.
+    lod_caption <- if ("lod_substituted" %in% names(dat) &&
+                       any(dat$lod_substituted, na.rm = TRUE)) {
+      paste0(sum(dat$lod_substituted, na.rm = TRUE),
+             " well(s) were at or below the limit of detection and were censored at it")
+    } else NULL
+    caption_parts <- c(error_type_caption(error_type, variation_display, y_mode, is_survival),
+                       survival_caption, n_caption, lod_caption)
     resolved_cmp <- input$comparison %||% "auto"
     if (identical(resolved_cmp, "auto")) resolved_cmp <- resolve_auto_comparison(plot_mode)
     # A survival test outside survival mode, or a timepoint test inside it, is
@@ -1604,6 +2375,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     ggplot2::guide_axis()
   }
   legend_pos <- input$legend_position %||% "top"
+  # A key the user asked to place cannot be hidden by "none": it goes in the
+  # right-hand margin, outside the data.
+  if (key_on_figure && identical(legend_pos, "none")) legend_pos <- "right"
   legend_theme <- if (identical(legend_pos, "inside")) {
     theme(
       legend.position = "inside",
@@ -1615,13 +2389,13 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     theme(legend.position = legend_pos)
   }
 
-  base_theme <- theme_classic(base_size = font_size) +
+  base_theme <- theme_classic(base_size = font_size, base_family = font_fam) +
     theme(
-      plot.title = element_text(face = "bold", size = title_size),
-      plot.subtitle = element_text(size = subtitle_size, color = "grey30"),
-      axis.text.x = element_text(angle = x_angle, hjust = 1),
+      plot.title = element_text(face = "bold", size = title_size, family = font_fam),
+      plot.subtitle = element_text(size = subtitle_size, color = "grey30", family = font_fam),
+      axis.text.x = element_text(angle = x_angle, hjust = 1, family = font_fam),
       strip.background = element_rect(fill = "grey92", color = NA),
-      strip.text = element_text(face = "bold"),
+      strip.text = element_text(face = "bold", family = font_fam),
       axis.ticks.y = if (isTRUE(input$show_y_ticks)) element_line(color = axis_col, linewidth = axis_line_width) else element_blank(),
       axis.minor.ticks.y.left = if (use_minor_ticks) element_line(color = axis_col, linewidth = axis_line_width * 0.75) else element_blank(),
       axis.ticks.length.y = grid::unit(y_tick_length, "pt"),
@@ -1634,13 +2408,13 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     legend_theme
 
   if (identical(plot_theme, "minimal_grid")) {
-    base_theme <- theme_minimal(base_size = font_size) +
+    base_theme <- theme_minimal(base_size = font_size, base_family = font_fam) +
       theme(
-        plot.title = element_text(face = "bold", size = title_size),
-        plot.subtitle = element_text(size = subtitle_size, color = "grey30"),
-        axis.text.x = element_text(angle = x_angle, hjust = 1),
+        plot.title = element_text(face = "bold", size = title_size, family = font_fam),
+        plot.subtitle = element_text(size = subtitle_size, color = "grey30", family = font_fam),
+        axis.text.x = element_text(angle = x_angle, hjust = 1, family = font_fam),
         strip.background = element_rect(fill = "grey95", color = NA),
-        strip.text = element_text(face = "bold"),
+        strip.text = element_text(face = "bold", family = font_fam),
         panel.grid.major.x = element_blank(),
         panel.grid.minor.x = element_blank(),
         panel.grid.major.y = element_line(color = grid_col, linewidth = 0.3),
@@ -1747,9 +2521,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     }
     if (!is.finite(n_y)) return(plot_obj)
     n_mapping <- if (is.null(group_var)) {
-      aes(x = concentration_label, y = n_y, label = n)
+      aes(x = concentration_label, y = n_y, label = n_label)
     } else {
-      aes(x = concentration_label, y = n_y, label = n, group = .data[[group_var]])
+      aes(x = concentration_label, y = n_y, label = n_label, group = .data[[group_var]])
     }
     plot_obj + geom_text(
       data = sumdat,
@@ -1760,13 +2534,12 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       # point offset into that unit.
       vjust = 1 + n_row_offset_pt / n_label_pt,
       size = n_label_pt * 0.3528,
-      color = stat_col
+      color = stat_col,
+      family = font_fam
     )
   }
 
   if (plot_mode == "survival") {
-    sample_colors <- named_palette(levels(droplevels(sumdat$sample)),
-                                   c(input$sample_color_1, input$sample_color_2))
     dodge_pos <- position_dodge(width = dodge_width)
     p <- if (per_bar_color) {
       ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = sample))
@@ -1794,12 +2567,10 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- add_n_labels(p, dodge_pos, "sample")
     p <- p +
       scale_x_discrete(drop = FALSE) +
-      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
-       else scale_fill_manual(values = sample_colors)) +
+      scale_fill_manual(values = fill_values, guide = fill_guide) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title,
            title = input$plot_title, subtitle = subtitle_text)
   } else if (plot_mode == "combined") {
-    sample_colors <- named_palette(levels(dat$sample), c(input$sample_color_1, input$sample_color_2))
     dodge_pos <- position_dodge(width = dodge_width)
     # group stays on the sample even when fill moves to bar_key: position_dodge
     # allocates one slot per group, so dodging by a key that also varies with x
@@ -1828,11 +2599,9 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- p +
       facet_wrap(~ time_min, nrow = 1) +
       scale_x_discrete(drop = FALSE) +
-      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
-       else scale_fill_manual(values = sample_colors)) +
+      scale_fill_manual(values = fill_values, guide = fill_guide) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   } else if (plot_mode == "sample_both") {
-    time_colors <- named_palette(levels(dat$time_min), c(input$time_color_1, input$time_color_2))
     dodge_pos <- position_dodge(width = dodge_width)
     p <- if (per_bar_color) {
       ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key, group = time_min))
@@ -1857,40 +2626,28 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     p <- add_n_labels(p, dodge_pos, "time_min")
     p <- p +
       scale_x_discrete(drop = FALSE) +
-      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none")
-       else scale_fill_manual(values = time_colors)) +
+      scale_fill_manual(values = fill_values, guide = fill_guide) +
       labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   } else {
-    p <- if (per_bar_color) {
-      ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = bar_key))
-    } else {
-      ggplot(sumdat, aes(x = concentration_label, y = mean_y))
-    }
-    p <- add_mean_layer(p, position_identity(),
-                        fixed_fill = if (per_bar_color) NULL else input$single_color)
+    # One colour, or one per bar: either way the fill is mapped (to key_group or
+    # bar_key) so it comes from fill_values like every other mode.
+    fill_var <- key_map$variable
+    p <- ggplot(sumdat, aes(x = concentration_label, y = mean_y, fill = .data[[fill_var]]))
+    p <- add_mean_layer(p, position_identity())
     p <- add_interval_layer(p, position_identity(), width = 0.2)
     if (isTRUE(input$show_points)) {
-      if (per_bar_color) {
-        p <- p + geom_point(
-          data = dat,
-          aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = bar_key),
-          position = position_jitter(width = jitter_width, height = 0, seed = jitter_seed),
-          shape = 21, size = point_size, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
-        )
-      } else {
-        p <- p + geom_point(
-          data = dat,
-          aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu),
-          position = position_jitter(width = jitter_width, height = 0, seed = jitter_seed),
-          shape = 21, size = point_size, fill = input$single_color, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
-        )
-      }
+      p <- p + geom_point(
+        data = dat,
+        aes(x = concentration_label, y = if (y_mode == "log10") log10_cfu else cfu, fill = .data[[fill_var]]),
+        position = position_jitter(width = jitter_width, height = 0, seed = jitter_seed),
+        shape = 21, size = point_size, color = bar_outline_col, stroke = 0.25, alpha = point_alpha
+      )
     }
     p <- add_n_labels(p, position_identity())
     p <- p +
       scale_x_discrete(drop = FALSE) +
-      (if (per_bar_color) scale_fill_manual(values = bar_palette, guide = "none") else NULL) +
-      labs(x = input$x_label, y = y_lab, title = input$plot_title, subtitle = subtitle_text)
+      scale_fill_manual(values = fill_values, guide = fill_guide) +
+      labs(x = input$x_label, y = y_lab, fill = input$legend_title, title = input$plot_title, subtitle = subtitle_text)
   }
 
   if (nrow(ann) > 0) {
@@ -1902,7 +2659,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
       aes(x = x, y = y, label = label)
     }
     p <- p + geom_text(data = ann, ann_aes, inherit.aes = FALSE,
-                       size = stat_size, color = stat_col)
+                       size = stat_size, color = stat_col, family = font_fam)
   }
 
   if (!is.null(caption_text)) {
@@ -1911,14 +2668,16 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
 
   p <- p + base_theme +
     theme(
-      plot.title = element_text(face = "bold", size = title_size, hjust = input$title_hjust %||% 0),
-      plot.subtitle = element_text(size = subtitle_size, color = "grey30", hjust = input$subtitle_hjust %||% 0),
+      plot.title = element_text(face = "bold", size = title_size, hjust = input$title_hjust %||% 0,
+                                family = font_fam),
+      plot.subtitle = element_text(size = subtitle_size, color = "grey30", hjust = input$subtitle_hjust %||% 0,
+                                   family = font_fam),
       plot.caption = element_text(
         size = (subtitle_size %||% 10) * 0.92, color = "grey35",
-        hjust = input$caption_hjust %||% 0
+        hjust = input$caption_hjust %||% 0, family = font_fam
       ),
-      axis.title.x = element_text(hjust = input$x_title_hjust %||% 0.5),
-      axis.title.y = element_text(hjust = input$y_title_hjust %||% 0.5)
+      axis.title.x = element_text(hjust = input$x_title_hjust %||% 0.5, family = font_fam),
+      axis.title.y = element_text(hjust = input$y_title_hjust %||% 0.5, family = font_fam)
     )
 
   # The n row sits outside the panel between the tick labels and the axis title,
@@ -1928,7 +2687,7 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
     # needs the extra height the n row adds -- not the tick extent again.
     p <- p + theme(
       axis.title.x = element_text(margin = margin(t = n_label_pt + 7, unit = "pt"),
-                                  hjust = input$x_title_hjust %||% 0.5),
+                                  hjust = input$x_title_hjust %||% 0.5, family = font_fam),
       plot.margin = margin(5.5, 5.5, 8, 5.5, "pt")
     )
   }
@@ -1957,7 +2716,8 @@ make_cfu_plot <- function(dat, sumdat, ann, plot_mode, y_mode, error_type, input
   p
 }
 
-make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, step = NULL, bar_palette = NULL) {
+make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, step = NULL, bar_palette = NULL,
+                             sample_palette = NULL, time_palette = NULL) {
   reveal <- reveal_data(dat, sumdat, plot_mode)
   if (!is.null(step)) {
     step <- max(1, min(step, nrow(reveal$groups)))
@@ -1973,11 +2733,14 @@ make_reveal_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, 
     y_mode = y_mode,
     error_type = error_type,
     input = input,
-    bar_palette = bar_palette
+    bar_palette = bar_palette,
+    sample_palette = sample_palette,
+    time_palette = time_palette
   )
 }
 
-make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, bar_palette = NULL) {
+make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, input, bar_palette = NULL,
+                                   sample_palette = NULL, time_palette = NULL) {
   validate(need(requireNamespace("gganimate", quietly = TRUE), "Package gganimate is required for GIF export."))
   validate(need(requireNamespace("gifski", quietly = TRUE), "Package gifski is required for GIF export."))
 
@@ -1996,12 +2759,105 @@ make_animated_cfu_plot <- function(dat, sumdat, plot_mode, y_mode, error_type, i
     y_mode = y_mode,
     error_type = error_type,
     input = input,
-    bar_palette = bar_palette
+    bar_palette = bar_palette,
+    sample_palette = sample_palette,
+    time_palette = time_palette
   ) +
     gganimate::transition_manual(frame) +
     labs(caption = "Reveal step {current_frame}")
 
   list(plot = p, steps = total_steps)
+}
+
+# ---------------------------------------------------------------------------
+# Legend key
+# ---------------------------------------------------------------------------
+# The standalone key is the figure's own legend, cut out of the figure. The
+# figure is built with the key switched on (make_cfu_plot(key_on_figure =
+# TRUE)), so the grob below is the very grob "Place key on figure" draws: same
+# glyphs, same colours, same names, same font. Nothing is redrawn by hand.
+# Returns NULL when the figure has no legend to cut out.
+legend_key_grob <- function(p, dpi = 300, pad_pt = 4) {
+  with_measure_device({
+    g <- ggplot2::ggplotGrob(p)
+    boxes <- g$grobs[grepl("^guide-box", g$layout$name)]
+    boxes <- Filter(function(b) inherits(b, "gtable") && "guides" %in% b$layout$name, boxes)
+    if (length(boxes) == 0) return(NULL)
+    box <- boxes[[1]]
+    guides <- box$grobs[[which(box$layout$name == "guides")[1]]]
+    w <- sum(grid::convertWidth(guides$widths, "in", valueOnly = TRUE))
+    h <- sum(grid::convertHeight(guides$heights, "in", valueOnly = TRUE))
+    # The figure's own background, so the key sits on the same white.
+    bg_grob <- g$grobs[[which(g$layout$name == "background")[1]]]
+    bg <- tryCatch(bg_grob$gp$fill, error = function(e) NULL) %||% "white"
+    pad <- pad_pt / 72
+    out <- gtable::gtable(widths = grid::unit(c(pad, w, pad), "in"),
+                          heights = grid::unit(c(pad, h, pad), "in"))
+    out <- gtable::gtable_add_grob(out, grid::rectGrob(gp = grid::gpar(fill = bg, col = NA)),
+                                   t = 1, l = 1, b = 3, r = 3, name = "background")
+    out <- gtable::gtable_add_grob(out, guides, t = 2, l = 2, name = "key")
+    list(grob = out, width = w + 2 * pad, height = h + 2 * pad)
+  }, dpi = dpi)
+}
+
+# Plain colour words for the text starter: nearest entry by CIE Lab distance.
+legend_colour_table <- c(
+  "black" = "#000000", "dark grey" = "#595959", "grey" = "#808080", "light grey" = "#BFBFBF",
+  "white" = "#FFFFFF", "red" = "#E41A1C", "dark red" = "#8B0000", "orange" = "#FF7F00",
+  "yellow" = "#FFD700", "green" = "#4DAF4A", "dark green" = "#006400", "teal" = "#008080",
+  "cyan" = "#00BFFF", "blue" = "#377EB8", "dark blue" = "#00008B", "navy" = "#000080",
+  "purple" = "#984EA3", "magenta" = "#FF00FF", "pink" = "#F781BF", "brown" = "#A65628",
+  "olive" = "#808000", "gold" = "#DAA520", "sky blue" = "#56B4E9", "vermillion" = "#D55E00",
+  "bluish green" = "#009E73", "reddish purple" = "#CC79A7", "yellow-green" = "#9ACD32"
+)
+
+colour_to_lab <- function(cols) {
+  grDevices::convertColor(t(grDevices::col2rgb(cols)) / 255, from = "sRGB", to = "Lab")
+}
+
+# Two different colours that land on the same word get "light"/"dark" so the
+# reader can still tell them apart; identical colours keep the same word.
+colour_words <- function(cols) {
+  if (length(cols) == 0) return(character(0))
+  lab <- colour_to_lab(cols)
+  ref <- colour_to_lab(unname(legend_colour_table))
+  idx <- apply(lab, 1, function(v) which.min(colSums((t(ref) - v)^2)))
+  words <- names(legend_colour_table)[idx]
+  hex <- toupper(grDevices::rgb(t(grDevices::col2rgb(cols)), maxColorValue = 255))
+  out <- words
+  for (w in unique(words[duplicated(words)])) {
+    ii <- which(words == w)
+    if (length(unique(hex[ii])) < 2) next
+    L <- lab[ii, 1]
+    already <- grepl("^(dark|light) ", w)
+    lightest <- ii[which.max(L)]
+    darkest <- ii[which.min(L)]
+    out[lightest] <- paste(if (already) "lighter" else "light", w)
+    out[darkest] <- paste(if (already) "darker" else "dark", w)
+  }
+  out
+}
+
+# "NAME (colour, marker); NAME (...)." -- read off figure_key_mapping(), the
+# same object the figure's fill scale is drawn from.
+legend_text_starter <- function(key_map) {
+  e <- key_map$entries
+  if (is.null(e) || nrow(e) == 0) return("")
+  words <- colour_words(e$fill)
+  glyph <- ifelse(e$glyph == "bar", "bars", "filled circles")
+  glyph <- ifelse(e$glyph == "bar" & e$replicates, "bars, replicates as filled circles", glyph)
+  parts <- paste0(e$name, " (", words, ", ", glyph, ")")
+  out <- paste0(paste(parts, collapse = "; "), ".")
+  outline <- unique(e$outline)
+  bars_outlined <- any(e$glyph == "bar" & e$outline_width > 0)
+  circles_outlined <- any(e$glyph == "point" | e$replicates)
+  what <- c(if (bars_outlined) "bars", if (circles_outlined) "circles")
+  if (length(outline) == 1 && length(what) > 0) {
+    what <- paste(what, collapse = " and ")
+    substr(what, 1, 1) <- toupper(substr(what, 1, 1))
+    out <- paste0(out, " ", what, " are outlined in ", colour_words(outline), ".")
+  }
+  out
 }
 
 ui <- fluidPage(
@@ -2116,6 +2972,12 @@ ui <- fluidPage(
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
+    }
+    .app-version {
+      margin: 10px 0 0;
+      color: #5c7276;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     }
     .badge-pill {
       display: inline-flex;
@@ -2448,6 +3310,13 @@ ui <- fluidPage(
       background: #f6f9f9;
     }
     .bundle-row .form-group { margin-bottom: 0; }
+    .legend-key-box {
+      margin-top: 12px; padding: 10px 12px; border: 1px solid #d5dedf; border-radius: 6px;
+      background: #f6f9f9;
+    }
+    .legend-key-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .legend-key-row .form-group { margin-bottom: 0; }
+    .legend-key-box textarea { width: 100%; font-size: 13px; resize: vertical; background: #fff; }
     .bundle-hint { color: #536b6f; font-size: 12px; flex: 1 1 280px; }
     .size-readout {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -2472,6 +3341,20 @@ ui <- fluidPage(
     }
   ")),
   tags$script(HTML("
+    document.addEventListener('click', async function(event) {
+      const button = event.target.closest('#copy_legend_text');
+      if (!button) return;
+      const box = document.getElementById('legend_text_starter');
+      const status = document.getElementById('copy_legend_text_status');
+      if (!box) return;
+      try {
+        await navigator.clipboard.writeText(box.value);
+        if (status) status.textContent = 'Copied.';
+      } catch (err) {
+        box.select();
+        if (status) status.textContent = 'Press Ctrl/Cmd+C to copy the selected text.';
+      }
+    });
     document.addEventListener('click', async function(event) {
       const button = event.target.closest('#copy_plot');
       if (!button) return;
@@ -2516,7 +3399,9 @@ ui <- fluidPage(
         span(class = "badge-pill", span(class = "badge-dot"), "Replicate aware"),
         span(class = "badge-pill", span(class = "badge-dot red"), "Stats ready"),
         span(class = "badge-pill", span(class = "badge-dot blue"), "Export polished")
-      )
+      ),
+      # A figure exported today has to be traceable to the code that drew it.
+      p(class = "app-version", textOutput("app_version_line", inline = TRUE))
     ),
     div(
       class = "petri-stage",
@@ -2574,11 +3459,41 @@ ui <- fluidPage(
   ),
   sidebarLayout(
     sidebarPanel(
-      fileInput("file", "Upload CFU CSV", accept = ".csv"),
+      fileInput("file", "Upload CFU CSV", accept = c(".csv", ".tsv", ".txt")),
+      # CPS-9: a European export writes 1,5E+08 with ; separators. Auto-detect
+      # covers the common case; the explicit settings cover the rest.
+      selectInput("csv_format", "CSV dialect", choices = c(
+        "Detect automatically" = "auto",
+        "Comma-separated, dot decimal (1.5E+08)" = "comma",
+        "Semicolon-separated, comma decimal (1,5E+08)" = "semicolon",
+        "Tab-separated" = "tab"
+      ), selected = "auto"),
       actionButton("use_demo", "Load dummy example data"),
       downloadButton("download_template", "Download dummy/template CSV"),
       tags$hr(),
       uiOutput("mapping_ui"),
+      tags$hr(),
+      # CPS-3: zero colonies is a measurement, not a gap. Which of the two
+      # defensible treatments applies is the user's call, and it is recorded.
+      selectInput("lod_mode", "Counts at or below zero", choices = c(
+        "Exclude the well (default)" = "exclude",
+        "Substitute at the limit of detection" = "substitute"
+      ), selected = "exclude"),
+      conditionalPanel(
+        "input.lod_mode == 'substitute'",
+        numericInput("lod_value", "Limit of detection (CFU, same units as the CFU column)",
+                     value = LOD_DEFAULT, min = 0),
+        selectInput("lod_rule", "Substitute with", choices = c(
+          "The LOD itself" = "lod",
+          "LOD / 2" = "half"
+        ), selected = "lod")
+      ),
+      helpText(
+        "Excluding sterile wells biases a log-reduction towards the null, because the ",
+        "wells that vanish are the ones where the treatment worked. Substituting at the ",
+        "LOD keeps them as censored observations. Either way, the rule, the count and ",
+        "the affected wells are written into the QC tab, the manifest and the bundle."
+      ),
       tags$hr(),
       selectInput(
         "plot_mode", "Plot mode",
@@ -2604,8 +3519,11 @@ ui <- fluidPage(
         "Welch t-test on log10(CFU)" = "welch",
         "Student t-test on log10(CFU)" = "student",
         "Wilcoxon rank-sum on log10(CFU)" = "wilcoxon",
-        "Linear model + emmeans" = "emmeans"
+        "Linear model + emmeans (app-side correction)" = "emmeans",
+        "Linear model + emmeans, Tukey HSD post-hoc" = "emmeans_tukey",
+        "Linear model + emmeans, Dunnett vs control" = "emmeans_dunnett"
       ), selected = "welch"),
+      helpText("Tukey and Dunnett are classical post-hoc procedures on the model the ANOVA tab reports, and they control the family-wise error themselves -- the correction setting below is then ignored and the table says so. The t-test and rank-test families are independent of that ANOVA; the ANOVA tab spells out which relationship applies."),
       helpText("The rank test drops the normality assumption, but it also has very little power at n=3: with three versus three replicates the smallest two-sided p it can return is 0.1, so nothing can reach 0.05. The Statistics tab flags this per row."),
       selectInput("p_adjust", "Multiple-comparison correction", choices = c("BH", "holm", "bonferroni", "none"), selected = "BH"),
       selectInput("p_adjust_scope", "Correction scope", choices = c(
@@ -2702,10 +3620,9 @@ ui <- fluidPage(
       sliderInput("errorbar_width", "Error bar line width", min = 0.2, max = 2, value = 0.55),
       actionButton("apply_okabe_ito", "Apply Okabe-Ito colorblind palette"),
       helpText("Okabe-Ito is a colorblind-safe qualitative palette (Wong 2011). Applies to sample, time, and single-bar colors."),
-      colourInput("sample_color_1", "Sample color 1", value = "#0072B2"),
-      colourInput("sample_color_2", "Sample color 2", value = "#D55E00"),
-      colourInput("time_color_1", "0 min color", value = "#7AA6C2"),
-      colourInput("time_color_2", "120 min color", value = "#2F5D8C"),
+      helpText("Colours belong to sample and timepoint NAMES, so a strain keeps its colour in every figure and every CSV of the session. A name seen for the first time takes the next unused colour."),
+      uiOutput("sample_colour_ui"),
+      uiOutput("time_colour_ui"),
       colourInput("single_color", "Single-bar color", value = "#7AA6C2"),
       selectInput("bar_color_mode", "Bar colouring", choices = c(
         "By group (sample or timepoint)" = "group",
@@ -2720,6 +3637,15 @@ ui <- fluidPage(
       sliderInput("jitter_width", "Point jitter", min = 0, max = 0.25, value = 0.08),
       numericInput("jitter_seed", "Jitter seed", value = 1, min = 1, max = 99999, step = 1),
       helpText("The seed fixes where the jittered replicate points land, so re-exporting the same figure -- or running the exported R script -- puts every point back in the same place. Change it only to reshuffle overlapping points."),
+      selectInput("font_family", "Font", choices = c(
+        "Default sans" = "sans", "Arial", "Helvetica", "Times New Roman",
+        "Serif" = "serif", "Custom…" = "custom"
+      ), selected = "sans"),
+      conditionalPanel(
+        "input.font_family == 'custom'",
+        textInput("font_family_custom", "Custom font name", "")
+      ),
+      helpText("Every piece of text on the figure, the key and the exports is drawn in this font. A font this machine does not have is drawn in the default sans, and Figure QA says so."),
       sliderInput("font_size", "Base font size", min = 8, max = 18, value = 11),
       sliderInput("title_size", "Title font size", min = 9, max = 24, value = 14),
       sliderInput("subtitle_size", "Subtitle font size", min = 7, max = 16, value = 10),
@@ -2746,6 +3672,21 @@ ui <- fluidPage(
       checkboxInput("ppt_editable", "PowerPoint figure is editable vector art", value = TRUE),
       tags$hr(),
       h4("Reproducibility"),
+      div(
+        class = "paper-style-box",
+        tags$strong("Paper style"),
+        fluidRow(
+          column(6, actionButton("paper_style_save", "Save as paper style")),
+          column(6, actionButton("paper_style_forget", "Forget paper style"))
+        ),
+        div(class = "size-readout", textOutput("paper_style_status", inline = TRUE)),
+        helpText(paste0(
+          "A paper style keeps today's look -- font, sizes, colours by sample and timepoint name, ",
+          "axes, legend, export size -- and applies it every time the app starts, so every figure ",
+          "of the paper matches. It leaves the settings that belong to one figure alone: ",
+          paste(names(figure_specific_setting_ids), collapse = ", "), "."
+        ))
+      ),
       fileInput("preset_file", "Load plot preset JSON", accept = ".json"),
       downloadButton("download_preset", "Save plot preset"),
       downloadButton("download_manifest", "Analysis manifest"),
@@ -2795,6 +3736,23 @@ ui <- fluidPage(
             column(4, downloadButton("download_pdf", "PDF")),
             column(4, downloadButton("download_svg", "SVG"))
           ),
+          # Legend key: the figure's own legend as a standalone image, in the
+          # figure's formats, plus a sentence to paste into the figure legend.
+          div(
+            class = "legend-key-box",
+            div(
+              class = "legend-key-row",
+              tags$strong("Legend key"),
+              downloadButton("download_key_png", "Key PNG"),
+              downloadButton("download_key_pdf", "Key PDF"),
+              downloadButton("download_key_svg", "Key SVG"),
+              checkboxInput("legend_key_on_figure", "Place key on figure", value = FALSE)
+            ),
+            tags$label(`for` = "legend_text_starter", "Legend text starter"),
+            uiOutput("legend_text_ui"),
+            tags$button(id = "copy_legend_text", type = "button", class = "btn btn-default btn-sm", "Copy"),
+            span(id = "copy_legend_text_status", class = "copy-status")
+          ),
           br(),
           fluidRow(
             column(3, downloadButton("download_gif", "Animated GIF")),
@@ -2823,16 +3781,28 @@ ui <- fluidPage(
           DTOutput("raw_qc_table"),
           h4("Replicate groups"),
           DTOutput("replicate_qc_table"),
-          downloadButton("download_qc", "Download QC CSV")
+          downloadButton("download_qc", "Download QC CSV"),
+          # CPS-6: advisory only. Nothing here switches a test.
+          h4("Spread and distribution (advisory)"),
+          div(class = "lab-tip", uiOutput("assumption_note")),
+          DTOutput("assumption_table"),
+          downloadButton("download_assumptions", "Download diagnostics CSV")
         ),
         tabPanel("Statistics", br(), DTOutput("stats_table"), downloadButton("download_stats", "Download current stats CSV")),
-        tabPanel("ANOVA", br(), DTOutput("anova_table"), downloadButton("download_anova", "Download ANOVA CSV"))
+        tabPanel(
+          "ANOVA", br(),
+          # CPS-7: state the relationship rather than letting the layout imply one.
+          div(class = "lab-tip", htmlOutput("omnibus_relationship")),
+          DTOutput("anova_table"), downloadButton("download_anova", "Download ANOVA CSV")
+        )
       )
     )
   )
 )
 
 server <- function(input, output, session) {
+  output$app_version_line <- renderText(app_version_line())
+
   active_source <- reactiveVal("demo")
 
   observeEvent(input$use_demo, {
@@ -2844,13 +3814,16 @@ server <- function(input, output, session) {
   })
 
   raw_data <- reactive({
+    fmt <- input$csv_format %||% "auto"
     if (identical(active_source(), "upload") && !is.null(input$file)) {
-      raw <- read_csv(input$file$datapath, show_col_types = FALSE, trim_ws = TRUE)
+      raw <- read_cfu_csv(input$file$datapath, fmt)
     } else {
       validate(need(file.exists(demo_file), "Upload a CSV or restore the dummy example data file."))
-      raw <- read_csv(demo_file, show_col_types = FALSE, trim_ws = TRUE)
+      raw <- read_cfu_csv(demo_file, fmt)
     }
+    fmt_used <- attr(raw, "csv_format")
     names(raw) <- clean_names(names(raw))
+    attr(raw, "csv_format") <- fmt_used
     raw
   })
 
@@ -2864,11 +3837,18 @@ server <- function(input, output, session) {
 
   column_mapping <- reactive({
     req(input$col_sample, input$col_conc, input$col_time, input$col_rep, input$col_cfu)
+    # Resolve the two sentinels to a real column name or to NA. Everything
+    # downstream sees only "a column, or none".
+    bio <- input$col_bio_rep %||% "__same__"
+    bio <- if (identical(bio, "__none__")) NA_character_
+           else if (identical(bio, "__same__")) input$col_rep
+           else bio
     list(
       sample = input$col_sample,
       concentration = input$col_conc,
       time = input$col_time,
       replicate = input$col_rep,
+      bio_replicate = bio,
       cfu = input$col_cfu
     )
   })
@@ -2985,10 +3965,19 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$apply_okabe_ito, {
-    updateColourInput(session, "sample_color_1", value = okabe_ito[1])
-    updateColourInput(session, "sample_color_2", value = okabe_ito[2])
-    updateColourInput(session, "time_color_1", value = okabe_ito[1])
-    updateColourInput(session, "time_color_2", value = okabe_ito[2])
+    # Okabe-Ito in level order to the samples and timepoints loaded now. Names
+    # not in this CSV keep whatever colour the registry holds for them.
+    lv <- current_levels()
+    reg <- colour_registry()
+    for (kind in c("samples", "times")) {
+      for (i in seq_along(lv[[kind]])) {
+        nm <- lv[[kind]][i]
+        col <- okabe_ito[((i - 1) %% length(okabe_ito)) + 1]
+        reg[[kind]][[nm]] <- col
+        updateColourInput(session, colour_input_id(kind, nm), value = col)
+      }
+    }
+    colour_registry(reg)
     updateColourInput(session, "single_color", value = okabe_ito[1])
     showNotification("Applied Okabe-Ito colorblind-safe palette.", type = "message")
   })
@@ -3082,6 +4071,88 @@ server <- function(input, output, session) {
     set_figure_size(4.5, 4.5, 600)
   })
 
+  # One path for every way settings arrive: an uploaded preset, the paper style
+  # at startup, the paper style just saved. `skip` names settings to leave
+  # alone (a paper style skips figure_specific_setting_ids). Returns the
+  # settings it sent to the inputs, id -> value.
+  apply_preset_settings <- function(settings, session, skip = character(0)) {
+    applied <- list()
+    for (id in setdiff(intersect(names(settings), plot_setting_ids), skip)) {
+      value <- settings[[id]]
+      if (id %in% select_setting_ids) {
+        updateSelectInput(session, id, selected = value)
+      } else if (id %in% radio_setting_ids) {
+        updateRadioButtons(session, id, selected = value)
+      } else if (id %in% checkbox_setting_ids) {
+        updateCheckboxInput(session, id, value = isTRUE(value))
+      } else if (id %in% text_setting_ids) {
+        updateTextInput(session, id, value = as.character(value %||% ""))
+      } else if (id %in% numeric_setting_ids) {
+        updateNumericInput(session, id, value = suppressWarnings(as.numeric(value)))
+      } else if (id %in% colour_setting_ids) {
+        updateColourInput(session, id, value = as.character(value))
+      } else if (id %in% slider_setting_ids) {
+        updateSliderInput(session, id, value = suppressWarnings(as.numeric(value)))
+      }
+      applied[[id]] <- value
+    }
+    if (!is.null(settings$bar_palette) && length(settings$bar_palette) > 0) {
+      pal <- unlist(settings$bar_palette)
+      for (key in names(pal)) {
+        updateColourInput(session, bar_color_input_id(key), value = unname(pal[[key]]))
+      }
+    }
+    # Sample and timepoint colours merge into the registry BY NAME. Names the
+    # current CSV lacks are kept, so a paper-wide palette can name every strain.
+    lv <- isolate(current_levels())
+    reg <- isolate(colour_registry())
+    legacy_note <- character(0)
+    for (kind in c("samples", "times")) {
+      pal <- unlist(settings[[if (identical(kind, "samples")) "sample_palette" else "time_palette"]])
+      if (length(pal) > 0 && !is.null(names(pal))) {
+        for (nm in names(pal)) {
+          reg[[kind]][[nm]] <- as.character(pal[[nm]])
+          if (nm %in% lv[[kind]]) updateColourInput(session, colour_input_id(kind, nm), value = as.character(pal[[nm]]))
+        }
+        applied[[if (identical(kind, "samples")) "sample_palette" else "time_palette"]] <- as.list(pal)
+        next
+      }
+      # Presets from before 0.4.0 numbered their two colours. They go to the
+      # first and second level loaded now, which is what they coloured then.
+      old_ids <- if (identical(kind, "samples")) c("sample_color_1", "sample_color_2")
+                 else c("time_color_1", "time_color_2")
+      old <- lapply(old_ids, function(id) settings[[id]])
+      if (all(vapply(old, is.null, logical(1)))) next
+      targets <- character(0)
+      for (k in seq_along(old)) {
+        if (is.null(old[[k]]) || length(lv[[kind]]) < k) next
+        nm <- lv[[kind]][k]
+        reg[[kind]][[nm]] <- as.character(old[[k]])[1]
+        updateColourInput(session, colour_input_id(kind, nm), value = as.character(old[[k]])[1])
+        targets <- c(targets, nm)
+      }
+      legacy_note <- c(legacy_note, paste0(
+        if (identical(kind, "samples")) "sample" else "timepoint", " colours went to ",
+        if (length(targets) > 0) paste(targets, collapse = " and ") else "nothing (no data loaded)"
+      ))
+    }
+    colour_registry(reg)
+    # The width and height arrive in the preset's units. Tell the unit
+    # converter those units are already in force, or switching the selector
+    # would "convert" the preset's numbers a second time.
+    if (!is.null(applied$size_units)) size_units_previous(as.character(applied$size_units))
+    if (length(legacy_note) > 0) {
+      tryCatch(showNotification(paste0(
+        "This preset is from before 0.4.0 and numbers its colours; they were given to the first ",
+        "and second names loaded now: ", paste(legacy_note, collapse = "; "), "."
+      ), type = "warning", duration = 10, session = session), error = function(e) NULL)
+    }
+    invisible(applied)
+  }
+
+  # What the last preset or paper style actually set, for the record and tests.
+  last_applied_settings <- reactiveVal(NULL)
+
   observeEvent(input$preset_file, {
     req(input$preset_file)
     validate(need(requireNamespace("jsonlite", quietly = TRUE), "Package jsonlite is required to load plot presets."))
@@ -3094,29 +4165,93 @@ server <- function(input, output, session) {
     )
     if (is.null(preset)) return()
     settings <- preset$settings %||% preset
-    for (id in intersect(names(settings), plot_setting_ids)) {
-      value <- settings[[id]]
-      if (id %in% select_setting_ids) {
-        updateSelectInput(session, id, selected = value)
-      } else if (id %in% radio_setting_ids) {
-        updateRadioButtons(session, id, selected = value)
-      } else if (id %in% checkbox_setting_ids) {
-        updateCheckboxInput(session, id, value = isTRUE(value))
-      } else if (id %in% text_setting_ids) {
-        updateTextInput(session, id, value = as.character(value %||% ""))
-      } else if (id %in% numeric_setting_ids) {
-        updateNumericInput(session, id, value = suppressWarnings(as.numeric(value)))
-      } else if (id %in% slider_setting_ids) {
-        updateSliderInput(session, id, value = suppressWarnings(as.numeric(value)))
-      }
-    }
-    if (!is.null(settings$bar_palette) && length(settings$bar_palette) > 0) {
-      pal <- unlist(settings$bar_palette)
-      for (key in names(pal)) {
-        updateColourInput(session, bar_color_input_id(key), value = unname(pal[[key]]))
-      }
-    }
+    last_applied_settings(apply_preset_settings(settings, session))
     showNotification("Plot preset loaded.", type = "message")
+  })
+
+  # --- Paper style -----------------------------------------------------------
+  # Today's settings saved beside the app and applied at every start, so every
+  # figure of one paper comes out in the same style from any CSV.
+  no_paper_style_text <- "No paper style saved. Save as paper style keeps today's settings for every figure of the paper."
+  paper_style_status <- reactiveVal(
+    if (file.exists(paper_style_path())) paste0("Paper style: ", paper_style_path()) else no_paper_style_text
+  )
+  output$paper_style_status <- renderText(paper_style_status())
+
+  load_paper_style <- function() {
+    path <- paper_style_path()
+    if (!file.exists(path)) {
+      paper_style_status(no_paper_style_text)
+      return(invisible(NULL))
+    }
+    if (!requireNamespace("jsonlite", quietly = TRUE)) {
+      paper_style_status(paste0("Paper style at ", path, " needs the jsonlite package to load."))
+      return(invisible(NULL))
+    }
+    style <- tryCatch(jsonlite::read_json(path, simplifyVector = TRUE), error = function(e) NULL)
+    if (is.null(style)) {
+      paper_style_status(paste0("Paper style at ", path, " could not be read; nothing was applied."))
+      return(invisible(NULL))
+    }
+    settings <- style$settings %||% style
+    applied <- apply_preset_settings(settings, session, skip = unname(figure_specific_setting_ids))
+    last_applied_settings(applied)
+    paper_style_status(paste0("Paper style: ", path, ", saved ", style$created_at %||% "at an unknown time"))
+    invisible(applied)
+  }
+
+  # After the first flush, so the inputs the style updates exist in the page.
+  session$onFlushed(function() isolate(load_paper_style()), once = TRUE)
+
+  observeEvent(input$paper_style_save, {
+    if (!requireNamespace("jsonlite", quietly = TRUE)) {
+      showNotification("Package jsonlite is required to save a paper style.", type = "error")
+      return()
+    }
+    path <- paper_style_path()
+    reg <- colour_registry()
+    payload <- plot_settings_payload(input, reg$samples, reg$times)
+    payload <- c(payload[1], list(kind = "paper_style"), payload[-1])
+    written <- tryCatch({
+      dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+      writeLines(jsonlite::toJSON(payload, pretty = TRUE, auto_unbox = TRUE, null = "null"), path)
+      TRUE
+    }, error = function(e) conditionMessage(e))
+    if (!isTRUE(written)) {
+      showNotification(paste0("The paper style could not be written to ", path, ": ", written), type = "error")
+      return()
+    }
+    load_paper_style()
+    showNotification(paste0("Paper style saved to ", path, ". It is applied every time the app starts."),
+                     type = "message", duration = 8)
+  })
+
+  observeEvent(input$paper_style_forget, {
+    path <- paper_style_path()
+    if (!file.exists(path)) {
+      paper_style_status(no_paper_style_text)
+      showNotification("No paper style is saved.", type = "message")
+      return()
+    }
+    showModal(modalDialog(
+      title = "Forget the paper style?",
+      paste0("This deletes ", path, ". The figure in front of you keeps its settings; ",
+             "the next session starts from the app defaults."),
+      footer = tagList(modalButton("Keep it"), actionButton("paper_style_forget_confirm", "Forget paper style")),
+      easyClose = TRUE
+    ))
+  })
+
+  observeEvent(input$paper_style_forget_confirm, {
+    path <- paper_style_path()
+    gone <- !file.exists(path) || isTRUE(file.remove(path))
+    removeModal()
+    if (gone) {
+      paper_style_status(no_paper_style_text)
+      showNotification(paste0("Paper style forgotten; ", path, " deleted."), type = "message")
+    } else {
+      showNotification(paste0("Could not delete ", path, "."), type = "error")
+    }
   })
 
   output$mapping_ui <- renderUI({
@@ -3126,6 +4261,25 @@ server <- function(input, output, session) {
       selectInput("col_conc", "Treatment/dose/condition column", choices = cols, selected = guess_column(cols, c("treatment", "condition", "dose", "concentration", "inducer", "induction", "iptg", "arabinose", "atc"))),
       selectInput("col_time", "Time column", choices = cols, selected = guess_column(cols, c("time", "timepoint", "minutes", "hours"))),
       selectInput("col_rep", "Replicate column", choices = cols, selected = guess_column(cols, c("replicate", "rep", "biorep", "trial"))),
+      # The unit of replication is a claim about how the experiment was run, and
+      # the CSV cannot settle it: four rows sharing a replicate label are four
+      # plates of one culture in some files and four cultures in others. The app
+      # refuses to guess, because guessing wrong multiplies n by the number of
+      # plates and moves every p-value with it.
+      selectInput(
+        "col_bio_rep", "Biological replicate column",
+        choices = c(
+          "Same as the replicate column above" = "__same__",
+          "None in this file - technical replicates only" = "__none__",
+          setNames(as.list(cols), cols)
+        ),
+        selected = "__same__"
+      ),
+      helpText(
+        "Which column identifies INDEPENDENT cultures. Rows that share a value here are ",
+        "technical repeats of one biological replicate and are averaged on the log10 scale ",
+        "before any test, so n counts cultures, not plates."
+      ),
       selectInput("col_cfu", "CFU column", choices = cols, selected = guess_column(cols, c("cfu", "cfuperml", "cfuml", "count", "colonies", "titer", "titre")))
     )
   })
@@ -3138,11 +4292,11 @@ server <- function(input, output, session) {
   output$canvas_hint <- renderText({
     switch(
       input$canvas_mode %||% "off",
-      legend = if (identical(input$bar_color_mode %||% "group", "manual")) {
+      legend = if (identical(input$bar_color_mode %||% "group", "manual") && !isTRUE(input$legend_key_on_figure)) {
         # Per-bar colouring hides the fill legend, so there is nothing to place
         # and a click would look like it did nothing.
         "This figure has no legend to place: per-bar colouring hides it. Switch Bar colouring back to 'By group' first."
-      } else if (identical(input$legend_position %||% "top", "none")) {
+      } else if (identical(input$legend_position %||% "top", "none") && !isTRUE(input$legend_key_on_figure)) {
         "The legend is set to 'none'. Choose another legend position first."
       } else {
         "Click anywhere on the figure to put the legend there."
@@ -3230,6 +4384,85 @@ server <- function(input, output, session) {
     showNotification("Legend and statistic labels returned to their automatic positions.", type = "message")
   })
 
+  # --- Colour registry -------------------------------------------------------
+  # Sample and timepoint colours, keyed by NAME. It outlives the CSV: loading
+  # another file keeps every name it has seen and gives new names the next
+  # unused default, so a strain is the same colour in every figure.
+  colour_registry <- reactiveVal(list(
+    samples = setNames(character(0), character(0)),
+    times = setNames(character(0), character(0))
+  ))
+
+  # The sample and timepoint names in the loaded data, in level order; empty
+  # before the columns are mapped.
+  current_levels <- reactive({
+    d <- tryCatch(cfu_data(), error = function(e) NULL)
+    if (is.null(d)) return(list(samples = character(0), times = character(0)))
+    list(samples = levels(droplevels(as.factor(d$sample))),
+         times = levels(droplevels(as.factor(d$time_min))))
+  })
+
+  observeEvent(current_levels(), {
+    lv <- current_levels()
+    reg <- colour_registry()
+    new <- list(samples = extend_colour_registry(reg$samples, lv$samples, "samples"),
+                times = extend_colour_registry(reg$times, lv$times, "times"))
+    if (!identical(new, reg)) colour_registry(new)
+  })
+
+  # Picker -> registry. A picker writes only when its value CHANGES: a picker
+  # for a name that left the data keeps its last value in `input`, and that
+  # stale value must not overwrite a colour a preset set since.
+  picker_seen <- new.env(parent = emptyenv())
+  observe({
+    lv <- current_levels()
+    reg <- isolate(colour_registry())
+    changed <- FALSE
+    for (kind in c("samples", "times")) {
+      for (nm in lv[[kind]]) {
+        id <- colour_input_id(kind, nm)
+        val <- input[[id]]
+        if (is.null(val) || length(val) != 1 || !nzchar(val)) next
+        if (identical(val, picker_seen[[id]])) next
+        assign(id, val, envir = picker_seen)
+        if (!identical(unname(reg[[kind]][nm]), val)) {
+          reg[[kind]][[nm]] <- val
+          changed <- TRUE
+        }
+      }
+    }
+    if (changed) colour_registry(reg)
+  })
+
+  colour_picker_ui <- function(kind) {
+    lv <- current_levels()[[kind]]
+    what <- if (identical(kind, "samples")) "sample" else "timepoint"
+    if (length(lv) == 0) {
+      return(helpText(paste0("Load data to get one colour picker per ", what, ".")))
+    }
+    cols <- registry_colours(isolate(colour_registry())[[kind]], lv, kind)
+    tagList(
+      tags$label(class = "control-label", if (identical(kind, "samples")) "Sample colours" else "Timepoint colours"),
+      lapply(lv, function(nm) colourInput(colour_input_id(kind, nm), nm, value = unname(cols[[nm]])))
+    )
+  }
+  output$sample_colour_ui <- renderUI(colour_picker_ui("samples"))
+  output$time_colour_ui <- renderUI(colour_picker_ui("times"))
+
+  # --- Font ------------------------------------------------------------------
+  font_resolved <- reactive(resolve_font_family(font_family_request(input$font_family, input$font_family_custom)))
+  # Debounced so typing a custom name does not raise a notice per keystroke.
+  font_request_settled <- debounce(reactive(font_family_request(input$font_family, input$font_family_custom)), 1000)
+  observeEvent(font_request_settled(), {
+    f <- resolve_font_family(font_request_settled())
+    if (!isTRUE(f$available)) {
+      tryCatch(showNotification(
+        paste0(f$requested, " is not installed on this machine; drawn with the default sans."),
+        type = "warning", duration = 8
+      ), error = function(e) NULL)
+    }
+  })
+
   # --- Per-bar colours -------------------------------------------------------
   # One picker per drawn bar. The keys come from the filtered data, so they
   # follow the plot mode and any sample/timepoint filtering.
@@ -3249,13 +4482,9 @@ server <- function(input, output, session) {
     # pickers must seed from the sample colours too -- otherwise every bar
     # starts the same colour and the user has to set all of them by hand.
     if (input$plot_mode %in% c("combined", "survival") && grp %in% lv_sample) {
-      c(input$sample_color_1 %||% okabe_ito[1], input$sample_color_2 %||% okabe_ito[2])[
-        match(grp, lv_sample)
-      ] %||% okabe_ito[((idx - 1) %% length(okabe_ito)) + 1]
+      unname(registry_colours(colour_registry()$samples, lv_sample, "samples")[grp])
     } else if (identical(input$plot_mode, "sample_both") && grp %in% lv_time) {
-      c(input$time_color_1 %||% okabe_ito[6], input$time_color_2 %||% okabe_ito[1])[
-        match(grp, lv_time)
-      ] %||% okabe_ito[((idx - 1) %% length(okabe_ito)) + 1]
+      unname(registry_colours(colour_registry()$times, lv_time, "times")[grp])
     } else {
       input$single_color %||% okabe_ito[1]
     }
@@ -3337,7 +4566,39 @@ server <- function(input, output, session) {
       treatment_unit = input$treatment_unit %||% "",
       time_unit = input$time_unit %||% "min",
       append_treatment_unit = isTRUE(input$append_treatment_unit),
-      append_time_unit = isTRUE(input$append_time_unit)
+      append_time_unit = isTRUE(input$append_time_unit),
+      lod_mode = input$lod_mode %||% "exclude",
+      lod_value = input$lod_value %||% LOD_DEFAULT,
+      lod_rule = input$lod_rule %||% "lod"
+    )
+  })
+
+  # CPS-3: every well the LOD rule touched, named. The on-screen banner does not
+  # survive into a bundle, so this is what the manifest and the QC tab report.
+  lod_report <- reactive({
+    raw <- raw_data()
+    mapping <- column_mapping()
+    vals <- suppressWarnings(as.numeric(raw[[mapping$cfu]]))
+    idx <- which(!is.na(vals) & vals <= 0)
+    mode <- input$lod_mode %||% "exclude"
+    sub_value <- lod_substituted_value(input$lod_value %||% LOD_DEFAULT, input$lod_rule %||% "lod")
+    list(
+      mode = mode,
+      rule = lod_rule_label(mode, input$lod_value %||% LOD_DEFAULT, input$lod_rule %||% "lod"),
+      lod_value = as.numeric(input$lod_value %||% LOD_DEFAULT),
+      substituted_value = if (identical(mode, "substitute")) sub_value else NA_real_,
+      n_affected = length(idx),
+      n_substituted = if (identical(mode, "substitute") && !is.na(sub_value)) length(idx) else 0L,
+      n_excluded = if (identical(mode, "substitute") && !is.na(sub_value)) 0L else length(idx),
+      wells = if (length(idx) == 0) tibble() else tibble(
+        sample = as.character(raw[[mapping$sample]])[idx],
+        treatment = as.character(raw[[mapping$concentration]])[idx],
+        time = as.character(raw[[mapping$time]])[idx],
+        replicate = as.character(raw[[mapping$replicate]])[idx],
+        reported_cfu = vals[idx],
+        disposition = if (identical(mode, "substitute") && !is.na(sub_value))
+          paste0("substituted at ", format(sub_value, scientific = FALSE)) else "excluded"
+      )
     )
   })
 
@@ -3367,6 +4628,27 @@ server <- function(input, output, session) {
       div(class = "lab-tip warn", "Some visible groups have fewer than 2 replicates, so SD/error bars and tests may be limited.")
     } else {
       div(class = "lab-tip ok", "Visible groups have replicate data for SD/error bars and replicate-level statistics.")
+    }
+    # CPS-1. The single most consequential thing the app cannot infer from the
+    # file: whether the repeated measurements are independent. Say it loudly,
+    # because everything downstream -- n, df, every p-value -- depends on it.
+    rep_tip <- if (!has_biological_replicates(dat)) {
+      div(
+        class = "lab-tip warn",
+        tags$strong("Technical replicates only. "),
+        "No biological replicate column is identified, so every row is treated as a ",
+        "separate measurement of the same thing. Tests, n and error bars are labelled ",
+        "\"technical replicates only\" and must not be reported as replicate-level ",
+        "statistics. Set the biological replicate column in the Data tab to fix this."
+      )
+    } else {
+      collapsed <- nrow(dat) - nrow(aggregate_biological_replicates(dat))
+      if (collapsed > 0) {
+        div(class = "lab-tip ok", sprintf(
+          "%d technical measurement(s) are averaged on the log10 scale into their biological replicate before any test, so n counts cultures rather than plates.",
+          collapsed
+        ))
+      } else NULL
     }
     # Rows the pipeline discards never reach the figure, the summary, or the
     # tests. Dropping them quietly makes n look larger than it is.
@@ -3448,6 +4730,7 @@ server <- function(input, output, session) {
           span(class = "metric-note", "Range per visible group")
         )
       ),
+      rep_tip,
       tip,
       drop_tip,
       pair_tip,
@@ -3529,13 +4812,18 @@ server <- function(input, output, session) {
   survival_pairs <- reactive({
     if (!identical(input$plot_mode, "survival")) return(NULL)
     req(input$surv_baseline, input$surv_readout)
-    pair_survival(filtered_data(), input$surv_baseline, input$surv_readout)
+    # Pair at the biological unit. pair_survival() collapses technical repeats
+    # within a replicate label already; aggregating first is what makes that
+    # label the BIOLOGICAL replicate when the user mapped a separate column.
+    pair_survival(aggregate_biological_replicates(filtered_data()),
+                  input$surv_baseline, input$surv_readout)
   })
 
   survival_qc <- reactive({
     if (!identical(input$plot_mode, "survival")) return(NULL)
     req(input$surv_baseline, input$surv_readout)
-    survival_pairing_qc(filtered_data(), input$surv_baseline, input$surv_readout)
+    survival_pairing_qc(aggregate_biological_replicates(filtered_data()),
+                        input$surv_baseline, input$surv_readout)
   })
 
   plot_data <- reactive({
@@ -3577,8 +4865,10 @@ server <- function(input, output, session) {
     if (identical(cmp, "survival_vs_zero")) {
       return(tibble(message = "The survival comparison needs the Paired survival plot mode."))
     }
-    if (identical(input$stats_method, "emmeans")) {
-      run_contrast(filtered_data(), cmp, input$p_adjust, input$control_concentration)
+    if (is_emmeans_method(input$stats_method)) {
+      run_contrast(filtered_data(), cmp, input$p_adjust, input$control_concentration,
+                   adjustment_scope = input$p_adjust_scope,
+                   emm_adjust = emmeans_adjust())
     } else {
       run_groupwise_t_tests(
         dat = filtered_data(),
@@ -3591,8 +4881,10 @@ server <- function(input, output, session) {
     }
   })
 
+  emmeans_adjust <- reactive(emmeans_adjust_for(input$stats_method))
+
   current_anova <- reactive({
-    run_anova(plot_data())
+    run_anova(plot_data(), input$stats_method)
   })
 
   current_annotation <- reactive({
@@ -3622,8 +4914,27 @@ server <- function(input, output, session) {
         details = if (isTRUE(pass)) details_ok else details_warn
       )
     }
+    lod <- lod_report()
     bind_rows(
       qa,
+      # CPS-1: the check a reader most needs, first.
+      add_check(
+        "Unit of replication",
+        has_biological_replicates(filtered_data()),
+        paste0("n counts biological replicates (",
+               replication_unit_label(filtered_data()), ")."),
+        "No biological replicate column was identified, so n counts measurements, not replicates. Results are labelled technical replicates only."
+      ),
+      # CPS-3: an exclusion that never reaches the bundle is not a record.
+      add_check(
+        "Non-positive counts",
+        lod$n_affected == 0 || lod$n_substituted > 0,
+        if (lod$n_affected == 0) "No well reported a count at or below zero."
+        else paste0(lod$n_affected, " well(s) reported a count at or below zero; ", lod$rule, "."),
+        paste0(lod$n_affected, " well(s) reported a count at or below zero and were EXCLUDED. ",
+               "Excluding them biases a log-reduction towards the null; consider LOD substitution. ",
+               "The affected wells are listed in the manifest and in lod_wells.csv.")
+      ),
       add_check(
         "Replicate groups",
         nrow(rep_counts) > 0 && min(rep_counts$n_reps, na.rm = TRUE) >= 2,
@@ -3661,6 +4972,16 @@ server <- function(input, output, session) {
         paste0("Export size is ", format_figure_size(export_width(), export_height(), export_dpi()),
                "; below roughly 50 x 40 mm most journals will not hold the text legible.")
       ),
+      {
+        f <- font_resolved()
+        add_check(
+          "Font",
+          f$available,
+          paste0("Requested ", f$requested, "; drawn in ", f$family, "."),
+          paste0("Requested ", f$requested, "; drawn in ", f$family, ", because ", f$requested,
+                 " is not installed on this machine. Install it, or pick another font, before export.")
+        )
+      },
       add_check(
         "Base font size",
         !is.na(input$font_size) && input$font_size >= 9,
@@ -3746,7 +5067,9 @@ server <- function(input, output, session) {
       y_mode = input$y_mode,
       error_type = input$error_type,
       input = input,
-      bar_palette = bar_palette()
+      bar_palette = bar_palette(),
+      sample_palette = colour_registry()$samples,
+      time_palette = colour_registry()$times
     )
   })
 
@@ -3774,6 +5097,57 @@ server <- function(input, output, session) {
     res = PREVIEW_PPI
   )
 
+  # --- Legend key ------------------------------------------------------------
+  # The colour mapping the figure is drawn from, from the same function and the
+  # same inputs current_plot() passes to make_cfu_plot().
+  key_mapping <- reactive({
+    validate(need(nrow(filtered_data()) > 0, "No rows remain after filtering."))
+    figure_key_mapping(plot_data(), current_summary(), input$plot_mode, input, bar_palette(),
+                       sample_palette = colour_registry()$samples, time_palette = colour_registry()$times)
+  })
+
+  # The figure with its key switched on. When the key is already on the figure
+  # this IS current_plot(), so the standalone key is cut from the very figure
+  # being exported.
+  key_plot <- reactive({
+    if (isTRUE(input$legend_key_on_figure)) return(current_plot())
+    validate(need(nrow(filtered_data()) > 0, "No rows remain after filtering."))
+    make_cfu_plot(
+      dat = plot_data(), sumdat = current_summary(), ann = current_annotation(),
+      plot_mode = input$plot_mode, y_mode = input$y_mode, error_type = input$error_type,
+      input = input, bar_palette = bar_palette(), key_on_figure = TRUE,
+      sample_palette = colour_registry()$samples, time_palette = colour_registry()$times
+    )
+  })
+
+  legend_key <- reactive({
+    k <- legend_key_grob(key_plot(), dpi = export_dpi())
+    validate(need(!is.null(k), "This figure has no groups to put in a key."))
+    k
+  })
+
+  legend_text <- reactive(legend_text_starter(key_mapping()))
+
+  output$legend_text_ui <- renderUI({
+    txt <- tryCatch(legend_text(), error = function(e) "")
+    tags$textarea(id = "legend_text_starter", class = "form-control", rows = 3,
+                  readonly = NA, txt)
+  })
+
+  # Same post-condition as the figure: a key that could not be written raises
+  # rather than handing the browser an empty file.
+  save_key_file <- function(file, kind, notify = TRUE) {
+    k <- legend_key()
+    res <- ggsave_checked(filename = file, plot = k$grob, kind = kind,
+                          width = k$width, height = k$height, units = "in", dpi = export_dpi())
+    if (!isTRUE(res$ok)) stop(res$message, call. = FALSE)
+    if (isTRUE(res$fallback) && isTRUE(notify)) {
+      tryCatch(showNotification(res$message, type = "warning", duration = 10),
+               error = function(e) NULL)
+    }
+    invisible(res)
+  }
+
   output$cleaned_table <- renderDT({
     datatable(cfu_data(), options = list(pageLength = 12, scrollX = TRUE))
   })
@@ -3796,6 +5170,49 @@ server <- function(input, output, session) {
     datatable(current_stats(), options = list(pageLength = 15, scrollX = TRUE))
   })
 
+  current_assumptions <- reactive(assumption_diagnostics(plot_data()))
+
+  output$assumption_table <- renderDT({
+    datatable(current_assumptions(), options = list(pageLength = 12, scrollX = TRUE), rownames = FALSE)
+  })
+
+  output$assumption_note <- renderUI({
+    diag <- current_assumptions()
+    vr <- max_variance_ratio(diag)
+    base <- paste(
+      "Per-cell spread on log10(CFU), computed on the same aggregated units the tests use.",
+      "These are advisory: nothing here switches a test, and Shapiro-Wilk has almost no",
+      "power at n = 3, so a passing p is not evidence of normality."
+    )
+    if (identical(input$stats_method, "student") && is.finite(vr) && vr > 4) {
+      tagList(tags$strong("Student t-test with unequal spread. "),
+              sprintf(paste("The widest cell has %.1fx the variance of the narrowest.",
+                            "Student pools them; Welch, the default, does not."), vr),
+              tags$br(), base)
+    } else if (is_emmeans_method(input$stats_method) && is.finite(vr) && vr > 4) {
+      tagList(tags$strong("Pooled-variance model with unequal spread. "),
+              sprintf(paste("The widest cell has %.1fx the variance of the narrowest, and",
+                            "the linear model pools one residual variance across every cell."), vr),
+              tags$br(), base)
+    } else {
+      base
+    }
+  })
+
+  output$download_assumptions <- downloadHandler(
+    filename = function() "assumption_diagnostics.csv",
+    content = function(file) write_csv(current_assumptions(), file)
+  )
+
+  output$omnibus_relationship <- renderUI({
+    tagList(
+      tags$strong("How this table relates to the Statistics tab: "),
+      pairwise_family_note(input$stats_method),
+      tags$br(),
+      sprintf("Unit of replication: %s.", replication_unit_label(plot_data()))
+    )
+  })
+
   output$anova_table <- renderDT({
     datatable(current_anova(), options = list(pageLength = 12, scrollX = TRUE))
   })
@@ -3804,16 +5221,26 @@ server <- function(input, output, session) {
     datatable(figure_qa(), options = list(dom = "t", pageLength = 20, scrollX = TRUE), rownames = FALSE)
   })
 
-  save_plot_file <- function(file, device) {
-    ggsave(
+  # `kind` is the FORMAT, not the device: which device can actually write that
+  # format is decided per machine by ggsave_checked(). A format that cannot be
+  # written raises, so a download handler fails loudly and the bundle records
+  # the item as missing rather than adding an empty file.
+  save_plot_file <- function(file, kind, notify = TRUE) {
+    res <- ggsave_checked(
       filename = file,
       plot = current_grob(),
+      kind = kind,
       width = export_width(),
       height = export_height(),
       units = "in",
-      dpi = export_dpi(),
-      device = device
+      dpi = export_dpi()
     )
+    if (!isTRUE(res$ok)) stop(res$message, call. = FALSE)
+    if (isTRUE(res$fallback) && isTRUE(notify)) {
+      tryCatch(showNotification(res$message, type = "warning", duration = 10),
+               error = function(e) NULL)
+    }
+    invisible(res)
   }
 
   add_plot_slide <- function(doc, plot_obj) {
@@ -3866,7 +5293,9 @@ server <- function(input, output, session) {
         error_type = input$error_type,
         input = input,
         step = step,
-        bar_palette = bar_palette()
+        bar_palette = bar_palette(),
+        sample_palette = colour_registry()$samples,
+        time_palette = colour_registry()$times
       ) +
         labs(caption = paste0("Reveal step ", step, " of ", total_steps))
       doc <- add_plot_slide(doc, step_plot)
@@ -3887,12 +5316,52 @@ server <- function(input, output, session) {
   manifest_payload <- reactive({
     list(
       app = "CFU Plot Studio",
+      app_version = APP_VERSION,
+      app_git_sha = app_git_sha(),
       generated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
       data_source = data_source_label(),
+      csv_format = attr(raw_data(), "csv_format") %||% "comma",
       column_mapping = column_mapping(),
+      max_variance_ratio = max_variance_ratio(current_assumptions()),
       plot_mode = input$plot_mode,
       active_comparison = active_comparison(),
-      settings = c(collect_plot_settings(input), list(bar_palette = as.list(bar_palette() %||% NULL))),
+      # CPS-1/CPS-2: a bundle has to say what n counted and what scale the
+      # figure summarised on, or the numbers in it cannot be interpreted.
+      replication = list(
+        unit = replication_unit_label(filtered_data()),
+        biological_replicate_column = column_mapping()$bio_replicate %||% NA_character_,
+        rows_before_aggregation = nrow(filtered_data()),
+        units_after_aggregation = nrow(aggregate_biological_replicates(filtered_data()))
+      ),
+      limit_of_detection = {
+        lod <- lod_report()
+        list(
+          mode = lod$mode,
+          rule = lod$rule,
+          lod_value = lod$lod_value,
+          substituted_value = lod$substituted_value,
+          wells_at_or_below_zero = lod$n_affected,
+          wells_substituted = lod$n_substituted,
+          wells_excluded = lod$n_excluded,
+          affected_wells = lod$wells
+        )
+      },
+      summary_scale = list(
+        y_mode = input$y_mode,
+        centre_statistic = unique(as.character(current_summary()$centre_statistic %||% NA)),
+        scale = unique(as.character(current_summary()$summary_scale %||% NA)),
+        statistics_scale = if (is_survival_frame(plot_data())) "log10 survival ratio" else "log10(CFU)"
+      ),
+      settings = c(collect_plot_settings(input), list(
+        bar_palette = as.list(bar_palette() %||% NULL),
+        sample_palette = as.list(colour_registry()$samples),
+        time_palette = as.list(colour_registry()$times)
+      )),
+      font = list(
+        requested = font_resolved()$requested,
+        used = font_resolved()$family,
+        available = font_resolved()$available
+      ),
       visible_data = list(
         rows = nrow(plot_data()),
         readout = if (is_survival_frame(plot_data())) "paired survival ratio" else "absolute CFU",
@@ -3919,6 +5388,10 @@ server <- function(input, output, session) {
     # The per-bar palette lives in dynamic inputs, so collect_plot_settings
     # cannot see it. Bake it in or the exported script loses the colours.
     settings$bar_palette <- as.list(bar_palette() %||% NULL)
+    # Sample and timepoint colours live in the registry, keyed by name; the
+    # script reads them from settings exactly as the app reads the registry.
+    settings$sample_palette <- as.list(colour_registry()$samples)
+    settings$time_palette <- as.list(colour_registry()$times)
     dat_csv <- csv_literal(plot_data())
     sum_csv <- csv_literal(current_summary())
     ann_csv <- csv_literal(current_annotation())
@@ -3928,6 +5401,7 @@ server <- function(input, output, session) {
 
     paste(c(
       "# Reproducible CFU Plot Studio figure export",
+      paste0("# App:       ", app_version_line()),
       paste0("# Generated: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
       "# This script rebuilds the visible figure from embedded filtered data, summary data, annotations, and plot settings.",
       "",
@@ -3935,7 +5409,9 @@ server <- function(input, output, session) {
       "",
       paste0("dat <- read.csv(text = ", dat_csv, ", check.names = FALSE)"),
       paste0("sumdat <- read.csv(text = ", sum_csv, ", check.names = FALSE)"),
-      paste0("ann <- read.csv(text = ", ann_csv, ", check.names = FALSE)"),
+      # A figure without statistic labels has an empty annotation table, which
+      # read.csv() refuses outright; that must not stop the figure rebuilding.
+      paste0("ann <- tryCatch(read.csv(text = ", ann_csv, ", check.names = FALSE), error = function(e) data.frame())"),
       "",
       "for (nm in intersect(c('sample', 'concentration_label', 'time_min'), names(dat))) dat[[nm]] <- factor(dat[[nm]], levels = unique(dat[[nm]]))",
       "for (nm in intersect(c('sample', 'concentration_label', 'time_min'), names(sumdat))) sumdat[[nm]] <- factor(sumdat[[nm]], levels = unique(sumdat[[nm]]))",
@@ -3954,7 +5430,12 @@ server <- function(input, output, session) {
       exported_function_source("size_to_inches"),
       exported_function_source("scale_breaks_or_default"),
       exported_function_source("axis_step_breaks"),
-      exported_function_source("named_palette"),
+      exported_function_source("okabe_ito"),
+      exported_function_source("colour_registry_defaults"),
+      exported_function_source("extend_colour_registry"),
+      exported_function_source("registry_colours"),
+      exported_function_source("font_family_request"),
+      exported_function_source("resolve_font_family"),
       exported_function_source("fix_panel_size"),
       exported_function_source("with_measure_device"),
       exported_function_source("gtable_size_in"),
@@ -3965,9 +5446,17 @@ server <- function(input, output, session) {
       exported_function_source("apply_annotation_offsets"),
       exported_function_source("bar_key_columns"),
       exported_function_source("bar_keys"),
+      exported_function_source("figure_key_mapping"),
       exported_function_source("error_type_caption"),
+      exported_function_source("is_emmeans_method"),
+      exported_function_source("emmeans_adjust_for"),
       exported_function_source("stats_caption"),
       exported_function_source("make_cfu_plot"),
+      exported_function_source("legend_key_grob"),
+      exported_function_source("legend_colour_table"),
+      exported_function_source("colour_to_lab"),
+      exported_function_source("colour_words"),
+      exported_function_source("legend_text_starter"),
       "",
       "if (!'y' %in% names(ann)) ann$y <- numeric(0)",
       "p <- make_cfu_plot(",
@@ -3991,12 +5480,27 @@ server <- function(input, output, session) {
       "  obj <- p",
       "}",
       "",
-      "grid::grid.newpage(); grid::grid.draw(if (inherits(obj, 'gtable')) obj else ggplotGrob(obj))",
+      "# On screen only when there is a screen: Rscript's default device is pdf(),",
+      "# which cannot draw a system font such as Times New Roman.",
+      "if (interactive()) { grid::grid.newpage(); grid::grid.draw(if (inherits(obj, 'gtable')) obj else ggplotGrob(obj)) }",
       "ggsave(",
       "  'cfu_plot_recreated.png', obj,",
       "  width = w_in, height = h_in,",
       "  units = 'in', dpi = settings$download_dpi %||% 600",
-      ")"
+      ")",
+      "",
+      "# Legend key: the figure's own legend, cut out of the figure built with the",
+      "# key switched on, and the legend text starter from the same colour mapping.",
+      "key <- legend_key_grob(",
+      "  make_cfu_plot(dat = dat, sumdat = sumdat, ann = ann, plot_mode = plot_mode, y_mode = y_mode,",
+      "                error_type = settings$error_type %||% 'SD', input = settings, key_on_figure = TRUE),",
+      "  dpi = settings$download_dpi %||% 600",
+      ")",
+      "if (!is.null(key)) {",
+      "  ggsave('legend_key_recreated.png', key$grob, width = key$width, height = key$height,",
+      "         units = 'in', dpi = settings$download_dpi %||% 600)",
+      "}",
+      "writeLines(legend_text_starter(figure_key_mapping(dat, sumdat, plot_mode, settings)), 'legend_text_recreated.txt')"
     ), collapse = "\n")
   })
 
@@ -4007,12 +5511,27 @@ server <- function(input, output, session) {
 
   output$download_pdf <- downloadHandler(
     filename = function() "cfu_plot.pdf",
-    content = function(file) save_plot_file(file, cairo_pdf)
+    content = function(file) save_plot_file(file, "pdf")
   )
 
   output$download_svg <- downloadHandler(
     filename = function() "cfu_plot.svg",
     content = function(file) save_plot_file(file, "svg")
+  )
+
+  output$download_key_png <- downloadHandler(
+    filename = function() "cfu_plot_legend_key.png",
+    content = function(file) save_key_file(file, "png")
+  )
+
+  output$download_key_pdf <- downloadHandler(
+    filename = function() "cfu_plot_legend_key.pdf",
+    content = function(file) save_key_file(file, "pdf")
+  )
+
+  output$download_key_svg <- downloadHandler(
+    filename = function() "cfu_plot_legend_key.svg",
+    content = function(file) save_key_file(file, "svg")
   )
 
   output$download_gif <- downloadHandler(
@@ -4025,7 +5544,9 @@ server <- function(input, output, session) {
         y_mode = input$y_mode,
         error_type = input$error_type,
         input = input,
-        bar_palette = bar_palette()
+        bar_palette = bar_palette(),
+        sample_palette = colour_registry()$samples,
+        time_palette = colour_registry()$times
       )
       if (panel_mode()) {
         showNotification(
@@ -4067,7 +5588,9 @@ server <- function(input, output, session) {
     filename = function() "cfu_plot_preset.json",
     content = function(file) {
       validate(need(requireNamespace("jsonlite", quietly = TRUE), "Package jsonlite is required for plot preset export."))
-      writeLines(jsonlite::toJSON(plot_settings_payload(input), pretty = TRUE, auto_unbox = TRUE, null = "null"), file)
+      reg <- colour_registry()
+      writeLines(jsonlite::toJSON(plot_settings_payload(input, reg$samples, reg$times),
+                                  pretty = TRUE, auto_unbox = TRUE, null = "null"), file)
     }
   )
 
@@ -4152,14 +5675,21 @@ server <- function(input, output, session) {
         }
       }
 
-      steps <- 12 + as.integer(isTRUE(input$bundle_gif))
+      steps <- 13 + as.integer(isTRUE(input$bundle_gif))
       withProgress(message = "Building the archive", value = 0, {
         bump <- function(msg) incProgress(1 / steps, detail = msg)
 
         bump("figures")
         add("figure.png", "Raster figure at the export DPI.", function(f) save_plot_file(f, "png"))
-        add("figure.pdf", "Vector figure for a manuscript.", function(f) save_plot_file(f, cairo_pdf))
+        add("figure.pdf", "Vector figure for a manuscript.", function(f) save_plot_file(f, "pdf"))
         add("figure.svg", "Vector figure for editing in Illustrator or Inkscape.", function(f) save_plot_file(f, "svg"))
+
+        bump("legend key")
+        add("legend_key.png", "The figure's legend key on its own, raster.", function(f) save_key_file(f, "png"))
+        add("legend_key.pdf", "The figure's legend key on its own, vector.", function(f) save_key_file(f, "pdf"))
+        add("legend_key.svg", "The figure's legend key on its own, editable text.", function(f) save_key_file(f, "svg"))
+        add("legend_text.txt", "Legend text starter: each group with its colour and marker in words.",
+            function(f) writeLines(legend_text(), f))
 
         bump("PowerPoint")
         add("figure.pptx", "PowerPoint slide, editable vector art when rvg is installed.",
@@ -4172,7 +5702,8 @@ server <- function(input, output, session) {
                 anim <- make_animated_cfu_plot(
                   dat = plot_data(), sumdat = current_summary(), plot_mode = input$plot_mode,
                   y_mode = input$y_mode, error_type = input$error_type, input = input,
-                  bar_palette = bar_palette())
+                  bar_palette = bar_palette(), sample_palette = colour_registry()$samples,
+                  time_palette = colour_registry()$times)
                 rendered <- gganimate::animate(
                   anim$plot, nframes = max(anim$steps, round(input$animation_duration * input$animation_fps)),
                   fps = input$animation_fps, width = export_width(), height = export_height(),
@@ -4212,6 +5743,14 @@ server <- function(input, output, session) {
             })
         add("figure_qa.csv", "Publication-readiness checklist for this figure.",
             function(f) write_csv(figure_qa(), f))
+        add("assumption_diagnostics.csv", "Per-cell spread and normality checks on the tested units (advisory).",
+            function(f) write_csv(current_assumptions(), f))
+        # CPS-3: only written when there is something to record, so a clean
+        # dataset does not ship an empty file the README has to explain.
+        if (lod_report()$n_affected > 0) {
+          add("lod_wells.csv", "Wells reporting a count at or below zero, and what was done with each.",
+              function(f) write_csv(lod_report()$wells, f))
+        }
 
         bump("reproducibility")
         add("recreate_figure.R", "Standalone script that rebuilds this figure from embedded data.",
@@ -4226,6 +5765,7 @@ server <- function(input, output, session) {
         bump("README")
         writeLines(c(
           "CFU Plot Studio export bundle",
+          paste0("App:     ", app_version_line()),
           paste0("Created: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
           paste0("Source:  ", if (!is.null(input$file)) input$file$name else "bundled example data"),
           paste0("Figure:  ", format_figure_size(export_width(), export_height(), export_dpi())),

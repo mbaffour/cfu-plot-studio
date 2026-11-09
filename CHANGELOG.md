@@ -6,7 +6,7 @@ Entries marked **STATISTICS CHANGE** alter numbers this app has previously produ
 Figures and p-values from a version before such a change are not comparable with figures
 and p-values from a version after it.
 
-## 0.4.0 — 2026-11-09 (unreleased)
+## 0.4.0 — 2026-11-09
 
 One style for the whole paper. No statistic, summary or plotted value changes, and
 figures with every setting at its default render byte-identically to 0.3.0
@@ -74,7 +74,7 @@ byte for byte).
   load PDF CID font" on the log10 axis title). It draws to the screen only in an
   interactive session; the PNG files it writes are unchanged.
 
-## 0.3.0 — 2026-11-08 (unreleased)
+## 0.3.0 — 2026-11-08 (released together with 0.4.0)
 
 The legend key. No statistic, summary or plotted value changes: figures with the new
 switch off render byte-identically to 0.2.0 (checked on SVG output in every plot mode).
